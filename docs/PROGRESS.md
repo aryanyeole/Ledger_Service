@@ -80,7 +80,8 @@ Canonical source for every external number (D-015). Blank = not yet measured.
 
 - [ ] M10 depends on the Data Den v2 eval harness existing.
 - [ ] D-021: pick the EC2 instance size from `docker stats` on the full local stack (by M8); verify current instance specs and pricing.
-- [ ] Verify whether `docker kill` bypasses the Compose restart policy; this decides the chaos #1 recovery step.
+- [ ] Verify whether `docker kill` bypasses the Compose restart policy; this decides the chaos #1 recovery step. No `restart:` policy in Compose until this is decided (M8).
+- [ ] WMP's wmp-db publishes 0.0.0.0:5433. Stop the WMP stack before `docker compose up` here.
 
 ### Closed
 

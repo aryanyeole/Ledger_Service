@@ -106,13 +106,17 @@ ledger-service/
 | Thing | Host port |
 |---|---|
 | Postgres (container) | **5433** (5432 is taken by native Postgres 18) |
-| Kafka | 9092 (host listener) — container-to-container uses the internal listener |
+| Kafka | 9092 (host listener, 127.0.0.1 only); containers use kafka:29092; controller 9093 not published |
 | Redis | 6379 |
 | ledger-api | 8080 |
 | worker metrics | 8000 |
 | Prometheus | 9090 |
 | Grafana | 3000 |
 | dashboard (Vite dev) | 5173 |
+
+All published host ports bind to 127.0.0.1 only (D-029).
+
+Compose project name: ledger-service (fixed via top-level `name:`)
 
 Kafka in Compose needs **two listeners**: one advertised as `kafka:<internal port>` for containers, one as `localhost:9092` for tools/tests on Windows. Getting this wrong is the #1 Compose Kafka bug — if a client connects then hangs, check advertised listeners first.
 
