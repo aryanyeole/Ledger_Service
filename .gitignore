@@ -1,0 +1,20 @@
+# Maven
+target/
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+# Node
+node_modules/
+dist/
+# Env
+.env
+!.env.example
+# IDE
+.idea/
+.vscode/
+.claude/settings.local.json
+# OS
+Thumbs.db
+.DS_Store
