@@ -49,6 +49,9 @@
 | D-024 | `report.md` records hardware, VUs, req/s and k6 version; README "Reproduce" section uses `docker run grafana/k6`; peer runs are appended with their hardware | Reproduction across machines needs a definition and a cross-platform path | PowerShell-only repro path |
 | D-025 | M10 agent is a CLI/eval module that calls only ledger-api GET endpoints, not a service; eval = 30 read questions + 5 write attempts, scored separately; the LLM SDK dependency gets its own row at M10 kickoff | No 4th service; read-only by construction | Text-to-SQL with DB credentials; agent as a service |
 | D-026 | One task = one branch = one PR, squash-merged; branch protection on `main` requires the CI jobs (enabled after M0 T5, once the checks exist); T1 bootstrap is the only direct commit to `main` | Every change passes CI before reaching `main`; history stays one commit per task | Direct commits to `main` |
+| D-027 | Infra images pinned to exact patch tags: postgres:17.11, apache/kafka:4.3.1, redis:7.4.11; upgrades are explicit PRs | Reproducible stack; latency numbers comparable across runs | Floating major tags (17, 7, latest) |
+| D-028 | Kafka log dir on a named volume; `docker compose down -v` is the only full reset and wipes Postgres and Kafka together | Wiping Kafka while Postgres keeps outbox rows marked published silently loses events in dev | Ephemeral Kafka storage |
+| D-029 | All published infra ports bind to 127.0.0.1 | No unauthenticated Redis/Postgres/Kafka on the LAN or, at M9, the internet; same Compose file runs on EC2 | Binding 0.0.0.0 and relying on firewalls |
 
 ## Measured numbers
 

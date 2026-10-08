@@ -13,4 +13,15 @@ front and center: idempotent requests, exactly-once effects on top of
 at-least-once delivery, explicit transaction boundaries, deterministic lock
 ordering, reconciliation, and recovering cleanly when a consumer dies mid-batch.
 
+## Local infra
+
+Copy `.env.example` to `.env`, then:
+
+```powershell
+docker compose up -d      # Postgres :5433, Kafka :9092, Redis :6379 (127.0.0.1 only)
+docker compose ps         # wait for all services to be healthy
+docker compose down       # stop; Postgres and Kafka data are kept
+docker compose down -v    # full reset: wipes Postgres and Kafka volumes together
+```
+
 **Status:** under construction. See [docs/PROGRESS.md](docs/PROGRESS.md).
