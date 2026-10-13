@@ -232,4 +232,5 @@ cd services\settlement-worker; .\.venv\Scripts\Activate.ps1; pytest -k crash
 Get-Content infra\k6\transfers.js -Raw | docker run --rm -i -e BASE_URL=http://host.docker.internal:8080 grafana/k6 run -
 
 psql "postgresql://postgres:postgres@localhost:5433/ledger"   # native psql from PG18 install
+& "C:\Program Files\PostgreSQL\18\bin\psql.exe" "postgresql://postgres:postgres@localhost:5433/ledger"   # if psql is not on PATH
 ```
