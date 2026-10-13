@@ -24,4 +24,15 @@ docker compose down       # stop; Postgres and Kafka data are kept
 docker compose down -v    # full reset: wipes Postgres and Kafka volumes together
 ```
 
+## Settlement worker (local)
+
+```powershell
+cd services\settlement-worker
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]" -c constraints.txt
+pytest
+python -m settlement_worker   # prints one JSON startup line
+```
+
 **Status:** under construction. See [docs/PROGRESS.md](docs/PROGRESS.md).

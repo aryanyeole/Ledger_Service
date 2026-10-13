@@ -53,6 +53,7 @@
 | D-028 | Kafka log dir on a named volume; `docker compose down -v` is the only full reset and wipes Postgres and Kafka together | Wiping Kafka while Postgres keeps outbox rows marked published silently loses events in dev | Ephemeral Kafka storage |
 | D-029 | All published infra ports bind to 127.0.0.1 | No unauthenticated Redis/Postgres/Kafka on the LAN or, at M9, the internet; same Compose file runs on EC2 | Binding 0.0.0.0 and relying on firewalls |
 | D-030 | Spring Boot 4.1.1 (Spring Framework 7, Jackson 3, Testcontainers 2.x), Java 21, Maven 3.9.16 via the wrapper; Testcontainers images use the D-027 pins; containers override the datasource with SPRING_DATASOURCE_URL | Current stable line at project start; pins keep test and Compose environments identical | Boot 3.5.x (older line, migration debt later); custom host/port placeholders (host port leaks into containers) |
+| D-031 | Python direct deps pinned exactly in pyproject; full environment captured in services/settlement-worker/constraints.txt via `pip freeze --exclude-editable`; all installs use `-c constraints.txt`; upgrades are explicit PRs | Same reproducibility as D-027/D-030; transitive deps can't drift between laptop and CI; a constraints file (unlike a requirements file) tolerates Windows-only deps such as colorama on Linux CI | Compatible ranges without a lock; adding uv or pip-tools (new tooling) |
 
 ## Measured numbers
 
