@@ -19,9 +19,10 @@ class TestcontainersConfiguration {
 	// Relative to the module directory, which is the working directory for Maven tests.
 	private static final Path ROLES_SCRIPT = Path.of("../../infra/postgres/init/01-roles.sh");
 
-	// Test-only credentials for throwaway containers. The worker password is package-private
-	// so tests can connect as settlement_worker.
-	private static final String OWNER_PASSWORD = "test-owner-password";
+	// Test-only credentials for throwaway containers. The worker and owner passwords are
+	// package-private so proof tests can connect as those roles; outside Flyway, production
+	// never connects as ledger_api_owner.
+	static final String OWNER_PASSWORD = "test-owner-password";
 	private static final String APP_PASSWORD = "test-app-password";
 	static final String WORKER_PASSWORD = "test-worker-password";
 
