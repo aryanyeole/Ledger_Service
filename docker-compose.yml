@@ -7,10 +7,15 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:?set in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
       POSTGRES_DB: ${POSTGRES_DB:?set in .env}
+      # Read by infra/postgres/init/01-roles.sh, which runs only on an empty pgdata volume.
+      LEDGER_API_OWNER_PASSWORD: ${LEDGER_API_OWNER_PASSWORD:?set in .env}
+      LEDGER_API_APP_PASSWORD: ${LEDGER_API_APP_PASSWORD:?set in .env}
+      SETTLEMENT_WORKER_PASSWORD: ${SETTLEMENT_WORKER_PASSWORD:?set in .env}
     ports:
       - "127.0.0.1:5433:5432"  # host 5432 is native Postgres (D-013); loopback only (D-029)
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s

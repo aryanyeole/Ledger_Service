@@ -4,10 +4,14 @@ spring:
   datasource:
     # Host default; containers override with SPRING_DATASOURCE_URL (D-030).
     url: jdbc:postgresql://localhost:5433/ledger
-    username: ${POSTGRES_USER:ledger}
-    password: ${POSTGRES_PASSWORD:change-me}
+    # Runtime role: not the schema owner (D-006). Roles come from infra/postgres/init.
+    username: ledger_api_app
+    password: ${LEDGER_API_APP_PASSWORD}
   flyway:
     enabled: true
+    # Migrations run as the owner on their own connection.
+    user: ledger_api_owner
+    password: ${LEDGER_API_OWNER_PASSWORD}
     locations: classpath:db/migration
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
