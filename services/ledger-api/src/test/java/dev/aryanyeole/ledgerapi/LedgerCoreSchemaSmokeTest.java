@@ -14,7 +14,7 @@ import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.transaction.support.TransactionTemplate;
 
-// Smoke test for V1 and its grants, not a proof test (those are T5-T7). Runs through the
+// Smoke test for the schema and its grants, not a proof test (those are T5-T7). Runs through the
 // app DataSource as ledger_api_app. Every write commits explicitly via TransactionTemplate;
 // rows cannot be deleted, so each test uses its own uniquely named account and leaves
 // balances at 0.
@@ -70,6 +70,34 @@ class LedgerCoreSchemaSmokeTest {
 			.single());
 
 		assertThat(locked).isEqualTo(id);
+	}
+
+	// Happy path through the V2 deferred triggers as the runtime role; rejection is T5.
+	// Both legs hit the same account, so its entry sum stays equal to its balance (0).
+	@Test
+	void balancedPairCommitsAsAppRole() {
+		long accountId = createCustomer(uniqueName());
+		String reference = "smoke-" + UUID.randomUUID();
+
+		long transactionId = tx.execute(status -> {
+			long id = jdbc.sql("INSERT INTO transactions (kind, reference) VALUES ('TRANSFER', ?) RETURNING id")
+				.param(reference)
+				.query(Long.class)
+				.single();
+			jdbc.sql("INSERT INTO entries (transaction_id, account_id, amount) VALUES (?, ?, 1.0000), (?, ?, -1.0000)")
+				.params(id, accountId, id, accountId)
+				.update();
+			return id;
+		});
+
+		record Posted(long count, BigDecimal sum) {
+		}
+		Posted posted = jdbc.sql("SELECT count(*), COALESCE(sum(amount), 0) FROM entries WHERE transaction_id = ?")
+			.param(transactionId)
+			.query((rs, rowNum) -> new Posted(rs.getLong(1), rs.getBigDecimal(2)))
+			.single();
+		assertThat(posted.count()).isEqualTo(2);
+		assertThat(posted.sum()).isEqualByComparingTo("0");
 	}
 
 	@Test
