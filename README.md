@@ -24,6 +24,24 @@ docker compose down       # stop; Postgres and Kafka data are kept
 docker compose down -v    # full reset: wipes Postgres and Kafka volumes together
 ```
 
+On first start (empty `pgdata` volume), Postgres runs `infra/postgres/init/01-roles.sh`,
+which creates the application roles: `ledger_api_owner` (Flyway only), `ledger_api_app`
+(ledger-api runtime) and `settlement_worker`. None is a superuser. The role passwords
+are read only on that first start, so changing them in `.env` later needs
+`docker compose down -v`.
+
+## Ledger API (local)
+
+Spring Boot does not read `.env`. Set the two passwords in the shell first:
+
+```powershell
+cd services\ledger-api
+$env:LEDGER_API_APP_PASSWORD = '<value from .env>'
+$env:LEDGER_API_OWNER_PASSWORD = '<value from .env>'
+.\mvnw.cmd spring-boot:run
+.\mvnw.cmd verify    # tests use Testcontainers and need only Docker
+```
+
 ## Settlement worker (local)
 
 ```powershell
