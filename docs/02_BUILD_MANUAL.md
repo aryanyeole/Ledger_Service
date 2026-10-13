@@ -231,5 +231,10 @@ cd services\settlement-worker; .\.venv\Scripts\Activate.ps1; pytest -k crash
 # k6 (PowerShell has no `<` redirect; pipe instead; reach the host API via host.docker.internal)
 Get-Content infra\k6\transfers.js -Raw | docker run --rm -i -e BASE_URL=http://host.docker.internal:8080 grafana/k6 run -
 
-psql "postgresql://postgres:postgres@localhost:5433/ledger"   # native psql from PG18 install
+# psql as the superuser, inside the container (it trusts local connections; no password in shell history)
+docker compose exec postgres psql -U ledger -d ledger
+
+# psql as the app role from the host (repo root), password read from .env
+$pw = (Select-String -Path .env -Pattern '^LEDGER_API_APP_PASSWORD=(.+)$').Matches[0].Groups[1].Value
+& "C:\Program Files\PostgreSQL\18\bin\psql.exe" "postgresql://ledger_api_app:$pw@localhost:5433/ledger"
 ```

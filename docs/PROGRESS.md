@@ -8,7 +8,7 @@
 | Milestone | Status | Proof artifact(s) | Commit |
 |---|---|---|---|
 | M0 Scaffold + CI | done | CI green on `main` (badge in README) | ea07275; PRs #1–#4 |
-| M1 Schema + invariant | not started | `UnbalancedTransactionRejectedTest`, `EntriesAppendOnlyTest` | |
+| M1 Schema + invariant | proof artifacts done · gate deferred | `UnbalancedTransactionRejectedTest`, `EntriesAppendOnlyTest`, `DbRolePrivilegesTest` (D-037) | 606b2bd; PRs #6–#12 |
 | M2 API + idempotency | not started | `ConcurrentIdempotentTransferTest` (100 threads), `IdempotencyPayloadMismatchTest`, `OppositeTransfersNoDeadlockTest`, negative control: check-then-insert idempotency → duplicate transactions (D-017) | |
 | M3 Outbox + Kafka + dedup | not started | `test_crash_recovery.py` (both fault points × N iterations, D-018), `OutboxRedeliveryTest`, negative control: dedup row committed in a separate tx → double-applied entries (D-017) | |
 | M4 Settlement + reconciliation | not started | `test_reconciliation_detects_drift.py`, `IdempotencyKeyExpiryTest` (D-020), snapshot-consistent reconciliation (D-019); optional negative control: two-query reconciliation under load → false drift (D-017) | |
@@ -55,6 +55,16 @@
 | D-030 | Spring Boot 4.1.1 (Spring Framework 7, Jackson 3, Testcontainers 2.x), Java 21, Maven 3.9.16 via the wrapper; Testcontainers images use the D-027 pins; containers override the datasource with SPRING_DATASOURCE_URL | Current stable line at project start; pins keep test and Compose environments identical | Boot 3.5.x (older line, migration debt later); custom host/port placeholders (host port leaks into containers) |
 | D-031 | Python direct deps pinned exactly in pyproject; full environment captured in services/settlement-worker/constraints.txt via `pip freeze --exclude-editable`; all installs use `-c constraints.txt`; upgrades are explicit PRs | Same reproducibility as D-027/D-030; transitive deps can't drift between laptop and CI; a constraints file (unlike a requirements file) tolerates Windows-only deps such as colorama on Linux CI | Compatible ranges without a lock; adding uv or pip-tools (new tooling) |
 | D-032 | GitHub Actions pinned to verified major tags (checkout@v7, setup-java@v6, setup-python@v7); upgrades are explicit PRs | Build tooling, not runtime: major tags pick up patch fixes without churn | Full commit SHAs (stricter supply chain, but needs Dependabot to stay current: new tooling) |
+| D-033 | Three non-superuser roles: ledger_api_owner (Flyway only), ledger_api_app (API runtime), settlement_worker. Amends D-006; overrides spec §3 "JDBC (owner role)" | An owner can disable or drop triggers and grant TRUNCATE back to itself, so D-006 holds only if no runtime role owns anything | API runs as table owner |
+| D-034 | Roles created by infra/postgres/init/01-roles.sh (LEDGER_API_OWNER_PASSWORD, LEDGER_API_APP_PASSWORD, SETTLEMENT_WORKER_PASSWORD), shared by Compose and Testcontainers. Ownership and grants live in each table's own Flyway migration; no default privileges. accounts: INSERT(name, type, allow_negative) for the API only; UPDATE(balance) for both runtime roles | Roles are cluster-wide and need env passwords before Flyway runs; grants evolve with the schema; a balance changes only through postings and can't be seeded at insert | Roles in Flyway; grants in init; table-wide INSERT/UPDATE on accounts |
+| D-035 | Withdrawn — superseded by D-041 before adoption | — | — |
+| D-036 | Tests connect with the app's spring.datasource.* / spring.flyway.* roles, not @ServiceConnection; every connection asserts current_user | The superuser default would bypass the grants the proof tests depend on | @ServiceConnection |
+| D-037 | DbRolePrivilegesTest is an M1 proof artifact: pg_class-based table matrix (incl. MAINTAIN), column ACLs, ownership, membership, schema/database privileges, trigger hardening, 8 bypass attempts per runtime role, in-test negative control | Grants are half of the P1/P2 defense; information_schema hides tables the querying role can't access | Two proof tests only (spec §9) |
+| D-038 | Proof tests are seen failing first via -Dspring.flyway.target=<n-1>, locally, with the Flyway version line as evidence | Shows the test detects the missing guard without committing a red test or disabling a trigger | Red commit on the branch; no failing-first run |
+| D-039 | CHECK (allow_negative = (type = 'EXTERNAL')) on accounts | Spec §4: only EXTERNAL may go negative; the DB enforces it like the balance trigger | Trusting account-creation code |
+| D-040 | Trigger functions schema-qualify every table and pin SET search_path = pg_catalog, public, pg_temp; init script revokes TEMPORARY on the ledger database from PUBLIC | Unqualified names resolve against pg_temp first, so a temp table named entries would shadow the real one inside the deferred check | Spec §5's unqualified function body; grants alone |
+| D-041 | Append-only via one BEFORE UPDATE OR DELETE OR TRUNCATE ... FOR EACH STATEMENT trigger raising restrict_violation (23001) | Rejects the statement itself, including zero-row and TRUNCATE forms, with a SQLState distinct from 42501 (grants) and 23514 (balance) | Spec §5 row-level trigger plus a separate TRUNCATE trigger |
+| D-042 | transactions is append-only too (same statement-level forbid_mutation trigger) | kind and reference are part of the audit record; the owner could otherwise rewrite them without touching entries | Leaving transactions protected only by runtime grants |
 
 ## Measured numbers
 
@@ -85,6 +95,10 @@ Canonical source for every external number (D-015). Blank = not yet measured.
 - [ ] D-021: pick the EC2 instance size from `docker stats` on the full local stack (by M8); verify current instance specs and pricing.
 - [ ] Verify whether `docker kill` bypasses the Compose restart policy; this decides the chaos #1 recovery step. No `restart:` policy in Compose until this is decided (M8).
 - [ ] WMP's wmp-db publishes 0.0.0.0:5433. Stop the WMP stack before `docker compose up` here.
+- [ ] M1 interview gate deferred (answer 03_INTERVIEW_GATE.md §M1 before claiming M1 done).
+- [ ] M3: how the Python worker tests get the Flyway-built schema (e.g. Flyway CLI image = new infra → needs a decision).
+- [ ] No REVERSAL transaction kind; corrections are modeled as opposite-direction postings — decide if a dedicated kind is needed.
+- [ ] When ledger-api gets a Compose service, it needs SPRING_DATASOURCE_USERNAME/PASSWORD and SPRING_FLYWAY_USER/PASSWORD, all :?-required (D-034).
 
 ### Closed
 

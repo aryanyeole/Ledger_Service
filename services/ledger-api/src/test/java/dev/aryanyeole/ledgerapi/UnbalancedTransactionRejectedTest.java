@@ -69,7 +69,7 @@ class UnbalancedTransactionRejectedTest {
 			assertThat(entries).containsOnlyKeys(external, customer);
 			assertThat(entries.get(external)).isEqualByComparingTo("-100.0000");
 			assertThat(entries.get(customer)).isEqualByComparingTo("100.0000");
-			assertBalancesMatchEntries(conn, external, customer);
+			assertBalancesMatchEntries(conn, role, external, customer);
 		}
 	}
 
@@ -99,7 +99,7 @@ class UnbalancedTransactionRejectedTest {
 
 		try (Connection conn = connect(role)) {
 			assertThat(entrySum(conn, txId).compareTo(BigDecimal.ZERO)).isZero();
-			assertBalancesMatchEntries(conn, external, customerA, customerB);
+			assertBalancesMatchEntries(conn, role, external, customerA, customerB);
 		}
 	}
 
@@ -118,15 +118,15 @@ class UnbalancedTransactionRejectedTest {
 				insertEntry(conn, txId, external, "-99.99");
 
 				SQLException e = catchThrowableOfType(SQLException.class, conn::commit);
-				assertThat((Throwable) e).as("deferred trigger must reject at commit()").isNotNull();
-				assertCheckViolation(e, "unbalanced transaction " + txId + ":");
+				assertThat((Throwable) e).as("[%s] deferred trigger must reject at commit()", role.dbRole).isNotNull();
+				assertCheckViolation(e, role, "unbalanced transaction " + txId + ":");
 			}
 			finally {
 				conn.rollback();
 			}
 		}
 
-		assertNothingLeftBehind(reference, txId);
+		assertNothingLeftBehind(role, reference, txId);
 	}
 
 	@ParameterizedTest(name = "{0}")
@@ -142,15 +142,15 @@ class UnbalancedTransactionRejectedTest {
 				insertEntry(conn, txId, customer, "100");
 
 				SQLException e = catchThrowableOfType(SQLException.class, conn::commit);
-				assertThat((Throwable) e).as("deferred trigger must reject at commit()").isNotNull();
-				assertCheckViolation(e, "unbalanced transaction " + txId + ":");
+				assertThat((Throwable) e).as("[%s] deferred trigger must reject at commit()", role.dbRole).isNotNull();
+				assertCheckViolation(e, role, "unbalanced transaction " + txId + ":");
 			}
 			finally {
 				conn.rollback();
 			}
 		}
 
-		assertNothingLeftBehind(reference, txId);
+		assertNothingLeftBehind(role, reference, txId);
 	}
 
 	@ParameterizedTest(name = "{0}")
@@ -164,15 +164,15 @@ class UnbalancedTransactionRejectedTest {
 				txId = insertTransaction(conn, reference);
 
 				SQLException e = catchThrowableOfType(SQLException.class, conn::commit);
-				assertThat((Throwable) e).as("deferred trigger must reject at commit()").isNotNull();
-				assertCheckViolation(e, "transaction " + txId + " has no entries");
+				assertThat((Throwable) e).as("[%s] deferred trigger must reject at commit()", role.dbRole).isNotNull();
+				assertCheckViolation(e, role, "transaction " + txId + " has no entries");
 			}
 			finally {
 				conn.rollback();
 			}
 		}
 
-		assertNothingLeftBehind(reference, txId);
+		assertNothingLeftBehind(role, reference, txId);
 	}
 
 	@ParameterizedTest(name = "{0}")
@@ -187,8 +187,8 @@ class UnbalancedTransactionRejectedTest {
 				insertEntry(conn, txId, customer, "1.0000");
 
 				SQLException e = catchThrowableOfType(SQLException.class, conn::commit);
-				assertThat((Throwable) e).as("deferred trigger must reject at commit()").isNotNull();
-				assertCheckViolation(e, "unbalanced transaction " + txId + ":");
+				assertThat((Throwable) e).as("[%s] deferred trigger must reject at commit()", role.dbRole).isNotNull();
+				assertCheckViolation(e, role, "unbalanced transaction " + txId + ":");
 			}
 			finally {
 				conn.rollback();
@@ -199,7 +199,7 @@ class UnbalancedTransactionRejectedTest {
 		try (Connection conn = connect(role)) {
 			assertThat(entryCount(conn, txId)).isEqualTo(2);
 			assertThat(entrySum(conn, txId).compareTo(BigDecimal.ZERO)).isZero();
-			assertBalancesMatchEntries(conn, external, customer);
+			assertBalancesMatchEntries(conn, role, external, customer);
 		}
 	}
 
@@ -218,15 +218,15 @@ class UnbalancedTransactionRejectedTest {
 				insertEntry(conn, txId, external, "-99.9999");
 
 				SQLException e = catchThrowableOfType(SQLException.class, conn::commit);
-				assertThat((Throwable) e).as("deferred trigger must reject at commit()").isNotNull();
-				assertCheckViolation(e, "unbalanced transaction " + txId + ":");
+				assertThat((Throwable) e).as("[%s] deferred trigger must reject at commit()", role.dbRole).isNotNull();
+				assertCheckViolation(e, role, "unbalanced transaction " + txId + ":");
 			}
 			finally {
 				conn.rollback();
 			}
 		}
 
-		assertNothingLeftBehind(reference, txId);
+		assertNothingLeftBehind(role, reference, txId);
 	}
 
 	// EXTERNAL -100.0000 -> CUSTOMER +100.0000 with both balances updated, committed.
@@ -257,7 +257,7 @@ class UnbalancedTransactionRejectedTest {
 		try (PreparedStatement ps = conn.prepareStatement("SELECT current_user");
 				ResultSet rs = ps.executeQuery()) {
 			assertThat(rs.next()).isTrue();
-			assertThat(rs.getString(1)).isEqualTo(role.dbRole);
+			assertThat(rs.getString(1)).as("[%s] current_user", role.dbRole).isEqualTo(role.dbRole);
 			conn.setAutoCommit(false);
 			return conn;
 		}
@@ -330,7 +330,7 @@ class UnbalancedTransactionRejectedTest {
 		}
 	}
 
-	private void assertNothingLeftBehind(String reference, long txId) throws SQLException {
+	private void assertNothingLeftBehind(Role role, String reference, long txId) throws SQLException {
 		try (Connection conn = dataSource.getConnection();
 				PreparedStatement ps = conn.prepareStatement(
 						"SELECT (SELECT count(*) FROM transactions WHERE reference = ?), (SELECT count(*) FROM entries WHERE transaction_id = ?)")) {
@@ -338,13 +338,13 @@ class UnbalancedTransactionRejectedTest {
 			ps.setLong(2, txId);
 			try (ResultSet rs = ps.executeQuery()) {
 				assertThat(rs.next()).isTrue();
-				assertThat(rs.getLong(1)).as("transactions with reference %s", reference).isZero();
-				assertThat(rs.getLong(2)).as("entries for transaction %d", txId).isZero();
+				assertThat(rs.getLong(1)).as("[%s] transactions with reference %s", role.dbRole, reference).isZero();
+				assertThat(rs.getLong(2)).as("[%s] entries for transaction %d", role.dbRole, txId).isZero();
 			}
 		}
 	}
 
-	private static void assertBalancesMatchEntries(Connection conn, long... accountIds) throws SQLException {
+	private static void assertBalancesMatchEntries(Connection conn, Role role, long... accountIds) throws SQLException {
 		try (PreparedStatement ps = conn.prepareStatement(
 				"SELECT a.balance, (SELECT COALESCE(SUM(e.amount), 0) FROM entries e WHERE e.account_id = a.id) FROM accounts a WHERE a.id = ?")) {
 			for (long accountId : accountIds) {
@@ -353,8 +353,8 @@ class UnbalancedTransactionRejectedTest {
 					assertThat(rs.next()).isTrue();
 					BigDecimal balance = rs.getBigDecimal(1);
 					BigDecimal entrySum = rs.getBigDecimal(2);
-					assertThat(balance.compareTo(entrySum)).as("account %d balance %s vs entries %s", accountId, balance,
-							entrySum)
+					assertThat(balance.compareTo(entrySum))
+						.as("[%s] account %d balance %s vs entries %s", role.dbRole, accountId, balance, entrySum)
 						.isZero();
 				}
 			}
@@ -408,16 +408,17 @@ class UnbalancedTransactionRejectedTest {
 	}
 
 	// SQLState and server message of the deepest SQLException in the cause chain.
-	private static void assertCheckViolation(SQLException thrown, String messagePrefix) {
+	private static void assertCheckViolation(SQLException thrown, Role role, String messagePrefix) {
 		SQLException root = thrown;
 		for (Throwable cause = thrown; cause != null; cause = cause.getCause()) {
 			if (cause instanceof SQLException sql) {
 				root = sql;
 			}
 		}
-		assertThat(root.getSQLState()).as("SQLState of %s", root).isEqualTo(CHECK_VIOLATION);
-		assertThat((Throwable) root).isInstanceOf(PSQLException.class);
-		assertThat(((PSQLException) root).getServerErrorMessage().getMessage()).startsWith(messagePrefix);
+		assertThat(root.getSQLState()).as("[%s] SQLState of %s", role.dbRole, root).isEqualTo(CHECK_VIOLATION);
+		assertThat((Throwable) root).as("[%s] driver exception type", role.dbRole).isInstanceOf(PSQLException.class);
+		assertThat(((PSQLException) root).getServerErrorMessage().getMessage()).as("[%s] server message", role.dbRole)
+			.startsWith(messagePrefix);
 	}
 
 }

@@ -11,9 +11,12 @@
 | Why enforce the double-entry invariant in the database instead of the service? | Two writers in two languages; a constraint can't drift; app check is a promise, constraint is a guarantee; also protects against manual SQL/bugs |
 | Why is the trigger `DEFERRABLE INITIALLY DEFERRED`? | Entries are inserted one row at a time; mid-transaction the sum is temporarily non-zero; checked once at COMMIT |
 | A row-level `CHECK` can't do this. Why? | CHECK sees one row; invariant spans rows |
-| What can still bypass the trigger? | TRUNCATE, superuser/`session_replication_role`, disabling triggers → roles without those privileges |
+| What can still bypass the trigger? | Superuser (`session_replication_role = replica`, `DISABLE TRIGGER`); owner (drop/disable triggers, regrant itself) → runtime roles own nothing (D-033); TRUNCATE now blocked by a statement trigger (D-041); search_path/temp-table shadowing closed by qualified names + pinned search_path + no TEMP (D-040); a balanced pair appended to an old transaction passes the sum check — enforced by code/grants, not the trigger |
 | Why are entries append-only? How do you fix a wrong posting? | Audit trail; corrections are new reversing transactions, never edits |
 | Why `NUMERIC` and not `double`? Show what breaks. | Binary floating point can't represent 0.1 exactly; `0.1 + 0.2 ≠ 0.3`; rounding drift compounds across millions of entries; explicit scale and rounding mode |
+| Why three DB roles and not two? | An owner can disable/drop triggers and grant itself TRUNCATE; Flyway-only owner, runtime roles own nothing; proven by DbRolePrivilegesTest |
+| If the database enforces the invariant, why reconcile? | Trigger guarantees no commit introduces imbalance, not that the ledger is balanced; drift committed around it (superuser) can be silently offset by a later matching commit; materialized balances aren't checked by the trigger at all |
+| Why a statement-level trigger for append-only? | Row triggers miss zero-row statements and never see TRUNCATE; one trigger, one firing per statement; 23001 distinguishes it from grants (42501) and balance (23514) — DELETE on transactions failing with 23503 at v2 shows why exact SQLState matters |
 
 ## M2 — API, idempotency, concurrency
 
