@@ -7,7 +7,7 @@
 
 | Milestone | Status | Proof artifact(s) | Commit |
 |---|---|---|---|
-| M0 Scaffold + CI | not started | CI green on `main` (badge in README) | |
+| M0 Scaffold + CI | done | CI green on `main` (badge in README) | ea07275; PRs #1–#4 |
 | M1 Schema + invariant | not started | `UnbalancedTransactionRejectedTest`, `EntriesAppendOnlyTest` | |
 | M2 API + idempotency | not started | `ConcurrentIdempotentTransferTest` (100 threads), `IdempotencyPayloadMismatchTest`, `OppositeTransfersNoDeadlockTest`, negative control: check-then-insert idempotency → duplicate transactions (D-017) | |
 | M3 Outbox + Kafka + dedup | not started | `test_crash_recovery.py` (both fault points × N iterations, D-018), `OutboxRedeliveryTest`, negative control: dedup row committed in a separate tx → double-applied entries (D-017) | |
