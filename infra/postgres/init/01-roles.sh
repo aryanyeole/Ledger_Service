@@ -8,7 +8,8 @@ psql -v ON_ERROR_STOP=1 --no-psqlrc \
 	--username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
 	-v owner_password="$LEDGER_API_OWNER_PASSWORD" \
 	-v app_password="$LEDGER_API_APP_PASSWORD" \
-	-v worker_password="$SETTLEMENT_WORKER_PASSWORD" <<'EOSQL'
+	-v worker_password="$SETTLEMENT_WORKER_PASSWORD" \
+	-v dbname="$POSTGRES_DB" <<'EOSQL'
 -- Owns the schema; used only by Flyway.
 CREATE ROLE ledger_api_owner LOGIN PASSWORD :'owner_password'
 	NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
@@ -23,4 +24,9 @@ CREATE ROLE settlement_worker LOGIN PASSWORD :'worker_password'
 
 -- Postgres 15+ gives PUBLIC no CREATE on schema public.
 GRANT CREATE ON SCHEMA public TO ledger_api_owner;
+
+-- No temp tables for non-superusers: pg_temp is searched first for unqualified names,
+-- so a temp table could shadow a real one (D-040). The default grant comes from the
+-- database owner, so only it or a superuser can revoke it: not Flyway's owner role.
+REVOKE TEMPORARY ON DATABASE :"dbname" FROM PUBLIC;
 EOSQL
