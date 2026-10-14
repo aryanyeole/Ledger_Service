@@ -2,6 +2,7 @@ package dev.aryanyeole.ledgerapi.posting;
 
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
@@ -85,13 +86,24 @@ public class PostingService {
 			}
 			throw ex;
 		}
-		if (rows.size() != ids.length) {
-			throw new StoredOutcomeException(HttpStatus.NOT_FOUND, ProblemCode.ACCOUNT_NOT_FOUND,
-					"No account with this id.");
-		}
 		Map<Long, LockedAccount> byId = new TreeMap<>();
 		rows.forEach((row) -> byId.put(row.id(), row));
+		if (byId.size() != ids.length) {
+			throw new StoredOutcomeException(HttpStatus.NOT_FOUND, ProblemCode.ACCOUNT_NOT_FOUND,
+					missingAccountsDetail(ids, byId));
+		}
 		return new LockedAccounts(byId);
+	}
+
+	// The detail is stored and replayed with the 404, so it must be deterministic: missing ids
+	// in ascending order ("No account with id 7." / "No accounts with ids 7, 9.").
+	private static String missingAccountsDetail(Long[] sortedIds, Map<Long, LockedAccount> found) {
+		List<String> missing = Arrays.stream(sortedIds)
+			.filter((id) -> !found.containsKey(id))
+			.map(String::valueOf)
+			.toList();
+		return (missing.size() == 1) ? "No account with id " + missing.get(0) + "."
+				: "No accounts with ids " + String.join(", ", missing) + ".";
 	}
 
 	/**

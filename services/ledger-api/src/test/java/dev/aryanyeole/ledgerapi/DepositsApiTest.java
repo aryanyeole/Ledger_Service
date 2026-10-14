@@ -12,7 +12,6 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
 
@@ -35,7 +34,6 @@ import com.jayway.jsonpath.JsonPath;
 
 import dev.aryanyeole.ledgerapi.LedgerTestSupport.KeyRow;
 import dev.aryanyeole.ledgerapi.LedgerTestSupport.Totals;
-import dev.aryanyeole.ledgerapi.api.ApiKeyFilter;
 import dev.aryanyeole.ledgerapi.api.CorrelationIdFilter;
 import dev.aryanyeole.ledgerapi.api.EdgeProbe;
 import dev.aryanyeole.ledgerapi.api.ProblemCode;
@@ -283,20 +281,14 @@ class DepositsApiTest {
 		assertMoved(external, externalBefore, "0");
 	}
 
-	// --- helpers ---
+	// --- helpers (shared code lives in ApiTestClient and LedgerTestSupport) ---
 
 	private void assertSameResponse(MvcResult first, MvcResult replay) throws Exception {
-		assertThat(replay.getResponse().getStatus()).as("replay status").isEqualTo(first.getResponse().getStatus());
-		assertThat(replay.getResponse().getContentType()).as("replay content type")
-			.isEqualTo(first.getResponse().getContentType());
-		assertThat(replay.getResponse().getContentAsByteArray()).as("replay body bytes")
-			.isEqualTo(first.getResponse().getContentAsByteArray());
+		ApiTestClient.assertSameResponse(first, replay);
 	}
 
 	private void assertMoved(long accountId, Totals before, String amount) throws SQLException {
-		Totals delta = LedgerTestSupport.totals(this.dataSource, accountId).minus(before);
-		assertThat(delta.balance()).as("account %d balance moved", accountId).isEqualByComparingTo(amount);
-		assertThat(delta.entrySum()).as("account %d entry sum moved", accountId).isEqualByComparingTo(amount);
+		LedgerTestSupport.assertMoved(this.dataSource, accountId, before, amount);
 	}
 
 	private void assertNothingStored(long target, long keyRowsBefore) throws SQLException {
@@ -307,33 +299,15 @@ class DepositsApiTest {
 	}
 
 	private Map<Long, BigDecimal> entries(long transactionId) throws SQLException {
-		Map<Long, BigDecimal> entries = new LinkedHashMap<>();
-		try (Connection conn = LedgerTestSupport.connectApp(this.dataSource);
-				PreparedStatement ps = conn
-					.prepareStatement("SELECT account_id, amount FROM entries WHERE transaction_id = ? ORDER BY id")) {
-			ps.setLong(1, transactionId);
-			try (ResultSet rs = ps.executeQuery()) {
-				while (rs.next()) {
-					entries.put(rs.getLong(1), rs.getBigDecimal(2));
-				}
-			}
-		}
-		return entries;
+		return LedgerTestSupport.entries(this.dataSource, transactionId);
 	}
 
 	private long createAccount(String type) throws Exception {
-		MvcResult result = this.mvc
-			.perform(authenticated(post("/v1/accounts")).contentType(MediaType.APPLICATION_JSON)
-				.content("{\"name\": \"t4-" + UUID.randomUUID() + "\", \"type\": \"" + type + "\"}"))
-			.andExpect(status().isCreated())
-			.andReturn();
-		return ((Number) JsonPath.read(result.getResponse().getContentAsString(), "$.account_id")).longValue();
+		return ApiTestClient.createAccount(this.mvc, type);
 	}
 
 	private MockHttpServletRequestBuilder deposit(String key, String json) {
-		return authenticated(post("/v1/deposits")).header("Idempotency-Key", key)
-			.contentType(MediaType.APPLICATION_JSON)
-			.content(json);
+		return ApiTestClient.keyedPost("/v1/deposits", key, json);
 	}
 
 	private static String body(long accountId, String amount) {
@@ -341,11 +315,11 @@ class DepositsApiTest {
 	}
 
 	private static MockHttpServletRequestBuilder authenticated(MockHttpServletRequestBuilder request) {
-		return request.header(ApiKeyFilter.HEADER, EdgeProbe.API_KEY);
+		return ApiTestClient.authenticated(request);
 	}
 
 	private static String newKey() {
-		return "t4-" + UUID.randomUUID();
+		return ApiTestClient.newKey();
 	}
 
 }
