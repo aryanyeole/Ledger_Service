@@ -18,7 +18,7 @@
 | ID | Found | Milestone | Title | Property / invariant | Status | Fix commit |
 |---|---|---|---|---|---|---|
 | BUG-001 | 2026-10-13 17:36 | M2 | Never-log-the-key test fails whenever an earlier test in its class fails | none (component: ledger-api tests) | fixed | ccbff46 |
-| BUG-002 | 2026-10-13 18:12 | M2 | Shared EXTERNAL fixture adds order-dependent failures to UnbalancedTransactionRejectedTest's failing-first run | none (component: ledger-api tests) | open | |
+| BUG-002 | 2026-10-13 18:12 | M2 | Shared EXTERNAL fixture adds order-dependent failures to UnbalancedTransactionRejectedTest's failing-first run | none (component: ledger-api tests) | fixed | 1b6f5a4 (PR #16) |
 
 ---
 
@@ -97,7 +97,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 ### BUG-002 — Shared EXTERNAL fixture adds order-dependent failures to UnbalancedTransactionRejectedTest's failing-first run
 
 - **Found:** 2026-10-13 18:12 · M2 · Task T2 (PR #15 review fixes) · branch `m2/t2-accounts-balance`
-- **Status:** open
+- **Status:** fixed
 - **Component:** ledger-api tests
 - **Property / invariant touched:** none. The P1 failing-first evidence (D-038) for `UnbalancedTransactionRejectedTest` is muddied; the trigger itself is unaffected.
 - **Symptom:** At `-Dspring.flyway.target=1` the class reports 12 failures, where M1 (PR #10) reported 10. The 10 expected `deferred trigger must reject at commit()` failures are all present. The two extra failures come from a test that should pass at v1:
@@ -125,11 +125,19 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
   - In M1 each test inserted its own EXTERNAL account, so one test's committed garbage could not reach another test's assertions.
   - [UnbalancedTransactionRejectedTest.java:102](../services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/UnbalancedTransactionRejectedTest.java#L102), [:358](../services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/UnbalancedTransactionRejectedTest.java#L358)
 - **Why it wasn't caught earlier:** At v2 and above the trigger rejects those commits, so nothing pollutes EXTERNAL and the full suite is green. The defect only shows below v2, in failing-first mode. The first PR #15 version (seeded-EXTERNAL lookup) could not run below v4 at all, so no failing-first run had been done with a shared EXTERNAL.
-- **Fix:** Not applied yet. Proposed: for the shared EXTERNAL, assert per-test deltas instead of the absolute `balance = SUM(entries)`. Record EXTERNAL's balance and entry sum before the posting, and assert both moved by the posted amount. Keep the absolute check for the fresh CUSTOMER accounts.
-- **Regression test:**
-  - **Planned:** the same failing-first run must show exactly PR #10's 10 failures. `decimalAmountsBalanceExactly` and `balancedPostingCommits` should pass at v1, with the full suite still green at v4.
-  - **Red before the fix:** the run above.
-- **Decision Log impact:** none expected.
-- **Summary (one sentence):**
+- **Fix:** In `balancedPostingCommits`, `decimalAmountsBalanceExactly` and `lateUnbalancedAppendIsRejected`, the shared EXTERNAL account is checked by deltas, not totals.
+  - EXTERNAL's balance and `SUM(entries.amount)` are read before the posting and again after the test's assertions. Each read is one statement on a fresh connection that asserts `current_user` (D-036).
+  - Both values must have moved by exactly the EXTERNAL leg (`assertMovedBy`).
+  - Fresh CUSTOMER accounts keep the absolute `balance = SUM(entries)` check.
+  - Other tests' postings, including commits that leak through below v2, can no longer reach this test's assertions.
+  - Commit `1b6f5a4` on `m2/fix-bug-002` · PR #16 (squash-merge SHA to be added at merge).
+- **Regression test:** The regression check is a local failing-first run (D-038), **not a CI test**. In CI the schema is always at the latest version, where the defect cannot occur.
+  - Command: `.\mvnw.cmd test "-Dtest=UnbalancedTransactionRejectedTest" "-Dspring.flyway.target=1"`
+  - Red before the fix: the run under Symptom (12 failures, including the 2 extra `decimalAmountsBalanceExactly` failures, one per role). It ran on the PR #15 tree committed as `82e0e27`, squash-merged as `3ec3ae6`.
+  - Green after the fix (2026-10-13 18:25, on `1b6f5a4`): `now at version v1`, `Tests run: 14, Failures: 10, Errors: 0`. These are exactly PR #10's 10 `deferred trigger must reject at commit()` failures, with no `decimalAmountsBalanceExactly` failure. "Green" here means the run matches its M1 baseline; the 10 guard failures are designed-in.
+  - Also checked: `EntriesAppendOnlyTest` at `-Dspring.flyway.target=2` still shows PR #11's 8 failures, and full `.\mvnw.cmd verify` is 171/0 at v4.
+- **Decision Log impact:** none.
+- **Summary (one sentence):** With one shared EXTERNAL account, leftovers from earlier tests broke an absolute balance check during failing-first runs; the shared account is now checked by what each test moved, and the v1 run again shows exactly M1's 10 failures.
 - **Notes:**
   - `EntriesAppendOnlyTest` at `-Dspring.flyway.target=2` with the same fixture matches PR #11 exactly (22 run, 8 failures, same list), so it is not affected.
+  - The line links under Root cause point at `3ec3ae6`, the version where the defect was found. The fix moved those lines.
