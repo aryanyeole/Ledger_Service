@@ -120,8 +120,8 @@ class CheckThenInsertIdempotencyTest {
 		String context = "round " + round;
 		assertThat(statuses).as("%s: status counts", context)
 			.containsExactly(Map.entry(201, (long) ConcurrentRequestHarness.THREADS));
-		// BUG-003 phase 1: overlap metrics are report-only (summary line) while CI data is collected;
-		// phase 2 sets a floor on serverArrivedBeforeFirstCompletion.
+		// On CI this control's n > 1 (below) is the primary overlap evidence (D-067, BUG-003); the
+		// server and client overlap metrics are report-only here.
 		assertThat(n).as("%s: harness produced no overlap (new TRANSFER transactions = %d)", context, n)
 			.isGreaterThan(1);
 		assertThat(bodies.size()).as("%s: distinct raw bodies (was %d)", context, bodies.size()).isGreaterThan(1);

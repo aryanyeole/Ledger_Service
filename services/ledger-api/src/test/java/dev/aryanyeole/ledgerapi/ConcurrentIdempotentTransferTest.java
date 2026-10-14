@@ -150,8 +150,12 @@ class ConcurrentIdempotentTransferTest {
 
 		assertTotals(a, "990.0000", context);
 		assertTotals(b, "10.0000", context);
-		// BUG-003 phase 1: overlap metrics are report-only (summary line) while CI data is collected;
-		// phase 2 sets a floor on serverArrivedBeforeFirstCompletion.
+		// Tripwire for a serialized harness, not the overlap claim (D-067, BUG-003): on CI the
+		// negative control's n > 1 is the primary overlap evidence. Client metrics: report-only.
+		assertThat(server.arrivedBeforeFirstCompletion())
+			.as("%s: requests that arrived at the server before the first completed (was %d)", context,
+					server.arrivedBeforeFirstCompletion())
+			.isGreaterThanOrEqualTo(ConcurrentRequestHarness.MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION);
 	}
 
 	private void assertTotals(long accountId, String expected, String context) throws Exception {

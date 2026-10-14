@@ -43,6 +43,13 @@ public final class ConcurrentRequestHarness {
 
 	public static final int THREADS = 100;
 
+	/**
+	 * Proof tripwire (D-067): requests that arrived at the server before the first completed.
+	 * max(2, floor(0.6 x CI min)) with CI min 7 over 10 runs on 4-processor GitHub runners
+	 * (BUG-003). Guards against a serialized harness; it is not the overlap claim.
+	 */
+	public static final int MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION = 4;
+
 
 	/** -Dledger.test.concurrency.rounds: CI 1, local soak 20. */
 	public static final String ROUNDS_PROPERTY = "ledger.test.concurrency.rounds";
