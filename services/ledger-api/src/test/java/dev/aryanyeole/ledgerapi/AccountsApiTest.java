@@ -71,9 +71,21 @@ class AccountsApiTest {
 			.andExpect(jsonPath("$.created_at").isString())
 			.andReturn();
 		long id = ((Number) JsonPath.read(result.getResponse().getContentAsString(), "$.account_id")).longValue();
-		assertThat(result.getResponse().getHeader("Location")).as("Location").isEqualTo("/v1/accounts/" + id);
+		String location = result.getResponse().getHeader("Location");
+		assertThat(location).as("Location").isEqualTo("/v1/accounts/" + id);
 		assertThat(accountRow(id)).as("[%s] row for %s", APP, name)
 			.isEqualTo(new AccountRow(type, false, new BigDecimal("0.0000")));
+		assertLocationReturnsCreatedBody(result);
+	}
+
+	// --- GET /v1/accounts/{id} ---
+
+	@Test
+	void unknownAccountIs404OnGet() throws Exception {
+		this.mvc.perform(authenticated(get("/v1/accounts/{id}", Long.MAX_VALUE)))
+			.andExpect(status().isNotFound())
+			.andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+			.andExpect(jsonPath("$.code").value(ProblemCode.ACCOUNT_NOT_FOUND.value()));
 	}
 
 	@ParameterizedTest(name = "{0}")
@@ -104,12 +116,26 @@ class AccountsApiTest {
 		assertThat(accountRow(id).allowNegative()).as("[%s] allow_negative for %s", APP, name).isFalse();
 	}
 
+	// Each row is the raw JSON value of "name". Control characters (\p{Cc}) are rejected
+	// anywhere in the name, not just when the whole name is blank (D-057).
 	@ParameterizedTest(name = "{0}")
-	@ValueSource(strings = { "\"\"", "\"   \"", "null", "LONG" })
+	@ValueSource(strings = { "\"\"", "\"   \"", "null", "LONG", "\"\\n\"", "\"\\t\"", "\"\\u0000\"",
+			"\"bad\\nname\"", "\"bad\\tname\"", "\"bad\\u0000name\"", "\"bad\\u007fname\"", "\"bad\\u0085name\"" })
 	void invalidNameIsRejected(String nameJson) throws Exception {
 		String json = nameJson.equals("LONG") ? "\"" + "n".repeat(101) + "\"" : nameJson;
 		createAccount("{\"name\": " + json + ", \"type\": \"CUSTOMER\"}").andExpect(status().isBadRequest())
+			.andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
 			.andExpect(jsonPath("$.code").value(ProblemCode.INVALID_ACCOUNT_NAME.value()));
+	}
+
+	@Test
+	void nonAsciiNameIsAcceptedAndReadBackUnchanged() throws Exception {
+		String name = "Caf\u00e9 M\u00fcller \u6771\u4eac \u20b9 " + UUID.randomUUID();
+		MvcResult result = createAccount("{\"name\": \"" + name + "\", \"type\": \"MERCHANT\"}")
+			.andExpect(status().isCreated())
+			.andExpect(jsonPath("$.name").value(name))
+			.andReturn();
+		assertLocationReturnsCreatedBody(result);
 	}
 
 	// Length is counted in characters (code points), not UTF-16 units.
@@ -196,6 +222,17 @@ class AccountsApiTest {
 			.perform(authenticated(post("/v1/accounts")).contentType(MediaType.APPLICATION_JSON).content(json));
 	}
 
+	// The 201's Location resolves to GET /v1/accounts/{id}, which returns the same body.
+	private void assertLocationReturnsCreatedBody(MvcResult created) throws Exception {
+		String location = created.getResponse().getHeader("Location");
+		MvcResult read = this.mvc.perform(authenticated(get(location)))
+			.andExpect(status().isOk())
+			.andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
+			.andReturn();
+		assertThat(read.getResponse().getContentAsString()).as("GET %s body", location)
+			.isEqualTo(created.getResponse().getContentAsString());
+	}
+
 	private long createdAccountId(String type) throws Exception {
 		MvcResult result = createAccount("{\"name\": \"" + uniqueName() + "\", \"type\": \"" + type + "\"}")
 			.andExpect(status().isCreated())
@@ -214,14 +251,9 @@ class AccountsApiTest {
 	// EXTERNAL -amount -> account +amount, one transaction, balances updated, accounts locked
 	// in ascending id order (invariants 1 and 4), explicit commit.
 	private void postDeposit(long accountId, String amount) throws SQLException {
+		long external = SystemAccountFixture.external(this.dataSource);
 		try (Connection conn = connectApp()) {
 			try {
-				long external;
-				try (PreparedStatement ps = conn.prepareStatement("SELECT id FROM accounts WHERE type = 'EXTERNAL'");
-						ResultSet rs = ps.executeQuery()) {
-					assertThat(rs.next()).as("seeded EXTERNAL account").isTrue();
-					external = rs.getLong(1);
-				}
 				long txId;
 				try (PreparedStatement ps = conn.prepareStatement(
 						"INSERT INTO transactions (kind, reference) VALUES ('DEPOSIT', ?) RETURNING id")) {

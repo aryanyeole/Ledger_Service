@@ -59,7 +59,7 @@ class UnbalancedTransactionRejectedTest {
 	@ParameterizedTest(name = "{0}")
 	@EnumSource(Role.class)
 	void balancedPostingCommits(Role role) throws SQLException {
-		long external = seededExternal();
+		long external = SystemAccountFixture.external(dataSource);
 		long customer = createAccount("CUSTOMER");
 
 		long txId = postBalancedDeposit(role, external, customer);
@@ -76,7 +76,7 @@ class UnbalancedTransactionRejectedTest {
 	@ParameterizedTest(name = "{0}")
 	@EnumSource(Role.class)
 	void decimalAmountsBalanceExactly(Role role) throws SQLException {
-		long external = seededExternal();
+		long external = SystemAccountFixture.external(dataSource);
 		long customerA = createAccount("CUSTOMER");
 		long customerB = createAccount("CUSTOMER");
 		String reference = newReference();
@@ -106,7 +106,7 @@ class UnbalancedTransactionRejectedTest {
 	@ParameterizedTest(name = "{0}")
 	@EnumSource(Role.class)
 	void unbalancedPairIsRejectedAtCommitNotInsert(Role role) throws SQLException {
-		long external = seededExternal();
+		long external = SystemAccountFixture.external(dataSource);
 		long customer = createAccount("CUSTOMER");
 		String reference = newReference();
 
@@ -178,7 +178,7 @@ class UnbalancedTransactionRejectedTest {
 	@ParameterizedTest(name = "{0}")
 	@EnumSource(Role.class)
 	void lateUnbalancedAppendIsRejected(Role role) throws SQLException {
-		long external = seededExternal();
+		long external = SystemAccountFixture.external(dataSource);
 		long customer = createAccount("CUSTOMER");
 		long txId = postBalancedDeposit(role, external, customer);
 
@@ -206,7 +206,7 @@ class UnbalancedTransactionRejectedTest {
 	@ParameterizedTest(name = "{0}")
 	@EnumSource(Role.class)
 	void fourthDecimalImbalanceIsRejected(Role role) throws SQLException {
-		long external = seededExternal();
+		long external = SystemAccountFixture.external(dataSource);
 		long customer = createAccount("CUSTOMER");
 		String reference = newReference();
 
@@ -264,17 +264,6 @@ class UnbalancedTransactionRejectedTest {
 		catch (SQLException | RuntimeException | Error e) {
 			conn.close();
 			throw e;
-		}
-	}
-
-	// The one EXTERNAL account, seeded by V4 (D-048): a second EXTERNAL cannot be created.
-	// Shared across tests, so assertions on it are per transaction or balance = SUM(entries).
-	private long seededExternal() throws SQLException {
-		try (Connection conn = dataSource.getConnection();
-				PreparedStatement ps = conn.prepareStatement("SELECT id FROM accounts WHERE type = 'EXTERNAL'");
-				ResultSet rs = ps.executeQuery()) {
-			assertThat(rs.next()).as("seeded EXTERNAL account").isTrue();
-			return rs.getLong(1);
 		}
 	}
 

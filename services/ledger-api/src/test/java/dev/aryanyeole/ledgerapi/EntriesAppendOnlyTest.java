@@ -164,9 +164,10 @@ class EntriesAppendOnlyTest {
 	@ParameterizedTest(name = "{0}")
 	@EnumSource(value = Role.class, names = { "APP", "WORKER" })
 	void reversingPostingCorrectsWithoutMutation(Role role) throws SQLException {
+		long external = SystemAccountFixture.external(dataSource);
 		BigDecimal[] externalBefore;
 		try (Connection conn = connect(Role.APP)) {
-			externalBefore = balanceAndEntrySum(conn, seededExternal());
+			externalBefore = balanceAndEntrySum(conn, external);
 		}
 		Posting original = postDeposit();
 		Map<Long, BigDecimal> originalEntries;
@@ -191,6 +192,8 @@ class EntriesAppendOnlyTest {
 
 		try (Connection conn = connect(role)) {
 			// The customer is fresh, so it returns to 0; the shared EXTERNAL returns to where it was.
+			// That assumes nothing else posts to EXTERNAL during this test: test classes and
+			// methods run sequentially (Surefire's default, no JUnit parallel execution).
 			Map<Long, BigDecimal[]> expected = Map.of(original.customerId(),
 					new BigDecimal[] { BigDecimal.ZERO, BigDecimal.ZERO }, original.externalId(), externalBefore);
 			for (Map.Entry<Long, BigDecimal[]> account : expected.entrySet()) {
@@ -257,7 +260,7 @@ class EntriesAppendOnlyTest {
 	// Committed EXTERNAL -100.0000 -> CUSTOMER +100.0000 via the app role, balances updated.
 	// The target entry is the CUSTOMER leg.
 	private Posting postDeposit() throws SQLException {
-		long external = seededExternal();
+		long external = SystemAccountFixture.external(dataSource);
 		long customer = createAccount("CUSTOMER");
 		try (Connection conn = connect(Role.APP)) {
 			try {
@@ -336,18 +339,6 @@ class EntriesAppendOnlyTest {
 		catch (SQLException | RuntimeException | Error e) {
 			conn.close();
 			throw e;
-		}
-	}
-
-	// The one EXTERNAL account, seeded by V4 (D-048): a second EXTERNAL cannot be created.
-	// Shared across tests, so assertions on it are per transaction or relative to its
-	// balance before the test.
-	private long seededExternal() throws SQLException {
-		try (Connection conn = connect(Role.APP);
-				PreparedStatement ps = conn.prepareStatement("SELECT id FROM accounts WHERE type = 'EXTERNAL'");
-				ResultSet rs = ps.executeQuery()) {
-			assertThat(rs.next()).as("seeded EXTERNAL account").isTrue();
-			return rs.getLong(1);
 		}
 	}
 

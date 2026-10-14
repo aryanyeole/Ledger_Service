@@ -32,6 +32,9 @@ public class AccountRepository {
 	record Balance(BigDecimal balance, OffsetDateTime asOf) {
 	}
 
+	record Account(long id, String name, String type, OffsetDateTime createdAt) {
+	}
+
 	// allow_negative is not in the column list: the default (false) applies, and V1's CHECK
 	// ties it to type (D-039, D-048). A single statement, so it commits on its own.
 	// Only a violation of the name constraint is the client's duplicate; any other 23505
@@ -51,6 +54,14 @@ public class AccountRepository {
 			}
 			throw ex;
 		}
+	}
+
+	Optional<Account> find(long id) {
+		return this.jdbc.sql("SELECT id, name, type, created_at FROM accounts WHERE id = :id")
+			.param("id", id)
+			.query((rs, rowNum) -> new Account(rs.getLong("id"), rs.getString("name"), rs.getString("type"),
+					rs.getObject("created_at", OffsetDateTime.class)))
+			.optional();
 	}
 
 	// Balance and as_of come from one statement, so as_of is the database's time for the

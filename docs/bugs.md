@@ -18,6 +18,7 @@
 | ID | Found | Milestone | Title | Property / invariant | Status | Fix commit |
 |---|---|---|---|---|---|---|
 | BUG-001 | 2026-10-13 17:36 | M2 | Never-log-the-key test fails whenever an earlier test in its class fails | none (component: ledger-api tests) | fixed | ccbff46 |
+| BUG-002 | 2026-10-13 18:12 | M2 | Shared EXTERNAL fixture adds order-dependent failures to UnbalancedTransactionRejectedTest's failing-first run | none (component: ledger-api tests) | open | |
 
 ---
 
@@ -90,3 +91,45 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 - **Notes:**
   - Logged 2026-10-13 17:51, after the fix, at the owner's request. At the time it was found it was treated as a test-harness slip and described only in the PR #14 body. That ran against Rule 1 (open the entry before the fix).
   - The Symptom text is copied from the surefire report as it was displayed during the T1 session. The report file itself was overwritten by later runs.
+
+---
+
+### BUG-002 — Shared EXTERNAL fixture adds order-dependent failures to UnbalancedTransactionRejectedTest's failing-first run
+
+- **Found:** 2026-10-13 18:12 · M2 · Task T2 (PR #15 review fixes) · branch `m2/t2-accounts-balance`
+- **Status:** open
+- **Component:** ledger-api tests
+- **Property / invariant touched:** none. The P1 failing-first evidence (D-038) for `UnbalancedTransactionRejectedTest` is muddied; the trigger itself is unaffected.
+- **Symptom:** At `-Dspring.flyway.target=1` the class reports 12 failures, where M1 (PR #10) reported 10. The 10 expected `deferred trigger must reject at commit()` failures are all present. The two extra failures come from a test that should pass at v1:
+  ```
+  [ERROR] Tests run: 14, Failures: 12, Errors: 0, Skipped: 0
+  [ERROR]   UnbalancedTransactionRejectedTest.decimalAmountsBalanceExactly:102->assertBalancesMatchEntries:358 [[ledger_api_app] account 1 balance -400.3000 vs entries -800.2798]
+  [ERROR]   UnbalancedTransactionRejectedTest.decimalAmountsBalanceExactly:102->assertBalancesMatchEntries:358 [[settlement_worker] account 1 balance -400.6000 vs entries -800.5798]
+  ```
+  Account 1 is `system:external`, created by `SystemAccountFixture` because V4 is absent at v1.
+- **How detected:** The D-038 failing-first run requested in the PR #15 review, after the M1 suites moved to the get-or-create `SystemAccountFixture`:
+  - command: `.\mvnw.cmd test "-Dtest=UnbalancedTransactionRejectedTest" "-Dspring.flyway.target=1"`
+  - Flyway line: `Successfully applied 1 migration to schema "public", now at version v1`
+  - baseline: compared against the PR #10 failure list.
+- **Reproduction:**
+  ```powershell
+  cd services\ledger-api; .\mvnw.cmd test "-Dtest=UnbalancedTransactionRejectedTest" "-Dspring.flyway.target=1"
+  # Expect 10 failures (PR #10); observe 12, the extra two being decimalAmountsBalanceExactly for both roles.
+  ```
+- **Time to diagnose:** Not measured separately. First observation 18:12, root-cause mechanism identified 18:13 (before this entry), from the failure text and the test bodies.
+- **Root cause:** All tests in the class now post against one shared `system:external` account.
+  - At v1 there is no balance trigger, so the "must be rejected" cases commit their unbalanced EXTERNAL legs.
+  - They are the ones the test expects to be rejected: `unbalancedPairIsRejectedAtCommitNotInsert`, `singleEntryIsRejected`, `lateUnbalancedAppendIsRejected`, `fourthDecimalImbalanceIsRejected`.
+  - Those committed legs never go through the balance update, so EXTERNAL's `balance` and `SUM(entries.amount)` drift apart.
+  - `decimalAmountsBalanceExactly` runs later and asserts `balance = SUM(entries)` on that shared account, so it fails for a reason unrelated to its own posting.
+  - In M1 each test inserted its own EXTERNAL account, so one test's committed garbage could not reach another test's assertions.
+  - [UnbalancedTransactionRejectedTest.java:102](../services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/UnbalancedTransactionRejectedTest.java#L102), [:358](../services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/UnbalancedTransactionRejectedTest.java#L358)
+- **Why it wasn't caught earlier:** At v2 and above the trigger rejects those commits, so nothing pollutes EXTERNAL and the full suite is green. The defect only shows below v2, in failing-first mode. The first PR #15 version (seeded-EXTERNAL lookup) could not run below v4 at all, so no failing-first run had been done with a shared EXTERNAL.
+- **Fix:** Not applied yet. Proposed: for the shared EXTERNAL, assert per-test deltas instead of the absolute `balance = SUM(entries)`. Record EXTERNAL's balance and entry sum before the posting, and assert both moved by the posted amount. Keep the absolute check for the fresh CUSTOMER accounts.
+- **Regression test:**
+  - **Planned:** the same failing-first run must show exactly PR #10's 10 failures. `decimalAmountsBalanceExactly` and `balancedPostingCommits` should pass at v1, with the full suite still green at v4.
+  - **Red before the fix:** the run above.
+- **Decision Log impact:** none expected.
+- **Summary (one sentence):**
+- **Notes:**
+  - `EntriesAppendOnlyTest` at `-Dspring.flyway.target=2` with the same fixture matches PR #11 exactly (22 run, 8 failures, same list), so it is not affected.
