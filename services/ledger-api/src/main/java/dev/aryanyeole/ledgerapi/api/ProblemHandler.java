@@ -24,10 +24,6 @@ public class ProblemHandler extends ResponseEntityExceptionHandler {
 
 	public static final String CODE = "code";
 
-	static final String INTERNAL_ERROR = "internal_error";
-
-	static final String MALFORMED_REQUEST = "malformed_request";
-
 	private static final Logger log = LoggerFactory.getLogger(ProblemHandler.class);
 
 	@ExceptionHandler(ApiException.class)
@@ -40,7 +36,7 @@ public class ProblemHandler extends ResponseEntityExceptionHandler {
 		log.error("Unhandled exception", ex);
 		ProblemDetail body = ProblemDetail.forStatusAndDetail(HttpStatus.INTERNAL_SERVER_ERROR,
 				"An unexpected error occurred.");
-		body.setProperty(CODE, INTERNAL_ERROR);
+		body.setProperty(CODE, ProblemCode.INTERNAL_ERROR.value());
 		return ResponseEntity.internalServerError().body(body);
 	}
 
@@ -55,7 +51,7 @@ public class ProblemHandler extends ResponseEntityExceptionHandler {
 			}
 		}
 		ProblemDetail body = ProblemDetail.forStatusAndDetail(status, "Request body is not readable JSON.");
-		body.setProperty(CODE, MALFORMED_REQUEST);
+		body.setProperty(CODE, ProblemCode.MALFORMED_REQUEST.value());
 		return handleExceptionInternal(ex, body, headers, status, request);
 	}
 
@@ -71,7 +67,7 @@ public class ProblemHandler extends ResponseEntityExceptionHandler {
 
 	private static ResponseEntity<ProblemDetail> problem(ApiException ex) {
 		ProblemDetail body = ProblemDetail.forStatusAndDetail(ex.status(), ex.getMessage());
-		body.setProperty(CODE, ex.code());
+		body.setProperty(CODE, ex.code().value());
 		return ResponseEntity.status(ex.status()).headers(ex.headers()).body(body);
 	}
 
@@ -79,7 +75,7 @@ public class ProblemHandler extends ResponseEntityExceptionHandler {
 	private static String codeFor(HttpStatusCode statusCode) {
 		HttpStatus status = HttpStatus.resolve(statusCode.value());
 		if (status == null || status.is5xxServerError()) {
-			return INTERNAL_ERROR;
+			return ProblemCode.INTERNAL_ERROR.value();
 		}
 		return status.name().toLowerCase(Locale.ROOT);
 	}

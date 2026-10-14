@@ -164,6 +164,11 @@ class EntriesAppendOnlyTest {
 	@ParameterizedTest(name = "{0}")
 	@EnumSource(value = Role.class, names = { "APP", "WORKER" })
 	void reversingPostingCorrectsWithoutMutation(Role role) throws SQLException {
+		long external = SystemAccountFixture.external(dataSource);
+		BigDecimal[] externalBefore;
+		try (Connection conn = connect(Role.APP)) {
+			externalBefore = balanceAndEntrySum(conn, external);
+		}
 		Posting original = postDeposit();
 		Map<Long, BigDecimal> originalEntries;
 		try (Connection conn = connect(Role.APP)) {
@@ -186,11 +191,18 @@ class EntriesAppendOnlyTest {
 		}
 
 		try (Connection conn = connect(role)) {
-			for (long accountId : new long[] { original.externalId(), original.customerId() }) {
+			// The customer is fresh, so it returns to 0; the shared EXTERNAL returns to where it was.
+			// That assumes nothing else posts to EXTERNAL during this test: test classes and
+			// methods run sequentially (Surefire's default, no JUnit parallel execution).
+			Map<Long, BigDecimal[]> expected = Map.of(original.customerId(),
+					new BigDecimal[] { BigDecimal.ZERO, BigDecimal.ZERO }, original.externalId(), externalBefore);
+			for (Map.Entry<Long, BigDecimal[]> account : expected.entrySet()) {
+				long accountId = account.getKey();
 				BigDecimal[] balanceAndSum = balanceAndEntrySum(conn, accountId);
-				assertThat(balanceAndSum[0].compareTo(BigDecimal.ZERO)).as("%s: account %d balance", role.dbRole, accountId)
+				assertThat(balanceAndSum[0].compareTo(account.getValue()[0]))
+					.as("%s: account %d balance", role.dbRole, accountId)
 					.isZero();
-				assertThat(balanceAndSum[1].compareTo(BigDecimal.ZERO))
+				assertThat(balanceAndSum[1].compareTo(account.getValue()[1]))
 					.as("%s: account %d entry sum", role.dbRole, accountId)
 					.isZero();
 			}
@@ -248,7 +260,7 @@ class EntriesAppendOnlyTest {
 	// Committed EXTERNAL -100.0000 -> CUSTOMER +100.0000 via the app role, balances updated.
 	// The target entry is the CUSTOMER leg.
 	private Posting postDeposit() throws SQLException {
-		long external = createAccount("EXTERNAL");
+		long external = SystemAccountFixture.external(dataSource);
 		long customer = createAccount("CUSTOMER");
 		try (Connection conn = connect(Role.APP)) {
 			try {

@@ -18,10 +18,11 @@ import org.springframework.test.web.servlet.ResultActions;
 
 import dev.aryanyeole.ledgerapi.api.ApiKeyFilter;
 import dev.aryanyeole.ledgerapi.api.EdgeProbe;
+import dev.aryanyeole.ledgerapi.api.ProblemCode;
 
 // The money codec end to end through MVC (D-047): request JSON -> Money -> response JSON.
 // Each row is the raw JSON value of "amount". Default max-amount (1000000.00).
-@WebMvcTest(properties = EdgeProbe.API_KEYS_PROPERTY)
+@WebMvcTest(controllers = EdgeProbe.Controller.class, properties = EdgeProbe.API_KEYS_PROPERTY)
 @Import(EdgeProbe.Controller.class)
 class MoneyCodecWebTest {
 
@@ -60,7 +61,7 @@ class MoneyCodecWebTest {
 		postAmount(json).andExpect(status().isBadRequest())
 			.andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
 			.andExpect(jsonPath("$.status").value(400))
-			.andExpect(jsonPath("$.code").value(InvalidAmountException.CODE));
+			.andExpect(jsonPath("$.code").value(ProblemCode.INVALID_AMOUNT.value()));
 	}
 
 	@Test
@@ -70,7 +71,7 @@ class MoneyCodecWebTest {
 				.contentType(MediaType.APPLICATION_JSON)
 				.content("{}"))
 			.andExpect(status().isBadRequest())
-			.andExpect(jsonPath("$.code").value(InvalidAmountException.CODE));
+			.andExpect(jsonPath("$.code").value(ProblemCode.INVALID_AMOUNT.value()));
 	}
 
 	private ResultActions postAmount(String json) throws Exception {

@@ -10,15 +10,15 @@ public class ApiException extends RuntimeException {
 
 	private final HttpStatus status;
 
-	private final String code;
+	private final ProblemCode code;
 
 	private final HttpHeaders headers;
 
-	public ApiException(HttpStatus status, String code, String detail) {
+	public ApiException(HttpStatus status, ProblemCode code, String detail) {
 		this(status, code, detail, HttpHeaders.EMPTY);
 	}
 
-	public ApiException(HttpStatus status, String code, String detail, HttpHeaders headers) {
+	public ApiException(HttpStatus status, ProblemCode code, String detail, HttpHeaders headers) {
 		super(detail, null, false, false);
 		this.status = status;
 		this.code = code;
@@ -29,7 +29,7 @@ public class ApiException extends RuntimeException {
 		return this.status;
 	}
 
-	public String code() {
+	public ProblemCode code() {
 		return this.code;
 	}
 

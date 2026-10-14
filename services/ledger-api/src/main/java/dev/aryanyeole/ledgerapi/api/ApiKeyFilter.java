@@ -71,12 +71,12 @@ public class ApiKeyFilter extends OncePerRequestFilter {
 			throws ServletException, IOException {
 		String key = request.getHeader(HEADER);
 		if (key == null || key.isBlank()) {
-			reject(request, response, "missing_api_key", "The X-Api-Key header is required.");
+			reject(request, response, ProblemCode.MISSING_API_KEY, "The X-Api-Key header is required.");
 			return;
 		}
 		String clientId = match(sha256(key));
 		if (clientId == null) {
-			reject(request, response, "invalid_api_key", "The X-Api-Key header is not a valid API key.");
+			reject(request, response, ProblemCode.INVALID_API_KEY, "The X-Api-Key header is not a valid API key.");
 			return;
 		}
 		request.setAttribute(CLIENT_ID_ATTRIBUTE, clientId);
@@ -93,7 +93,8 @@ public class ApiKeyFilter extends OncePerRequestFilter {
 		return matched;
 	}
 
-	private void reject(HttpServletRequest request, HttpServletResponse response, String code, String detail) {
+	private void reject(HttpServletRequest request, HttpServletResponse response, ProblemCode code,
+			String detail) {
 		HttpHeaders challenge = new HttpHeaders();
 		challenge.set(HttpHeaders.WWW_AUTHENTICATE, "ApiKey");
 		this.exceptionResolver.resolveException(request, response, null,

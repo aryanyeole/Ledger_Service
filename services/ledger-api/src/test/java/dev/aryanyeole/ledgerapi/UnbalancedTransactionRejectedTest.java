@@ -59,7 +59,7 @@ class UnbalancedTransactionRejectedTest {
 	@ParameterizedTest(name = "{0}")
 	@EnumSource(Role.class)
 	void balancedPostingCommits(Role role) throws SQLException {
-		long external = createAccount("EXTERNAL");
+		long external = SystemAccountFixture.external(dataSource);
 		long customer = createAccount("CUSTOMER");
 
 		long txId = postBalancedDeposit(role, external, customer);
@@ -76,7 +76,7 @@ class UnbalancedTransactionRejectedTest {
 	@ParameterizedTest(name = "{0}")
 	@EnumSource(Role.class)
 	void decimalAmountsBalanceExactly(Role role) throws SQLException {
-		long external = createAccount("EXTERNAL");
+		long external = SystemAccountFixture.external(dataSource);
 		long customerA = createAccount("CUSTOMER");
 		long customerB = createAccount("CUSTOMER");
 		String reference = newReference();
@@ -106,7 +106,7 @@ class UnbalancedTransactionRejectedTest {
 	@ParameterizedTest(name = "{0}")
 	@EnumSource(Role.class)
 	void unbalancedPairIsRejectedAtCommitNotInsert(Role role) throws SQLException {
-		long external = createAccount("EXTERNAL");
+		long external = SystemAccountFixture.external(dataSource);
 		long customer = createAccount("CUSTOMER");
 		String reference = newReference();
 
@@ -178,7 +178,7 @@ class UnbalancedTransactionRejectedTest {
 	@ParameterizedTest(name = "{0}")
 	@EnumSource(Role.class)
 	void lateUnbalancedAppendIsRejected(Role role) throws SQLException {
-		long external = createAccount("EXTERNAL");
+		long external = SystemAccountFixture.external(dataSource);
 		long customer = createAccount("CUSTOMER");
 		long txId = postBalancedDeposit(role, external, customer);
 
@@ -206,7 +206,7 @@ class UnbalancedTransactionRejectedTest {
 	@ParameterizedTest(name = "{0}")
 	@EnumSource(Role.class)
 	void fourthDecimalImbalanceIsRejected(Role role) throws SQLException {
-		long external = createAccount("EXTERNAL");
+		long external = SystemAccountFixture.external(dataSource);
 		long customer = createAccount("CUSTOMER");
 		String reference = newReference();
 
