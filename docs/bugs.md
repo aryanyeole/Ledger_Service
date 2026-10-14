@@ -148,7 +148,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 ### BUG-003 — Concurrency harness produces too little overlap on GitHub runners
 
 - **Found:** 2026-10-14 13:26 (CI run time, 20:26 UTC) · M2 · after Task T6 (PR #20, merged as `0a414e7`) · branch `main`, then PR #21's branch `m2/t7-idempotency-semantics-proof`
-- **Status:** open
+- **Status:** open (fix committed in `a00e2d3`; awaiting acceptance: 5 consecutive green CI runs of that commit)
 - **Component:** ledger-api tests (`ConcurrentRequestHarness`, `ConcurrentIdempotentTransferTest`, `negativecontrols/CheckThenInsertIdempotencyTest`)
 - **Property / invariant touched:** P2's proof evidence (D-067). Production behaviour is not implicated: in every failing run the proof's own assertions on effects held (1 transaction, 1 body, 100 × 201).
 - **Symptom:** **Found on CI after the local green**: locally the 20-round soaks passed (proof 20/20; control n = 5–34 across runs). PR #20's own CI run passed. On GitHub-hosted runners (image `ubuntu-24.04`, version 20261012.334.1) the harness then failed twice:
@@ -175,19 +175,26 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
   gh run view 38633176987 --log
   ```
 - **Time to diagnose:**
-- **Root cause:** Partly established; the fix is not settled.
-  - **The client-side metric doesn't measure arrival.** It counts threads that called `HttpClient.send`, not requests that reached the server. In run 38633176987 the control had n = 1 while the client counted 53 "sent" before the first response.
-  - **A cold measured round funnels its connects through `HttpClient`'s single selector thread** (JDK 21 `PlainHttpConnection.connectAsync` → `ConnectEvent`).
-  - **On the 4-processor GitHub runner, overlap stays low even after a warm-up.** Phase 1 (PR #22, commit `2167fa2`, run 38637012761 attempts 1–5) measured server-side "arrived before the first completed":
-    - proof 7, 8, 17, 23, 12;
-    - control 13, 13, 19, 16, 14 (control n = 7–8 every time).
+- **Root cause:** The harness's overlap floor was set from local runs, and its overlap metric counted client calls, not server arrivals.
+  - **The floor came from local runs.** On the 4-processor GitHub runners, which share the machine with Postgres in Docker, far fewer of the 100 requests reach the server together than on the 16-thread development machine. The client-side floor of 50 was never reachable reliably there: PR #20's own CI already showed a peak of exactly 50 and a control peak of 36.
+  - **The metric measured the wrong thing.** It counted threads that had called `HttpClient.send`, not requests that reached the server. In run 38633176987 the control had n = 1 while the client counted 53 "sent". The JDK client completes non-blocking connects on a single `SelectorManager` thread (`PlainHttpConnection.connectAsync` → `ConnectEvent`), so a cold round's connects are serialized behind it.
+  - **Measured over ten report-only CI attempts** (run 38637012761 attempts 1–5 on `2167fa2`, run 38639703432 attempts 1–5 on `8228670`, all with the warm-up), as server-side "arrived before the first completed":
+    - proof 7, 8, 17, 23, 12, 19, 7, 13, 12, 20 (**min 7**);
+    - control 13, 13, 19, 16, 14, 13, 13, 47, 15, 4, with control n = 8, 7, 8, 8, 8, 9, 8, 13, 9, **2**.
 
-    Locally the same metric is 30–100. The warm-up opened only 53–100 connections, because requests overlapped too little to need more.
-  - **Remaining hypothesis, not yet verified:** the client side on 4 processors, i.e. 100 threads reaching `send()` and the client's selector-thread completion path. That's what keeps arrivals spread over 91–162 ms.
-- **Why it wasn't caught earlier:**
-- **Fix:**
-- **Regression test:**
-- **Decision Log impact:**
+    Locally (i5-1240P, 20 rounds) the proof's value is 40–100. Even after the warm-up, the client opens only 53–100 connections on CI, because requests overlap too little to need more.
+- **Why it wasn't caught earlier:** The floor and the soak were calibrated on the development machine only. PR #20's CI passed twice, once exactly at the floor, and nothing flagged the margin. The CI logs carried no CPU count.
+- **Fix:** Test sources only, no production change. Commits `2167fa2` (phase 1) and `a00e2d3` (phase 2) on `m2/fix-bug-003`, PR #22 (draft); the squash-merge SHA is added at merge.
+  - A warm-up round before the measured rounds.
+  - A test-only server filter that measures requests that arrived before the first completed.
+  - The proof's floor moved to that server-side value, as a tripwire for a serialized harness: `max(2, ⌊0.6 × 7⌋) = 4`.
+  - Client-side metrics are report-only.
+  - The negative control's n > 1 stays the primary overlap evidence on CI (D-067).
+  - Hardware (processors, heap) and Tomcat/Hikari settings are logged with every run.
+- **Regression test:** `ConcurrentIdempotentTransferTest` and `negativecontrols/CheckThenInsertIdempotencyTest` on CI.
+  - **Red before:** runs 38631908435 and 38633176987 (attempt 1).
+  - **Green after:** pending, 5 consecutive CI runs of `a00e2d3`.
+- **Decision Log impact:** D-067 replaced (PR #22 description).
 - **Summary (one sentence):**
 - **Notes:**
   - Logged 2026-10-14 13:43, when reported, before any fix.
@@ -196,6 +203,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
     CONCURRENCY control round=1 sentBeforeFirstResponse=100 peakInFlight=100 transactions=2 distinctBodies=3 statuses={201=100}
     CONCURRENCY real round=1 sentBeforeFirstResponse=50 peakInFlight=66 transactions=1 distinctBodies=1 statuses={201=100}
     ```
-  - Phase 1's floor rule `max(10, ⌊0.6 × CI min⌋)` gives 10 for CI min 7, which is above two of the five calibration values, so no floor was committed (2026-10-14).
+  - Phase 1's floor rule `max(10, ⌊0.6 × CI min⌋)` gives 10 for CI min 7, which is above two of the five calibration values, so no floor was committed (2026-10-14). The owner changed the rule to `max(2, ⌊0.6 × CI min⌋)` (floor 4) and made the control the primary CI overlap evidence.
+  - **The control is close to its own limit on CI:** run 38639703432 attempt 5 had n = 2 (server overlap 4). That's just above n > 1.
   - **PR #20's own CI runs were also marginal:** 38630949271 had proof peak 50 (then the floor) and control peak 36, n = 7. 38631761721 had proof 85/97 and control 67/74, n = 6.
   - The CI logs carry no CPU count for the runner, so the hardware behind these numbers is unknown.
