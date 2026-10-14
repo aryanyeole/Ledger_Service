@@ -37,20 +37,31 @@ import dev.aryanyeole.ledgerapi.api.EdgeProbe;
 // are parked, so a low peak can't come from thread startup. Per request it records status,
 // Content-Type, raw body bytes and any client exception, and tracks the peak number of
 // requests the client had in flight (incremented before send, decremented after the
-// response). Used by the real proof and by its D-017 negative control alike.
+// response), and how many requests were already sent when the first response arrived.
+// Used by the real proof and by its D-017 negative control alike.
 public final class ConcurrentRequestHarness {
 
 	public static final int THREADS = 100;
+
+	/** Overlap floor (D-067): requests already sent when the first response arrived. */
+	public static final int MIN_SENT_BEFORE_FIRST_RESPONSE = 50;
 
 	/** -Dledger.test.concurrency.rounds: CI 1, local soak 20. */
 	public static final String ROUNDS_PROPERTY = "ledger.test.concurrency.rounds";
 
 	private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(60);
 
-	public record Response(int status, String contentType, byte[] body, Throwable exception) {
+	/** One request: sentNanos is System.nanoTime() just before send, completedNanos just after. */
+	public record Response(int status, String contentType, byte[] body, Throwable exception, long sentNanos,
+			long completedNanos) {
 	}
 
-	public record Run(List<Response> responses, int peakInFlight) {
+	/**
+	 * sentBeforeFirstResponse counts requests whose send started before the earliest response
+	 * (or exception) arrived: the overlap evidence the proofs assert on (D-067). Peak in-flight
+	 * is reported only; it falls when replays finish fast, so it can't be the floor.
+	 */
+	public record Run(List<Response> responses, int peakInFlight, int sentBeforeFirstResponse) {
 	}
 
 	private final HttpClient client = HttpClient.newBuilder()
@@ -96,16 +107,19 @@ public final class ConcurrentRequestHarness {
 	}
 
 	public Response send(HttpRequest request) {
+		long sent = System.nanoTime();
 		try {
 			HttpResponse<byte[]> response = this.client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+			long completed = System.nanoTime();
 			return new Response(response.statusCode(), response.headers().firstValue("Content-Type").orElse(null),
-					response.body(), null);
+					response.body(), null, sent, completed);
 		}
 		catch (Exception ex) {
+			long completed = System.nanoTime();
 			if (ex instanceof InterruptedException) {
 				Thread.currentThread().interrupt();
 			}
-			return new Response(-1, null, null, ex);
+			return new Response(-1, null, null, ex, sent, completed);
 		}
 	}
 
@@ -155,7 +169,9 @@ public final class ConcurrentRequestHarness {
 			for (Future<Response> future : futures) {
 				responses.add(future.get(Math.max(1, deadline - System.nanoTime()), TimeUnit.NANOSECONDS));
 			}
-			return new Run(responses, peak.get());
+			long firstResponse = responses.stream().mapToLong(Response::completedNanos).min().orElseThrow();
+			int sentBeforeFirstResponse = (int) responses.stream().filter((r) -> r.sentNanos() < firstResponse).count();
+			return new Run(responses, peak.get(), sentBeforeFirstResponse);
 		}
 		finally {
 			pool.shutdownNow();

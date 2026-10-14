@@ -80,12 +80,16 @@ class CheckThenInsertIdempotencyTest {
 		int n = transfers.size();
 		Map<Integer, Long> statuses = responses.stream()
 			.collect(Collectors.groupingBy(Response::status, Collectors.counting()));
-		System.out.println("CONCURRENCY control round=" + round + " peakInFlight=" + run.peakInFlight()
+		System.out.println("CONCURRENCY control round=" + round + " sentBeforeFirstResponse=" + run.sentBeforeFirstResponse()
+				+ " peakInFlight=" + run.peakInFlight()
 				+ " transactions=" + n + " distinctBodies=" + bodies.size() + " statuses=" + statuses);
 
 		String context = "round " + round;
 		assertThat(statuses).as("%s: status counts", context)
 			.containsExactly(Map.entry(201, (long) ConcurrentRequestHarness.THREADS));
+		assertThat(run.sentBeforeFirstResponse())
+			.as("%s: requests sent before the first response (was %d)", context, run.sentBeforeFirstResponse())
+			.isGreaterThanOrEqualTo(ConcurrentRequestHarness.MIN_SENT_BEFORE_FIRST_RESPONSE);
 		assertThat(n).as("%s: harness produced no overlap (new TRANSFER transactions = %d)", context, n)
 			.isGreaterThan(1);
 		assertThat(bodies.size()).as("%s: distinct raw bodies (was %d)", context, bodies.size()).isGreaterThan(1);

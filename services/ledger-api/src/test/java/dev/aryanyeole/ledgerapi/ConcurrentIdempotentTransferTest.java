@@ -44,8 +44,6 @@ import dev.aryanyeole.ledgerapi.api.EdgeProbe;
 @SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT, properties = EdgeProbe.API_KEYS_PROPERTY)
 class ConcurrentIdempotentTransferTest {
 
-	private static final int MIN_PEAK_IN_FLIGHT = 50;
-
 	@LocalServerPort
 	int port;
 
@@ -85,7 +83,8 @@ class ConcurrentIdempotentTransferTest {
 		List<Long> transfersB = LedgerTestSupport.transactionIds(this.dataSource, b, "TRANSFER");
 		Map<Integer, Long> statuses = responses.stream()
 			.collect(Collectors.groupingBy(Response::status, Collectors.counting()));
-		System.out.println("CONCURRENCY real round=" + round + " peakInFlight=" + run.peakInFlight() + " transactions="
+		System.out.println("CONCURRENCY real round=" + round + " sentBeforeFirstResponse=" + run.sentBeforeFirstResponse()
+				+ " peakInFlight=" + run.peakInFlight() + " transactions="
 				+ transfersA.size() + " distinctBodies=" + bodies.size() + " statuses=" + statuses);
 
 		String context = "round " + round;
@@ -119,8 +118,10 @@ class ConcurrentIdempotentTransferTest {
 
 		assertTotals(a, "990.0000", context);
 		assertTotals(b, "10.0000", context);
-		assertThat(run.peakInFlight()).as("%s: peak client in-flight requests (was %d)", context, run.peakInFlight())
-			.isGreaterThanOrEqualTo(MIN_PEAK_IN_FLIGHT);
+		// Peak in-flight is reported in the summary line only, not asserted (D-067).
+		assertThat(run.sentBeforeFirstResponse())
+			.as("%s: requests sent before the first response (was %d)", context, run.sentBeforeFirstResponse())
+			.isGreaterThanOrEqualTo(ConcurrentRequestHarness.MIN_SENT_BEFORE_FIRST_RESPONSE);
 	}
 
 	private void assertTotals(long accountId, String expected, String context) throws Exception {
