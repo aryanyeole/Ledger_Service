@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.DynamicTest.dynamicTest;
 
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -29,6 +30,7 @@ import dev.aryanyeole.ledgerapi.ConcurrentRequestHarness.Response;
 import dev.aryanyeole.ledgerapi.ConcurrentRequestHarness.Run;
 import dev.aryanyeole.ledgerapi.LedgerTestSupport;
 import dev.aryanyeole.ledgerapi.LedgerTestSupport.Totals;
+import dev.aryanyeole.ledgerapi.ServerArrivals;
 import dev.aryanyeole.ledgerapi.TestcontainersConfiguration;
 import dev.aryanyeole.ledgerapi.api.EdgeProbe;
 
@@ -39,7 +41,7 @@ import dev.aryanyeole.ledgerapi.api.EdgeProbe;
 // duplicate is a balanced posting and balances still equal their entry sums, and the unique
 // key still allows one key row, which shows the key alone doesn't prevent duplicates when it
 // commits outside the effect's transaction.
-@Import({ TestcontainersConfiguration.class, NaiveTransferController.class })
+@Import({ TestcontainersConfiguration.class, ServerArrivals.Configuration.class, NaiveTransferController.class })
 @SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT, properties = EdgeProbe.API_KEYS_PROPERTY)
 class CheckThenInsertIdempotencyTest {
 
@@ -52,16 +54,44 @@ class CheckThenInsertIdempotencyTest {
 	@Autowired
 	WebServerApplicationContext webServerContext;
 
+	@Autowired
+	ServerArrivals arrivals;
+
 	@TestFactory
 	Stream<DynamicTest> naiveIdempotencyLetsDuplicatesThrough() throws Exception {
 		System.out.println("CONCURRENCY control config " + ConcurrentRequestHarness.serverLimits(this.dataSource,
 				this.webServerContext) + " rounds=" + ConcurrentRequestHarness.rounds());
 		ConcurrentRequestHarness harness = new ConcurrentRequestHarness(this.port);
+		Set<Integer> seenPorts = new HashSet<>();
+		warmUp(harness, seenPorts);
 		return IntStream.rangeClosed(1, ConcurrentRequestHarness.rounds())
-			.mapToObj((round) -> dynamicTest("round " + round, () -> round(harness, round)));
+			.mapToObj((round) -> dynamicTest("round " + round, () -> round(harness, round, seenPorts)));
 	}
 
-	private void round(ConcurrentRequestHarness harness, int round) throws Exception {
+	// One discarded round on separate accounts and key, through the same route (BUG-003): opens
+	// the 100 client connections (a cold round's connects all pass through HttpClient's single
+	// selector thread), starts Tomcat's worker threads, fills the Hikari pool and warms the JIT.
+	// Measured rounds then reuse those connections (reported per round). Only client
+	// exceptions are checked here.
+	private void warmUp(ConcurrentRequestHarness harness, Set<Integer> seenPorts) throws Exception {
+		long a = harness.createAccount("CUSTOMER");
+		long b = harness.createAccount("CUSTOMER");
+		harness.deposit(a, "1000.00");
+		String key = ConcurrentRequestHarness.newKey();
+		byte[] body = ("{\"from_account_id\": " + a + ", \"to_account_id\": " + b + ", \"amount\": \"10.00\"}")
+			.getBytes(StandardCharsets.UTF_8);
+		Run run = harness.fire(() -> harness.post(NaiveTransferController.ROUTE, key, body));
+		ServerArrivals.Overlap server = this.arrivals.overlap(key, seenPorts);
+		System.out.println("CONCURRENCY control warmup serverArrivedBeforeFirstCompletion="
+				+ server.arrivedBeforeFirstCompletion() + " arrivalSpreadMs=" + server.spreadMillis()
+				+ " connections=" + server.connections() + " clientSentBeforeFirst=" + run.sentBeforeFirstResponse()
+				+ " peakInFlight=" + run.peakInFlight());
+		assertThat(run.responses().stream().filter((r) -> r.exception() != null).map(Response::exception).toList())
+			.as("warm-up client exceptions")
+			.isEmpty();
+	}
+
+	private void round(ConcurrentRequestHarness harness, int round, Set<Integer> seenPorts) throws Exception {
 		long a = harness.createAccount("CUSTOMER");
 		long b = harness.createAccount("CUSTOMER");
 		harness.deposit(a, "1000.00");
@@ -80,16 +110,18 @@ class CheckThenInsertIdempotencyTest {
 		int n = transfers.size();
 		Map<Integer, Long> statuses = responses.stream()
 			.collect(Collectors.groupingBy(Response::status, Collectors.counting()));
-		System.out.println("CONCURRENCY control round=" + round + " sentBeforeFirstResponse=" + run.sentBeforeFirstResponse()
-				+ " peakInFlight=" + run.peakInFlight()
+		ServerArrivals.Overlap server = this.arrivals.overlap(key, seenPorts);
+		System.out.println("CONCURRENCY control round=" + round + " processors=" + ConcurrentRequestHarness.processors()
+				+ " serverArrivedBeforeFirstCompletion=" + server.arrivedBeforeFirstCompletion() + " arrivalSpreadMs="
+				+ server.spreadMillis() + " reusedConnections=" + server.reusedConnections() + "/" + server.connections()
+				+ " clientSentBeforeFirst=" + run.sentBeforeFirstResponse() + " peakInFlight=" + run.peakInFlight()
 				+ " transactions=" + n + " distinctBodies=" + bodies.size() + " statuses=" + statuses);
 
 		String context = "round " + round;
 		assertThat(statuses).as("%s: status counts", context)
 			.containsExactly(Map.entry(201, (long) ConcurrentRequestHarness.THREADS));
-		assertThat(run.sentBeforeFirstResponse())
-			.as("%s: requests sent before the first response (was %d)", context, run.sentBeforeFirstResponse())
-			.isGreaterThanOrEqualTo(ConcurrentRequestHarness.MIN_SENT_BEFORE_FIRST_RESPONSE);
+		// BUG-003 phase 1: overlap metrics are report-only (summary line) while CI data is collected;
+		// phase 2 sets a floor on serverArrivedBeforeFirstCompletion.
 		assertThat(n).as("%s: harness produced no overlap (new TRANSFER transactions = %d)", context, n)
 			.isGreaterThan(1);
 		assertThat(bodies.size()).as("%s: distinct raw bodies (was %d)", context, bodies.size()).isGreaterThan(1);

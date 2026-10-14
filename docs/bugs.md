@@ -183,4 +183,10 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 - **Summary (one sentence):**
 - **Notes:**
   - Logged 2026-10-14 13:43, when reported, before any fix.
+  - **Timing-dependent, confirmed:** CI run 38633176987 was re-run on the same commit (`ac414a3`) and attempt 2 passed (20:51 UTC). It passed narrowly:
+    ```
+    CONCURRENCY control round=1 sentBeforeFirstResponse=100 peakInFlight=100 transactions=2 distinctBodies=3 statuses={201=100}
+    CONCURRENCY real round=1 sentBeforeFirstResponse=50 peakInFlight=66 transactions=1 distinctBodies=1 statuses={201=100}
+    ```
+  - **PR #20's own CI runs were also marginal:** 38630949271 had proof peak 50 (then the floor) and control peak 36, n = 7. 38631761721 had proof 85/97 and control 67/74, n = 6.
   - The CI logs carry no CPU count for the runner, so the hardware behind these numbers is unknown.
