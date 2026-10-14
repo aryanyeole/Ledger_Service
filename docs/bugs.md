@@ -19,6 +19,7 @@
 |---|---|---|---|---|---|---|
 | BUG-001 | 2026-10-13 17:36 | M2 | Never-log-the-key test fails whenever an earlier test in its class fails | none (component: ledger-api tests) | fixed | ccbff46 |
 | BUG-002 | 2026-10-13 18:12 | M2 | Shared EXTERNAL fixture adds order-dependent failures to UnbalancedTransactionRejectedTest's failing-first run | none (component: ledger-api tests) | fixed | 1b6f5a4 (PR #16) |
+| BUG-003 | 2026-10-14 13:26 | M2 | Concurrency harness produces too little overlap on GitHub runners | P2 proof evidence (component: ledger-api tests) | open | |
 
 ---
 
@@ -141,3 +142,45 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 - **Notes:**
   - `EntriesAppendOnlyTest` at `-Dspring.flyway.target=2` with the same fixture matches PR #11 exactly (22 run, 8 failures, same list), so it is not affected.
   - The line links under Root cause point at `3ec3ae6`, the version where the defect was found. The fix moved those lines.
+
+---
+
+### BUG-003 — Concurrency harness produces too little overlap on GitHub runners
+
+- **Found:** 2026-10-14 13:26 (CI run time, 20:26 UTC) · M2 · after Task T6 (PR #20, merged as `0a414e7`) · branch `main`, then PR #21's branch `m2/t7-idempotency-semantics-proof`
+- **Status:** open
+- **Component:** ledger-api tests (`ConcurrentRequestHarness`, `ConcurrentIdempotentTransferTest`, `negativecontrols/CheckThenInsertIdempotencyTest`)
+- **Property / invariant touched:** P2's proof evidence (D-067). Production behaviour is not implicated: in every failing run the proof's own assertions on effects held (1 transaction, 1 body, 100 × 201).
+- **Symptom:** **Found on CI after the local green**: locally the 20-round soaks passed (proof 20/20; control n = 5–34 across runs). PR #20's own CI run passed. On GitHub-hosted runners (image `ubuntu-24.04`, version 20261012.334.1) the harness then failed twice:
+  - CI run **38631908435** (push to `main`, `0a414e7`, after #20). Only the proof failed; the control passed with n = 15.
+    ```
+    CONCURRENCY control round=1 sentBeforeFirstResponse=78 peakInFlight=94 transactions=15 distinctBodies=16 statuses={201=100}
+    CONCURRENCY real round=1 sentBeforeFirstResponse=42 peakInFlight=52 transactions=1 distinctBodies=1 statuses={201=100}
+    [ERROR]   ConcurrentIdempotentTransferTest.lambda$hundredIdenticalTransfersCreateOneTransaction$0:62->round:124 [round 1: requests sent before the first response (was 42)]
+    [ERROR] Tests run: 287, Failures: 1, Errors: 0, Skipped: 0
+    ```
+  - CI run **38633176987** (PR #21). Both failed:
+    ```
+    CONCURRENCY control round=1 sentBeforeFirstResponse=53 peakInFlight=66 transactions=1 distinctBodies=2 statuses={201=100}
+    CONCURRENCY real round=1 sentBeforeFirstResponse=48 peakInFlight=74 transactions=1 distinctBodies=1 statuses={201=100}
+    [ERROR]   ConcurrentIdempotentTransferTest.lambda$hundredIdenticalTransfersCreateOneTransaction$0:62->round:124 [round 1: requests sent before the first response (was 48)]
+    [ERROR]   CheckThenInsertIdempotencyTest.lambda$naiveIdempotencyLetsDuplicatesThrough$0:61->round:94 [round 1: harness produced no overlap (new TRANSFER transactions = 1)]
+    [ERROR] Tests run: 297, Failures: 2, Errors: 0, Skipped: 0
+    ```
+- **How detected:** the GitHub Actions `ledger-api` job (`./mvnw -B verify`) on the push to `main` after PR #20 merged, and on PR #21's checks. Reported by the owner; the lines above were taken from `gh run view <id> --log`.
+- **Reproduction:**
+  ```powershell
+  # Not yet reproduced locally; it is timing-dependent on GitHub-hosted runners.
+  gh run view 38631908435 --log
+  gh run view 38633176987 --log
+  ```
+- **Time to diagnose:**
+- **Root cause:** Under investigation, not yet confirmed. One observation from run 38633176987 so far: the control reached n = 1 even though the client recorded 53 requests "sent" before the first response. So the client-side send timestamp, taken just before `HttpClient.send`, does not show that the request had reached the server.
+- **Why it wasn't caught earlier:**
+- **Fix:**
+- **Regression test:**
+- **Decision Log impact:**
+- **Summary (one sentence):**
+- **Notes:**
+  - Logged 2026-10-14 13:43, when reported, before any fix.
+  - The CI logs carry no CPU count for the runner, so the hardware behind these numbers is unknown.
