@@ -29,7 +29,13 @@ final class ApiTestClient {
 	}
 
 	static MockHttpServletRequestBuilder keyedPost(String path, String key, String json) {
-		return authenticated(post(path)).header("Idempotency-Key", key)
+		return keyedPost(path, key, json, EdgeProbe.API_KEY);
+	}
+
+	/** A keyed POST authenticated with the given API key (e.g. EdgeProbe.API_KEY_BETA). */
+	static MockHttpServletRequestBuilder keyedPost(String path, String key, String json, String apiKey) {
+		return post(path).header(ApiKeyFilter.HEADER, apiKey)
+			.header("Idempotency-Key", key)
 			.contentType(MediaType.APPLICATION_JSON)
 			.content(json);
 	}

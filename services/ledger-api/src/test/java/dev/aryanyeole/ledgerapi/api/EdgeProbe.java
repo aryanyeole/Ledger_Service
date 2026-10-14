@@ -28,6 +28,15 @@ public final class EdgeProbe {
 	public static final String API_KEYS_PROPERTY = "ledger.api-keys.ac0c946c9691de2b912c3724d6aa9f9f842f6b557ed70542fcad05c90ed9f6b7="
 			+ CLIENT_ID;
 
+	// A second test-only key and client, for idempotency-key scoping across clients (T7).
+	// Configure both properties in the test that needs it.
+	public static final String API_KEY_BETA = "test-only-key-beta";
+
+	public static final String CLIENT_ID_BETA = "client-beta";
+
+	public static final String API_KEYS_PROPERTY_BETA = "ledger.api-keys.85c258c40df49a3dd9ed7175709d5fc29a20c2dcad97795829f879d6328b3f89="
+			+ CLIENT_ID_BETA;
+
 	// Parts of the failure behind /db-failure that must never reach a response body.
 	public static final String SQL_STATE = "23514";
 
