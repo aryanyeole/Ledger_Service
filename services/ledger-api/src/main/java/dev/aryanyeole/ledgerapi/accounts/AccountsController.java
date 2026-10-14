@@ -2,8 +2,11 @@ package dev.aryanyeole.ledgerapi.accounts;
 
 import java.net.URI;
 import java.time.OffsetDateTime;
+import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
+
+import jakarta.servlet.http.HttpServletRequest;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -11,16 +14,23 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import tools.jackson.databind.json.JsonMapper;
+
 import dev.aryanyeole.ledgerapi.api.ApiException;
+import dev.aryanyeole.ledgerapi.api.ApiKeyFilter;
 import dev.aryanyeole.ledgerapi.api.ProblemCode;
+import dev.aryanyeole.ledgerapi.db.WriteTransactions;
+import dev.aryanyeole.ledgerapi.idempotency.IdempotencyKeyHeader;
+import dev.aryanyeole.ledgerapi.idempotency.IdempotencyService;
+import dev.aryanyeole.ledgerapi.idempotency.IdempotencyService.Outcome;
 import dev.aryanyeole.ledgerapi.money.Money;
 
 // POST /v1/accounts, GET /v1/accounts/{id} and GET /v1/accounts/{id}/balance (spec §7,
 // D-048, D-057). Create and read return the same representation.
-// Idempotency-Key is not read yet; keyed requests come in T4 (D-054).
 @RestController
 @RequestMapping("/v1/accounts")
 class AccountsController {
@@ -34,13 +44,26 @@ class AccountsController {
 	// dashboard (D-057).
 	private static final Pattern CONTROL_CHARACTER = Pattern.compile("\\p{Cc}");
 
+	static final String ROUTE = "/v1/accounts";
+
 	private final AccountRepository accounts;
 
-	AccountsController(AccountRepository accounts) {
+	private final WriteTransactions transactions;
+
+	private final IdempotencyService idempotency;
+
+	private final JsonMapper json;
+
+	AccountsController(AccountRepository accounts, WriteTransactions transactions, IdempotencyService idempotency,
+			JsonMapper json) {
 		this.accounts = accounts;
+		this.transactions = transactions;
+		this.idempotency = idempotency;
+		this.json = json;
 	}
 
-	// Only name and type are bound: allow_negative or any other field in the body is ignored.
+	// Only name and type: allow_negative or any other field in the body is a 400
+	// invalid_request (D-046). The fingerprint is this record's canonical JSON.
 	record CreateAccountRequest(String name, String type) {
 	}
 
@@ -50,8 +73,16 @@ class AccountsController {
 	record BalanceResponse(long accountId, Money balance, OffsetDateTime asOf) {
 	}
 
+	// Idempotency-Key is optional here (D-054). Without one, the insert runs in its own write
+	// transaction and a taken name is an unstored 409. With one, the idempotency service owns
+	// the transaction and the 201 or 409 is stored and replayed. Either way every 201 carries
+	// Location: /v1/accounts/{account_id}, taken from the body (D-063): stored responses keep
+	// only status and body, so a replay rebuilds it the same way.
 	@PostMapping
-	ResponseEntity<AccountResponse> create(@RequestBody CreateAccountRequest request) {
+	ResponseEntity<?> create(@RequestBody CreateAccountRequest request,
+			@RequestHeader(name = IdempotencyKeyHeader.HEADER, required = false) String idempotencyKey,
+			HttpServletRequest http) {
+		Optional<String> key = IdempotencyKeyHeader.optional(idempotencyKey);
 		String type = request.type();
 		if (type == null || !CREATABLE_TYPES.contains(type)) {
 			throw new ApiException(HttpStatus.BAD_REQUEST, ProblemCode.INVALID_ACCOUNT_TYPE,
@@ -63,9 +94,29 @@ class AccountsController {
 			throw new ApiException(HttpStatus.BAD_REQUEST, ProblemCode.INVALID_ACCOUNT_NAME,
 					"name must be 1 to " + MAX_NAME_LENGTH + " characters, not blank, with no control characters.");
 		}
-		AccountRepository.Created created = this.accounts.insert(name, type);
-		return ResponseEntity.created(URI.create("/v1/accounts/" + created.id()))
-			.body(new AccountResponse(created.id(), name, type, created.createdAt()));
+		if (key.isEmpty()) {
+			AccountRepository.Created created = this.transactions.execute((status) -> this.accounts.insert(name, type));
+			return ResponseEntity.created(location(created.id()))
+				.body(new AccountResponse(created.id(), name, type, created.createdAt()));
+		}
+		ResponseEntity<String> response = this.idempotency.execute(ApiKeyFilter.clientId(http), key.get(), "POST",
+				ROUTE, request, () -> {
+					AccountRepository.Created created = this.accounts.insertIfNameFree(name, type);
+					return new Outcome(HttpStatus.CREATED,
+							new AccountResponse(created.id(), name, type, created.createdAt()));
+				});
+		if (response.getStatusCode().value() != HttpStatus.CREATED.value()) {
+			return response;
+		}
+		long id = this.json.readTree(response.getBody()).get("account_id").asLong();
+		return ResponseEntity.status(HttpStatus.CREATED)
+			.headers(response.getHeaders())
+			.location(location(id))
+			.body(response.getBody());
+	}
+
+	private static URI location(long id) {
+		return URI.create(ROUTE + "/" + id);
 	}
 
 	@GetMapping("/{id}")

@@ -105,15 +105,96 @@ class AccountsApiTest {
 			.andExpect(jsonPath("$.code").value(ProblemCode.INVALID_ACCOUNT_TYPE.value()));
 	}
 
-	@Test
-	void allowNegativeInBodyIsIgnored() throws Exception {
+	// allow_negative is never read from input (D-048); since D-046 any unknown field is a 400.
+	@ParameterizedTest(name = "{0}")
+	@ValueSource(strings = { "allow_negative", "allowNegative", "balance" })
+	void extraFieldInBodyIsRejected(String field) throws Exception {
 		String name = uniqueName();
-		MvcResult result = createAccount(
-				"{\"name\": \"" + name + "\", \"type\": \"CUSTOMER\", \"allow_negative\": true, \"allowNegative\": true}")
-			.andExpect(status().isCreated())
+		createAccount("{\"name\": \"" + name + "\", \"type\": \"CUSTOMER\", \"" + field + "\": true}")
+			.andExpect(status().isBadRequest())
+			.andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+			.andExpect(jsonPath("$.code").value(ProblemCode.INVALID_REQUEST.value()));
+		assertThat(countByName(name)).as("[%s] rows named %s", APP, name).isZero();
+	}
+
+	// --- POST /v1/accounts with an Idempotency-Key (D-054, D-063) ---
+
+	@Test
+	void keyedCreateReplaysByteIdenticalWithLocation() throws Exception {
+		String key = newKey();
+		String name = uniqueName();
+		String json = "{\"name\": \"" + name + "\", \"type\": \"CUSTOMER\"}";
+		MvcResult first = createAccount(key, json).andExpect(status().isCreated())
+			.andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
+			.andExpect(jsonPath("$.name").value(name))
 			.andReturn();
-		long id = ((Number) JsonPath.read(result.getResponse().getContentAsString(), "$.account_id")).longValue();
-		assertThat(accountRow(id).allowNegative()).as("[%s] allow_negative for %s", APP, name).isFalse();
+		long id = ((Number) JsonPath.read(first.getResponse().getContentAsString(), "$.account_id")).longValue();
+		assertThat(first.getResponse().getHeader("Location")).as("Location").isEqualTo("/v1/accounts/" + id);
+
+		MvcResult replay = createAccount(key, "{\"type\":\"CUSTOMER\",\"name\":\"" + name + "\"}").andReturn();
+		assertSameResponse(first, replay);
+		assertThat(replay.getResponse().getHeader("Location")).as("replay Location").isEqualTo("/v1/accounts/" + id);
+		assertThat(countByName(name)).as("[%s] rows named %s", APP, name).isEqualTo(1);
+
+		// The stored body is JSONB text, so it is formatted differently from GET's; same content.
+		MvcResult read = this.mvc.perform(authenticated(get("/v1/accounts/{id}", id))).andExpect(status().isOk())
+			.andReturn();
+		assertThat((Object) JsonPath.read(read.getResponse().getContentAsString(), "$"))
+			.isEqualTo(JsonPath.read(first.getResponse().getContentAsString(), "$"));
+	}
+
+	@Test
+	void keyedCreateWithNonAsciiNameReplaysByteIdentical() throws Exception {
+		String key = newKey();
+		String name = "Café 東京 " + UUID.randomUUID();
+		MvcResult first = createAccount(key, "{\"name\": \"" + name + "\", \"type\": \"MERCHANT\"}")
+			.andExpect(status().isCreated())
+			.andExpect(jsonPath("$.name").value(name))
+			.andReturn();
+		MvcResult replay = createAccount(key, "{\"name\": \"" + name + "\", \"type\": \"MERCHANT\"}").andReturn();
+		assertSameResponse(first, replay);
+	}
+
+	@Test
+	void keyedCreateWithDifferentNameIs422() throws Exception {
+		String key = newKey();
+		createAccount(key, "{\"name\": \"" + uniqueName() + "\", \"type\": \"CUSTOMER\"}")
+			.andExpect(status().isCreated());
+		String other = uniqueName();
+		createAccount(key, "{\"name\": \"" + other + "\", \"type\": \"CUSTOMER\"}")
+			.andExpect(status().isUnprocessableContent())
+			.andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+			.andExpect(jsonPath("$.code").value(ProblemCode.IDEMPOTENCY_KEY_REUSED.value()));
+		assertThat(countByName(other)).as("[%s] rows named %s", APP, other).isZero();
+	}
+
+	@Test
+	void keyedDuplicateNameIsStored409() throws Exception {
+		String name = uniqueName();
+		createAccount("{\"name\": \"" + name + "\", \"type\": \"CUSTOMER\"}").andExpect(status().isCreated());
+		String key = newKey();
+		MvcResult first = createAccount(key, "{\"name\": \"" + name + "\", \"type\": \"MERCHANT\"}")
+			.andExpect(status().isConflict())
+			.andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+			.andExpect(jsonPath("$.code").value(ProblemCode.ACCOUNT_NAME_TAKEN.value()))
+			.andReturn();
+		assertThat(first.getResponse().getHeader("Location")).as("Location on 409").isNull();
+		assertThat(LedgerTestSupport.keyRow(this.dataSource, EdgeProbe.CLIENT_ID, key).orElseThrow().statusCode())
+			.as("stored status")
+			.isEqualTo(409);
+
+		MvcResult replay = createAccount(key, "{\"name\": \"" + name + "\", \"type\": \"MERCHANT\"}").andReturn();
+		assertSameResponse(first, replay);
+		assertThat(countByName(name)).as("[%s] rows named %s", APP, name).isEqualTo(1);
+	}
+
+	@Test
+	void invalidOptionalKeyIs400() throws Exception {
+		String name = uniqueName();
+		createAccount("has space", "{\"name\": \"" + name + "\", \"type\": \"CUSTOMER\"}")
+			.andExpect(status().isBadRequest())
+			.andExpect(jsonPath("$.code").value(ProblemCode.INVALID_IDEMPOTENCY_KEY.value()));
+		assertThat(countByName(name)).isZero();
 	}
 
 	// Each row is the raw JSON value of "name". Control characters (\p{Cc}) are rejected
@@ -216,6 +297,24 @@ class AccountsApiTest {
 	}
 
 	// --- helpers ---
+
+	private ResultActions createAccount(String idempotencyKey, String json) throws Exception {
+		return this.mvc.perform(authenticated(post("/v1/accounts")).header("Idempotency-Key", idempotencyKey)
+			.contentType(MediaType.APPLICATION_JSON)
+			.content(json));
+	}
+
+	private static void assertSameResponse(MvcResult first, MvcResult replay) throws Exception {
+		assertThat(replay.getResponse().getStatus()).as("replay status").isEqualTo(first.getResponse().getStatus());
+		assertThat(replay.getResponse().getContentType()).as("replay content type")
+			.isEqualTo(first.getResponse().getContentType());
+		assertThat(replay.getResponse().getContentAsByteArray()).as("replay body bytes")
+			.isEqualTo(first.getResponse().getContentAsByteArray());
+	}
+
+	private static String newKey() {
+		return "t4-" + UUID.randomUUID();
+	}
 
 	private ResultActions createAccount(String json) throws Exception {
 		return this.mvc
