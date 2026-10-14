@@ -40,7 +40,17 @@ public class ServerArrivals {
 
 	/** Overlap of the requests carrying this Idempotency-Key; adds their ports to seenPorts. */
 	public Overlap overlap(String idempotencyKey, Set<Integer> seenPorts) {
-		List<Arrival> round = this.arrivals.stream().filter((a) -> idempotencyKey.equals(a.idempotencyKey())).toList();
+		return overlap(Set.of(idempotencyKey), seenPorts);
+	}
+
+	/**
+	 * Overlap of the requests carrying any of these Idempotency-Keys (a round where every
+	 * request has its own key); adds their ports to seenPorts.
+	 */
+	public Overlap overlap(Set<String> idempotencyKeys, Set<Integer> seenPorts) {
+		List<Arrival> round = this.arrivals.stream()
+			.filter((a) -> a.idempotencyKey() != null && idempotencyKeys.contains(a.idempotencyKey()))
+			.toList();
 		long firstCompletion = round.stream().mapToLong(Arrival::completedNanos).min().orElse(Long.MIN_VALUE);
 		int before = (int) round.stream().filter((a) -> a.arrivedNanos() < firstCompletion).count();
 		long first = round.stream().mapToLong(Arrival::arrivedNanos).min().orElse(0);

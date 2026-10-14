@@ -9,6 +9,7 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -159,14 +160,23 @@ public final class ConcurrentRequestHarness {
 
 	/** Sends THREADS copies of the request at once and waits for all of them. */
 	public Run fire(Supplier<HttpRequest> request) throws Exception {
-		ExecutorService pool = Executors.newFixedThreadPool(THREADS);
-		CountDownLatch ready = new CountDownLatch(THREADS);
+		return fire(Collections.nCopies(THREADS, request));
+	}
+
+	/**
+	 * Sends one request per supplier at once, one thread each, and waits for all of them.
+	 * Responses are in the same order as the suppliers.
+	 */
+	public Run fire(List<Supplier<HttpRequest>> requests) throws Exception {
+		int threads = requests.size();
+		ExecutorService pool = Executors.newFixedThreadPool(threads);
+		CountDownLatch ready = new CountDownLatch(threads);
 		CountDownLatch gate = new CountDownLatch(1);
 		AtomicInteger inFlight = new AtomicInteger();
 		AtomicInteger peak = new AtomicInteger();
 		try {
 			List<Future<Response>> futures = new ArrayList<>();
-			for (int i = 0; i < THREADS; i++) {
+			for (Supplier<HttpRequest> request : requests) {
 				futures.add(pool.submit(() -> {
 					HttpRequest httpRequest = request.get();
 					ready.countDown();
@@ -180,7 +190,7 @@ public final class ConcurrentRequestHarness {
 					}
 				}));
 			}
-			assertThat(ready.await(60, TimeUnit.SECONDS)).as("all %d threads parked on the gate", THREADS).isTrue();
+			assertThat(ready.await(60, TimeUnit.SECONDS)).as("all %d threads parked on the gate", threads).isTrue();
 			gate.countDown();
 			List<Response> responses = new ArrayList<>();
 			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(120);
