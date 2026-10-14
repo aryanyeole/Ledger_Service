@@ -12,7 +12,6 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -20,6 +19,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import javax.sql.DataSource;
@@ -34,7 +34,8 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 
-// Proof that the database roles match the declared model (D-006, D-033, D-034, D-040):
+// Proof that the database roles match the declared model (D-006, D-033, D-034, D-040,
+// D-043, D-060):
 // role attributes, memberships, ownership, the table/column/sequence privilege matrix,
 // schema and database privileges, trigger hardening, and that the runtime roles cannot
 // bypass any of it. Catalog reads go through the app connection; pg_catalog and the
@@ -66,31 +67,50 @@ class DbRolePrivilegesTest {
 			"REFERENCES", "TRIGGER", "MAINTAIN");
 
 	// Table-level privileges per table and runtime role; anything not listed must be false.
-	// accounts INSERT/UPDATE are column-level grants (see accountsColumnPrivileges), so they
-	// are false at table level. Every table in public must have a row here: M2/M3 tables
-	// add theirs, and idempotency_keys will be all false for settlement_worker (D-020).
+	// INSERT/UPDATE on accounts and idempotency_keys are column-level grants (COLUMN_GRANTS),
+	// so they are false at table level. Every table in public must have a row here.
+	// settlement_worker gets nothing on idempotency_keys (D-020, D-043).
 	private static final Map<String, Map<Role, Set<String>>> TABLE_MATRIX = Map.of(
 			"accounts", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of("SELECT")),
 			"transactions", Map.of(Role.APP, Set.of("SELECT", "INSERT"), Role.WORKER, Set.of("SELECT", "INSERT")),
 			"entries", Map.of(Role.APP, Set.of("SELECT", "INSERT"), Role.WORKER, Set.of("SELECT", "INSERT")),
+			"idempotency_keys", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of()),
 			"flyway_schema_history", Map.of(Role.APP, Set.of(), Role.WORKER, Set.of()));
 
-	private static final List<String> ACCOUNTS_COLUMNS = List.of("id", "name", "type", "currency", "balance",
-			"allow_negative", "created_at");
+	// Every column of each table that carries column-level grants.
+	private static final Map<String, List<String>> TABLE_COLUMNS = Map.of(
+			"accounts", List.of("id", "name", "type", "currency", "balance", "allow_negative", "created_at"),
+			"idempotency_keys", List.of("client_id", "key", "request_hash", "status_code", "response_body",
+					"created_at", "expires_at"));
 
-	// Column privileges on accounts, beyond table-level SELECT (which covers every column).
-	private static final Map<Role, Map<String, Set<String>>> ACCOUNTS_COLUMN_GRANTS = Map.of(Role.APP,
-			Map.of("INSERT", Set.of("name", "type", "allow_negative"), "UPDATE", Set.of("balance")), Role.WORKER,
-			Map.of("INSERT", Set.of(), "UPDATE", Set.of("balance")));
+	// Expected column ACLs: table -> role -> privilege -> columns, beyond table-level grants.
+	// No other column in public may carry a column-level grant (columnGrantsMatchMap).
+	private static final Map<String, Map<Role, Map<String, Set<String>>>> COLUMN_GRANTS = Map.of(
+			"accounts", Map.of(
+					Role.APP, Map.of("INSERT", Set.of("name", "type", "allow_negative"), "UPDATE", Set.of("balance")),
+					Role.WORKER, Map.of("INSERT", Set.of(), "UPDATE", Set.of("balance"))),
+			"idempotency_keys", Map.of(
+					Role.APP, Map.of("INSERT", Set.of("client_id", "key", "request_hash"), "UPDATE",
+							Set.of("status_code", "response_body")),
+					Role.WORKER, Map.of("INSERT", Set.of(), "UPDATE", Set.of())));
 
 	record TriggerSpec(String table, String function, boolean deferred) {
 	}
 
+	// Every non-internal trigger in public, exactly (D-060). Their functions are the exact set
+	// of trigger functions allowed in public, and each must be hardened (D-040).
 	private static final Map<String, TriggerSpec> TRIGGERS = Map.of(
 			"entries_balanced", new TriggerSpec("entries", "assert_transaction_balanced", true),
 			"transactions_have_entries", new TriggerSpec("transactions", "assert_transaction_has_entries", true),
 			"entries_append_only", new TriggerSpec("entries", "forbid_mutation", false),
-			"transactions_append_only", new TriggerSpec("transactions", "forbid_mutation", false));
+			"transactions_append_only", new TriggerSpec("transactions", "forbid_mutation", false),
+			"idempotency_keys_complete",
+			new TriggerSpec("idempotency_keys", "assert_idempotency_key_complete", true));
+
+	private static final Set<String> TRIGGER_FUNCTIONS = TRIGGERS.values()
+		.stream()
+		.map(TriggerSpec::function)
+		.collect(Collectors.toUnmodifiableSet());
 
 	enum Bypass {
 
@@ -105,15 +125,46 @@ class DbRolePrivilegesTest {
 		REPLACE_FUNCTION(
 				"CREATE OR REPLACE FUNCTION public.forbid_mutation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$",
 				"permission denied for schema public"),
-		CREATE_SCHEMA("CREATE SCHEMA t7_shadow", "permission denied for database ledger");
+		CREATE_SCHEMA("CREATE SCHEMA t7_shadow", "permission denied for database ledger"),
+
+		// idempotency_keys (D-043): role-specific; 42501 is the check, the message only has to
+		// name the table. WHERE false still runs the privilege check, so no row is needed.
+		WORKER_SELECT_KEYS(Role.WORKER, "SELECT 1 FROM idempotency_keys"),
+		WORKER_INSERT_KEY(Role.WORKER,
+				"INSERT INTO idempotency_keys (client_id, key, request_hash) VALUES ('t3', 'probe', decode(repeat('00', 32), 'hex'))"),
+		APP_INSERT_EXPIRES_AT(Role.APP,
+				"INSERT INTO idempotency_keys (client_id, key, request_hash, expires_at) VALUES ('t3', 'probe', decode(repeat('00', 32), 'hex'), now() + interval '30 days')"),
+		APP_UPDATE_REQUEST_HASH(Role.APP, "UPDATE idempotency_keys SET request_hash = request_hash WHERE false"),
+		APP_UPDATE_EXPIRES_AT(Role.APP, "UPDATE idempotency_keys SET expires_at = expires_at WHERE false"),
+		APP_UPDATE_CREATED_AT(Role.APP, "UPDATE idempotency_keys SET created_at = created_at WHERE false"),
+		APP_UPDATE_KEY(Role.APP, "UPDATE idempotency_keys SET key = key WHERE false"),
+		APP_UPDATE_CLIENT_ID(Role.APP, "UPDATE idempotency_keys SET client_id = client_id WHERE false"),
+		APP_DELETE_KEYS(Role.APP, "DELETE FROM idempotency_keys WHERE false"),
+		APP_TRUNCATE_KEYS(Role.APP, "TRUNCATE idempotency_keys");
+
+		final Set<Role> roles;
 
 		final String sql;
 
 		final String message;
 
+		// true: the server message must equal `message`; false: it must contain it.
+		final boolean exactMessage;
+
+		// Rejected for both runtime roles with exactly this server message.
 		Bypass(String sql, String message) {
+			this.roles = Set.of(Role.APP, Role.WORKER);
 			this.sql = sql;
 			this.message = message;
+			this.exactMessage = true;
+		}
+
+		// Rejected for one role; the server message must name idempotency_keys.
+		Bypass(Role role, String sql) {
+			this.roles = Set.of(role);
+			this.sql = sql;
+			this.message = "idempotency_keys";
+			this.exactMessage = false;
 		}
 
 	}
@@ -275,26 +326,30 @@ class DbRolePrivilegesTest {
 		}
 	}
 
-	// E1
+	// E1: every column of every table in COLUMN_GRANTS. A column privilege holds if the
+	// table-level grant (TABLE_MATRIX) or the column grant (COLUMN_GRANTS) gives it.
 	@Test
-	void accountsColumnPrivileges() throws SQLException {
+	void columnPrivileges() throws SQLException {
 		try (Connection conn = connect(Role.APP)) {
 			try {
-				List<String> columns = queryStrings(conn, """
-						SELECT attname FROM pg_attribute
-						WHERE attrelid = 'public.accounts'::regclass AND attnum > 0 AND NOT attisdropped""");
-				assertThat(columns).as("accounts columns").containsExactlyInAnyOrderElementsOf(ACCOUNTS_COLUMNS);
+				for (Map.Entry<String, Map<Role, Map<String, Set<String>>>> table : COLUMN_GRANTS.entrySet()) {
+					String name = table.getKey();
+					List<String> columns = queryStrings(conn, "SELECT attname FROM pg_attribute WHERE attrelid = 'public."
+							+ name + "'::regclass AND attnum > 0 AND NOT attisdropped");
+					assertThat(columns).as("%s columns", name)
+						.containsExactlyInAnyOrderElementsOf(TABLE_COLUMNS.get(name));
 
-				for (Role role : RUNTIME_ROLES) {
-					for (String column : ACCOUNTS_COLUMNS) {
-						for (String privilege : List.of("SELECT", "INSERT", "UPDATE")) {
-							boolean expected = privilege.equals("SELECT")
-									|| ACCOUNTS_COLUMN_GRANTS.get(role).get(privilege).contains(column);
-							assertThat(queryBoolean(conn,
-									"SELECT has_column_privilege(?::name, 'public.accounts'::regclass, ?::text, ?::text)",
-									role.dbRole, column, privilege))
-								.as("%s: %s on accounts.%s", role.dbRole, privilege, column)
-								.isEqualTo(expected);
+					for (Role role : RUNTIME_ROLES) {
+						for (String column : TABLE_COLUMNS.get(name)) {
+							for (String privilege : List.of("SELECT", "INSERT", "UPDATE")) {
+								boolean expected = TABLE_MATRIX.get(name).get(role).contains(privilege)
+										|| table.getValue().get(role).getOrDefault(privilege, Set.of()).contains(column);
+								assertThat(queryBoolean(conn,
+										"SELECT has_column_privilege(?::name, ?::regclass, ?::text, ?::text)",
+										role.dbRole, "public." + name, column, privilege))
+									.as("%s: %s on %s.%s", role.dbRole, privilege, name, column)
+									.isEqualTo(expected);
+							}
 						}
 					}
 				}
@@ -305,9 +360,13 @@ class DbRolePrivilegesTest {
 		}
 	}
 
-	// E2
+	// E2: the columns carrying any column-level ACL in public are exactly those in COLUMN_GRANTS.
 	@Test
-	void columnGrantsExistOnlyOnAccounts() throws SQLException {
+	void columnGrantsMatchMap() throws SQLException {
+		Set<String> expected = new TreeSet<>();
+		COLUMN_GRANTS.forEach((table, byRole) -> byRole.values()
+			.forEach((byPrivilege) -> byPrivilege.values()
+				.forEach((columns) -> columns.forEach((column) -> expected.add(table + "." + column)))));
 		try (Connection conn = connect(Role.APP)) {
 			try {
 				List<String> columnsWithAcl = queryStrings(conn, """
@@ -315,8 +374,7 @@ class DbRolePrivilegesTest {
 						FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
 						WHERE c.relnamespace = 'public'::regnamespace AND a.attnum > 0 AND a.attacl IS NOT NULL""");
 				assertThat(columnsWithAcl).as("ledger_api_app/settlement_worker: columns with column-level grants")
-					.containsExactlyInAnyOrder("accounts.name", "accounts.type", "accounts.allow_negative",
-							"accounts.balance");
+					.containsExactlyInAnyOrderElementsOf(expected);
 			}
 			finally {
 				conn.rollback();
@@ -395,9 +453,54 @@ class DbRolePrivilegesTest {
 		}
 	}
 
+	// H2: negative control for H's exact sets (D-060). As the owner, in a transaction that is
+	// rolled back, add a trigger function without a pinned search_path and a trigger using it:
+	// the check must report both, and the function as unhardened. After the rollback the
+	// normal check passes again.
+	@Test
+	void hardeningCheckCatchesUnlistedUnhardenedTrigger() throws SQLException {
+		String suffix = UUID.randomUUID().toString().replace("-", "");
+		String function = "t3_unhardened_" + suffix;
+		String trigger = "t3_unhardened_trigger_" + suffix;
+		try (Connection conn = connect(Role.OWNER)) {
+			try {
+				try (Statement st = conn.createStatement()) {
+					st.execute("CREATE FUNCTION public." + function
+							+ "() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$");
+					st.execute("CREATE TRIGGER " + trigger
+							+ " AFTER INSERT ON public.idempotency_keys FOR EACH ROW EXECUTE FUNCTION public." + function
+							+ "()");
+				}
+				HardeningReport report = hardeningReport(conn);
+				assertThat(report.unlistedFunctions()).as("ledger_api_owner: unlisted trigger functions")
+					.containsExactly(function);
+				assertThat(report.unhardenedFunctions()).as("ledger_api_owner: unhardened trigger functions")
+					.containsExactly(function);
+				assertThat(report.unlistedTriggers()).as("ledger_api_owner: unlisted triggers").containsExactly(trigger);
+				assertThat(report.missingFunctions()).as("ledger_api_owner: missing trigger functions").isEmpty();
+				assertThat(report.missingTriggers()).as("ledger_api_owner: missing triggers").isEmpty();
+				assertThat(report.triggerMismatches()).as("ledger_api_owner: trigger mismatches").isEmpty();
+				assertThat(report.clean()).as("ledger_api_owner: report clean").isFalse();
+			}
+			finally {
+				conn.rollback();
+			}
+		}
+		try (Connection conn = connect(Role.APP)) {
+			try {
+				assertTriggerHardening(conn, "after rolled-back negative control");
+			}
+			finally {
+				conn.rollback();
+			}
+		}
+	}
+
 	static Stream<Arguments> bypassAttempts() {
 		return RUNTIME_ROLES.stream()
-			.flatMap(role -> Arrays.stream(Bypass.values()).map(bypass -> Arguments.of(role, bypass)));
+			.flatMap(role -> Arrays.stream(Bypass.values())
+				.filter(bypass -> bypass.roles.contains(role))
+				.map(bypass -> Arguments.of(role, bypass)));
 	}
 
 	// I
@@ -420,7 +523,12 @@ class DbRolePrivilegesTest {
 
 		assertThat((Throwable) e).as("%s: %s must be rejected by the statement itself", role.dbRole, bypass)
 			.isNotNull();
-		assertRootError(e, role, INSUFFICIENT_PRIVILEGE, bypass.message);
+		if (bypass.exactMessage) {
+			assertRootError(e, role, INSUFFICIENT_PRIVILEGE, bypass.message);
+		}
+		else {
+			assertRootErrorContains(e, role, INSUFFICIENT_PRIVILEGE, bypass.message);
+		}
 
 		try (Connection conn = connect(Role.APP)) {
 			try {
@@ -466,28 +574,48 @@ class DbRolePrivilegesTest {
 		return new MatrixDiff(missing, stale);
 	}
 
+	// What the exact-set hardening check found (D-060). Empty lists everywhere = hardened.
+	record HardeningReport(Set<String> unlistedFunctions, Set<String> missingFunctions,
+			Set<String> unhardenedFunctions, Set<String> unlistedTriggers, Set<String> missingTriggers,
+			List<String> triggerMismatches) {
+
+		boolean clean() {
+			return unlistedFunctions.isEmpty() && missingFunctions.isEmpty() && unhardenedFunctions.isEmpty()
+					&& unlistedTriggers.isEmpty() && missingTriggers.isEmpty() && triggerMismatches.isEmpty();
+		}
+
+	}
+
 	private static void assertTriggerHardening(Connection conn, String context) throws SQLException {
-		Map<String, Map<String, Object>> functions = new HashMap<>();
+		HardeningReport report = hardeningReport(conn);
+		assertThat(report.unlistedFunctions()).as("%s: trigger functions in public not in TRIGGERS", context).isEmpty();
+		assertThat(report.missingFunctions()).as("%s: TRIGGERS functions missing from public", context).isEmpty();
+		assertThat(report.unhardenedFunctions()).as("%s: trigger functions not hardened", context).isEmpty();
+		assertThat(report.unlistedTriggers()).as("%s: triggers in public not in TRIGGERS", context).isEmpty();
+		assertThat(report.missingTriggers()).as("%s: TRIGGERS entries missing from public", context).isEmpty();
+		assertThat(report.triggerMismatches()).as("%s: triggers differing from TRIGGERS", context).isEmpty();
+	}
+
+	// Exact sets (D-060): every function in public returning trigger, and every non-internal
+	// trigger on a table in public, compared with TRIGGERS. Hardening (D-040: not SECURITY
+	// DEFINER, search_path pinned) is checked for every trigger function found, listed or not.
+	private static HardeningReport hardeningReport(Connection conn) throws SQLException {
+		Set<String> unhardened = new TreeSet<>();
+		Set<String> functions = new TreeSet<>();
 		try (PreparedStatement ps = conn.prepareStatement("""
 				SELECT p.proname, p.prosecdef, p.proconfig FROM pg_proc p
-				WHERE p.pronamespace = 'public'::regnamespace AND p.proname = ANY (?)""")) {
-			ps.setArray(1, conn.createArrayOf("text", new String[] { "assert_transaction_balanced",
-					"assert_transaction_has_entries", "forbid_mutation" }));
-			try (ResultSet rs = ps.executeQuery()) {
-				while (rs.next()) {
-					Array config = rs.getArray("proconfig");
-					functions.put(rs.getString("proname"), Map.of("prosecdef", rs.getBoolean("prosecdef"), "proconfig",
-							config == null ? List.of() : List.of((String[]) config.getArray())));
+				WHERE p.pronamespace = 'public'::regnamespace AND p.prorettype = 'pg_catalog.trigger'::regtype""");
+				ResultSet rs = ps.executeQuery()) {
+			while (rs.next()) {
+				String name = rs.getString("proname");
+				functions.add(name);
+				Array config = rs.getArray("proconfig");
+				List<String> settings = (config == null) ? List.of() : List.of((String[]) config.getArray());
+				if (rs.getBoolean("prosecdef") || !settings.equals(List.of(SEARCH_PATH))) {
+					unhardened.add(name);
 				}
 			}
 		}
-		assertThat(functions).as("%s: hardened trigger functions", context)
-			.containsOnlyKeys("assert_transaction_balanced", "assert_transaction_has_entries", "forbid_mutation");
-		functions.forEach((name, attributes) -> {
-			assertThat(attributes.get("prosecdef")).as("%s: %s prosecdef", context, name).isEqualTo(false);
-			assertThat(attributes.get("proconfig")).as("%s: %s proconfig", context, name)
-				.isEqualTo(List.of(SEARCH_PATH));
-		});
 
 		Map<String, Map<String, Object>> triggers = new LinkedHashMap<>();
 		try (PreparedStatement ps = conn.prepareStatement("""
@@ -506,18 +634,38 @@ class DbRolePrivilegesTest {
 								rs.getBoolean("function_in_public")));
 			}
 		}
-		assertThat(triggers).as("%s: triggers in public", context).containsKeys(TRIGGERS.keySet().toArray(String[]::new));
+
+		List<String> mismatches = new ArrayList<>();
 		TRIGGERS.forEach((name, spec) -> {
 			Map<String, Object> actual = triggers.get(name);
-			assertThat(actual.get("table")).as("%s: %s table", context, name).isEqualTo(spec.table());
-			assertThat(actual.get("enabled")).as("%s: %s tgenabled", context, name).isEqualTo("O");
-			assertThat(actual.get("function")).as("%s: %s tgfoid", context, name).isEqualTo(spec.function());
-			assertThat(actual.get("functionInPublic")).as("%s: %s function schema", context, name).isEqualTo(true);
-			if (spec.deferred()) {
-				assertThat(actual.get("deferrable")).as("%s: %s tgdeferrable", context, name).isEqualTo(true);
-				assertThat(actual.get("initdeferred")).as("%s: %s tginitdeferred", context, name).isEqualTo(true);
+			if (actual == null) {
+				return;
 			}
+			Map<String, Object> expected = new LinkedHashMap<>();
+			expected.put("table", spec.table());
+			expected.put("enabled", "O");
+			expected.put("function", spec.function());
+			expected.put("functionInPublic", true);
+			if (spec.deferred()) {
+				expected.put("deferrable", true);
+				expected.put("initdeferred", true);
+			}
+			expected.forEach((attribute, value) -> {
+				if (!value.equals(actual.get(attribute))) {
+					mismatches.add(name + "." + attribute + ": expected " + value + ", was " + actual.get(attribute));
+				}
+			});
 		});
+
+		return new HardeningReport(difference(functions, TRIGGER_FUNCTIONS), difference(TRIGGER_FUNCTIONS, functions),
+				unhardened, difference(triggers.keySet(), TRIGGERS.keySet()),
+				difference(TRIGGERS.keySet(), triggers.keySet()), mismatches);
+	}
+
+	private static Set<String> difference(Set<String> left, Set<String> right) {
+		Set<String> result = new TreeSet<>(left);
+		result.removeAll(right);
+		return result;
 	}
 
 	private static boolean hasSchemaPrivilege(Connection conn, Role role, String privilege) throws SQLException {
@@ -600,6 +748,15 @@ class DbRolePrivilegesTest {
 
 	// SQLState and server message of the deepest SQLException in the cause chain.
 	private static void assertRootError(SQLException thrown, Role role, String sqlState, String message) {
+		assertThat(rootServerMessage(thrown, role, sqlState)).as("%s: server message", role.dbRole).isEqualTo(message);
+	}
+
+	// SQLState is the check; the server message only has to contain `fragment`.
+	private static void assertRootErrorContains(SQLException thrown, Role role, String sqlState, String fragment) {
+		assertThat(rootServerMessage(thrown, role, sqlState)).as("%s: server message", role.dbRole).contains(fragment);
+	}
+
+	private static String rootServerMessage(SQLException thrown, Role role, String sqlState) {
 		SQLException root = thrown;
 		for (Throwable cause = thrown; cause != null; cause = cause.getCause()) {
 			if (cause instanceof SQLException sql) {
@@ -608,8 +765,7 @@ class DbRolePrivilegesTest {
 		}
 		assertThat(root.getSQLState()).as("%s: SQLState of %s", role.dbRole, root).isEqualTo(sqlState);
 		assertThat((Throwable) root).as("%s: driver exception type", role.dbRole).isInstanceOf(PSQLException.class);
-		assertThat(((PSQLException) root).getServerErrorMessage().getMessage()).as("%s: server message", role.dbRole)
-			.isEqualTo(message);
+		return ((PSQLException) root).getServerErrorMessage().getMessage();
 	}
 
 }
