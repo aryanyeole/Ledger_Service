@@ -4,8 +4,7 @@ import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.util.Optional;
 
-import org.postgresql.util.PSQLException;
-import org.postgresql.util.ServerErrorMessage;
+import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -13,12 +12,17 @@ import org.springframework.stereotype.Repository;
 
 import dev.aryanyeole.ledgerapi.api.ApiException;
 import dev.aryanyeole.ledgerapi.api.ProblemCode;
+import dev.aryanyeole.ledgerapi.api.StoredOutcomeException;
+import dev.aryanyeole.ledgerapi.db.DbErrors;
+import dev.aryanyeole.ledgerapi.db.LockContention;
 
 @Repository
 public class AccountRepository {
 
 	// V1's `name TEXT NOT NULL UNIQUE`, under Postgres' default constraint name.
 	static final String NAME_UNIQUE_CONSTRAINT = "accounts_name_key";
+
+	private static final String NAME_TAKEN = "An account with this name already exists.";
 
 	private final JdbcClient jdbc;
 
@@ -36,9 +40,10 @@ public class AccountRepository {
 	}
 
 	// allow_negative is not in the column list: the default (false) applies, and V1's CHECK
-	// ties it to type (D-039, D-048). A single statement, so it commits on its own.
-	// Only a violation of the name constraint is the client's duplicate; any other 23505
-	// (e.g. the system-type singleton index) is unexpected here and stays a 500.
+	// ties it to type (D-039, D-048). Runs inside WriteTransactions; the controller wraps it.
+	// Unkeyed creation (D-054): only a violation of the name constraint is the client's
+	// duplicate, an unstored 409; any other 23505 (e.g. the system-type singleton index) is
+	// unexpected and stays a 500 (D-058). A lock timeout is contention: 503 (D-050).
 	Created insert(String name, String type) {
 		try {
 			return this.jdbc.sql("INSERT INTO accounts (name, type) VALUES (:name, :type) RETURNING id, created_at")
@@ -48,11 +53,33 @@ public class AccountRepository {
 				.single();
 		}
 		catch (DuplicateKeyException ex) {
-			if (NAME_UNIQUE_CONSTRAINT.equals(violatedConstraint(ex))) {
-				throw new ApiException(HttpStatus.CONFLICT, ProblemCode.ACCOUNT_NAME_TAKEN,
-						"An account with this name already exists.");
+			if (NAME_UNIQUE_CONSTRAINT.equals(DbErrors.violatedConstraint(ex))) {
+				throw new ApiException(HttpStatus.CONFLICT, ProblemCode.ACCOUNT_NAME_TAKEN, NAME_TAKEN);
 			}
 			throw ex;
+		}
+		catch (DataAccessException ex) {
+			throw DbErrors.isLockTimeout(ex) ? new LockContention() : ex;
+		}
+	}
+
+	// Keyed creation (D-054): a taken name leaves the transaction usable, so the 409 can be
+	// stored against the key. Only the name conflict is absorbed; any other unique violation
+	// still raises and stays a 500.
+	Created insertIfNameFree(String name, String type) {
+		try {
+			return this.jdbc
+				.sql("INSERT INTO accounts (name, type) VALUES (:name, :type) ON CONFLICT (name) DO NOTHING "
+						+ "RETURNING id, created_at")
+				.param("name", name)
+				.param("type", type)
+				.query((rs, rowNum) -> new Created(rs.getLong("id"), rs.getObject("created_at", OffsetDateTime.class)))
+				.optional()
+				.orElseThrow(() -> new StoredOutcomeException(HttpStatus.CONFLICT, ProblemCode.ACCOUNT_NAME_TAKEN,
+						NAME_TAKEN));
+		}
+		catch (DataAccessException ex) {
+			throw DbErrors.isLockTimeout(ex) ? new LockContention() : ex;
 		}
 	}
 
@@ -72,16 +99,6 @@ public class AccountRepository {
 			.query((rs, rowNum) -> new Balance(rs.getBigDecimal("balance"),
 					rs.getObject("as_of", OffsetDateTime.class)))
 			.optional();
-	}
-
-	private static String violatedConstraint(DuplicateKeyException ex) {
-		for (Throwable cause = ex.getCause(); cause != null; cause = cause.getCause()) {
-			if (cause instanceof PSQLException psql) {
-				ServerErrorMessage message = psql.getServerErrorMessage();
-				return (message != null) ? message.getConstraint() : null;
-			}
-		}
-		return null;
 	}
 
 }

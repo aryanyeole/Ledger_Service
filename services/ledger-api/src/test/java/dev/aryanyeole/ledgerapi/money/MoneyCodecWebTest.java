@@ -19,11 +19,15 @@ import org.springframework.test.web.servlet.ResultActions;
 import dev.aryanyeole.ledgerapi.api.ApiKeyFilter;
 import dev.aryanyeole.ledgerapi.api.EdgeProbe;
 import dev.aryanyeole.ledgerapi.api.ProblemCode;
+import dev.aryanyeole.ledgerapi.api.StrictJsonConfiguration;
 
 // The money codec end to end through MVC (D-047): request JSON -> Money -> response JSON.
-// Each row is the raw JSON value of "amount". Default max-amount (1000000.00).
-@WebMvcTest(controllers = EdgeProbe.Controller.class, properties = EdgeProbe.API_KEYS_PROPERTY)
-@Import(EdgeProbe.Controller.class)
+// Each row is the raw JSON value of "amount". Default max-amount (1000000.00). Runs with the
+// app's strict scalar settings (D-065), which must not turn a JSON number amount into
+// invalid_request: amounts stay on the codec and invalid_amount.
+@WebMvcTest(controllers = EdgeProbe.Controller.class, properties = { EdgeProbe.API_KEYS_PROPERTY,
+		"spring.jackson.deserialization.fail-on-unknown-properties=true" })
+@Import({ EdgeProbe.Controller.class, StrictJsonConfiguration.class })
 class MoneyCodecWebTest {
 
 	@Autowired

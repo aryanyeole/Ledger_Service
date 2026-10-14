@@ -16,6 +16,9 @@ spring:
   jackson:
     # JSON field names follow spec §7: account_id, as_of, created_at.
     property-naming-strategy: SNAKE_CASE
+    deserialization:
+      # Unknown JSON fields are a 400 invalid_request, never silently ignored (D-046).
+      fail-on-unknown-properties: true
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
 

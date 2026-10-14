@@ -15,6 +15,9 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.request.WebRequest;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 
+import tools.jackson.core.exc.InputCoercionException;
+import tools.jackson.databind.DatabindException;
+
 // The one error handler: every error response is RFC 9457 application/problem+json with a
 // machine-readable `code`. Framework exceptions keep Spring's status and generic detail and
 // get a code derived from the status. Anything unexpected is a 500 whose body says nothing
@@ -41,17 +44,26 @@ public class ProblemHandler extends ResponseEntityExceptionHandler {
 	}
 
 	// A deserializer that rejects a value (e.g. an invalid amount) surfaces here, wrapped by
-	// Jackson and the message converter; its own code and detail win over "malformed".
+	// Jackson and the message converter; its own code and detail win. Otherwise: readable
+	// JSON that doesn't fit the request (unknown field, wrong scalar type, out-of-range
+	// integer; D-046, D-065) is invalid_request; unreadable JSON is malformed_request.
 	@Override
 	protected ResponseEntity<Object> handleHttpMessageNotReadable(HttpMessageNotReadableException ex,
 			HttpHeaders headers, HttpStatusCode status, WebRequest request) {
+		boolean doesNotFit = false;
 		for (Throwable cause = ex.getCause(); cause != null; cause = cause.getCause()) {
 			if (cause instanceof ApiException apiException) {
 				return ResponseEntity.status(apiException.status()).body(problem(apiException).getBody());
 			}
+			if (cause instanceof DatabindException || cause instanceof InputCoercionException) {
+				doesNotFit = true;
+			}
 		}
-		ProblemDetail body = ProblemDetail.forStatusAndDetail(status, "Request body is not readable JSON.");
-		body.setProperty(CODE, ProblemCode.MALFORMED_REQUEST.value());
+		ProblemDetail body = doesNotFit
+				? ProblemDetail.forStatusAndDetail(status, "Request body does not match the expected fields and types.")
+				: ProblemDetail.forStatusAndDetail(status, "Request body is not readable JSON.");
+		body.setProperty(CODE,
+				(doesNotFit ? ProblemCode.INVALID_REQUEST : ProblemCode.MALFORMED_REQUEST).value());
 		return handleExceptionInternal(ex, body, headers, status, request);
 	}
 
@@ -66,9 +78,14 @@ public class ProblemHandler extends ResponseEntityExceptionHandler {
 	}
 
 	private static ResponseEntity<ProblemDetail> problem(ApiException ex) {
+		return ResponseEntity.status(ex.status()).headers(ex.headers()).body(problemDetail(ex));
+	}
+
+	/** The body for an ApiException; stored outcomes are rendered from this too (D-044). */
+	public static ProblemDetail problemDetail(ApiException ex) {
 		ProblemDetail body = ProblemDetail.forStatusAndDetail(ex.status(), ex.getMessage());
 		body.setProperty(CODE, ex.code().value());
-		return ResponseEntity.status(ex.status()).headers(ex.headers()).body(body);
+		return body;
 	}
 
 	// NOT_FOUND -> not_found, METHOD_NOT_ALLOWED -> method_not_allowed, ...
