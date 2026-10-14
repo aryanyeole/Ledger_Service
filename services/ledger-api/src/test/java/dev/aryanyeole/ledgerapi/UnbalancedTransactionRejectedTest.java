@@ -61,6 +61,7 @@ class UnbalancedTransactionRejectedTest {
 	void balancedPostingCommits(Role role) throws SQLException {
 		long external = SystemAccountFixture.external(dataSource);
 		long customer = createAccount("CUSTOMER");
+		Totals externalBefore = totals(role, external);
 
 		long txId = postBalancedDeposit(role, external, customer);
 
@@ -69,8 +70,9 @@ class UnbalancedTransactionRejectedTest {
 			assertThat(entries).containsOnlyKeys(external, customer);
 			assertThat(entries.get(external)).isEqualByComparingTo("-100.0000");
 			assertThat(entries.get(customer)).isEqualByComparingTo("100.0000");
-			assertBalancesMatchEntries(conn, role, external, customer);
+			assertBalancesMatchEntries(conn, role, customer);
 		}
+		assertMovedBy(role, external, externalBefore, totals(role, external), "-100.0000");
 	}
 
 	@ParameterizedTest(name = "{0}")
@@ -80,6 +82,7 @@ class UnbalancedTransactionRejectedTest {
 		long customerA = createAccount("CUSTOMER");
 		long customerB = createAccount("CUSTOMER");
 		String reference = newReference();
+		Totals externalBefore = totals(role, external);
 
 		long txId;
 		try (Connection conn = connect(role)) {
@@ -99,8 +102,9 @@ class UnbalancedTransactionRejectedTest {
 
 		try (Connection conn = connect(role)) {
 			assertThat(entrySum(conn, txId).compareTo(BigDecimal.ZERO)).isZero();
-			assertBalancesMatchEntries(conn, role, external, customerA, customerB);
+			assertBalancesMatchEntries(conn, role, customerA, customerB);
 		}
+		assertMovedBy(role, external, externalBefore, totals(role, external), "-0.3");
 	}
 
 	@ParameterizedTest(name = "{0}")
@@ -180,6 +184,7 @@ class UnbalancedTransactionRejectedTest {
 	void lateUnbalancedAppendIsRejected(Role role) throws SQLException {
 		long external = SystemAccountFixture.external(dataSource);
 		long customer = createAccount("CUSTOMER");
+		Totals externalBefore = totals(role, external);
 		long txId = postBalancedDeposit(role, external, customer);
 
 		try (Connection conn = connect(role)) {
@@ -199,8 +204,9 @@ class UnbalancedTransactionRejectedTest {
 		try (Connection conn = connect(role)) {
 			assertThat(entryCount(conn, txId)).isEqualTo(2);
 			assertThat(entrySum(conn, txId).compareTo(BigDecimal.ZERO)).isZero();
-			assertBalancesMatchEntries(conn, role, external, customer);
+			assertBalancesMatchEntries(conn, role, customer);
 		}
+		assertMovedBy(role, external, externalBefore, totals(role, external), "-100.0000");
 	}
 
 	@ParameterizedTest(name = "{0}")
@@ -344,6 +350,39 @@ class UnbalancedTransactionRejectedTest {
 		}
 	}
 
+	// An account's balance and SUM(entries.amount), read in one statement.
+	private record Totals(BigDecimal balance, BigDecimal entrySum) {
+	}
+
+	// Fresh connection as the given role; connect() asserts current_user (D-036).
+	private Totals totals(Role role, long accountId) throws SQLException {
+		try (Connection conn = connect(role);
+				PreparedStatement ps = conn.prepareStatement(
+						"SELECT a.balance, (SELECT COALESCE(SUM(e.amount), 0) FROM entries e WHERE e.account_id = a.id) FROM accounts a WHERE a.id = ?")) {
+			ps.setLong(1, accountId);
+			try (ResultSet rs = ps.executeQuery()) {
+				assertThat(rs.next()).as("[%s] account %d exists", role.dbRole, accountId).isTrue();
+				return new Totals(rs.getBigDecimal(1), rs.getBigDecimal(2));
+			}
+		}
+	}
+
+	// The shared system:external account carries every other test's postings, and below V2
+	// (failing-first runs) their unbalanced commits too, so its totals need not match (BUG-002).
+	// It is checked by what this test moved: balance and entry sum by exactly the same amount.
+	private static void assertMovedBy(Role role, long accountId, Totals before, Totals after, String amount) {
+		BigDecimal expected = new BigDecimal(amount);
+		BigDecimal balanceDelta = after.balance().subtract(before.balance());
+		BigDecimal entryDelta = after.entrySum().subtract(before.entrySum());
+		assertThat(balanceDelta.compareTo(expected))
+			.as("[%s] account %d balance moved by %s, expected %s", role.dbRole, accountId, balanceDelta, expected)
+			.isZero();
+		assertThat(entryDelta.compareTo(expected))
+			.as("[%s] account %d entry sum moved by %s, expected %s", role.dbRole, accountId, entryDelta, expected)
+			.isZero();
+	}
+
+	// Totals check for accounts created by the test itself; never for the shared EXTERNAL.
 	private static void assertBalancesMatchEntries(Connection conn, Role role, long... accountIds) throws SQLException {
 		try (PreparedStatement ps = conn.prepareStatement(
 				"SELECT a.balance, (SELECT COALESCE(SUM(e.amount), 0) FROM entries e WHERE e.account_id = a.id) FROM accounts a WHERE a.id = ?")) {
