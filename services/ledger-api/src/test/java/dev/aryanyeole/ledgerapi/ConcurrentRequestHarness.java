@@ -21,7 +21,7 @@ import java.util.function.Supplier;
 
 import javax.sql.DataSource;
 
-import org.apache.coyote.AbstractProtocol;
+import org.apache.coyote.http11.AbstractHttp11Protocol;
 import org.springframework.boot.tomcat.TomcatWebServer;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
 
@@ -43,8 +43,13 @@ public final class ConcurrentRequestHarness {
 
 	public static final int THREADS = 100;
 
-	/** Overlap floor (D-067): requests already sent when the first response arrived. */
-	public static final int MIN_SENT_BEFORE_FIRST_RESPONSE = 50;
+	/**
+	 * Proof tripwire (D-067): requests that arrived at the server before the first completed.
+	 * max(2, floor(0.6 x CI min)) with CI min 7 over 10 runs on 4-processor GitHub runners
+	 * (BUG-003). Guards against a serialized harness; it is not the overlap claim.
+	 */
+	public static final int MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION = 4;
+
 
 	/** -Dledger.test.concurrency.rounds: CI 1, local soak 20. */
 	public static final String ROUNDS_PROPERTY = "ledger.test.concurrency.rounds";
@@ -81,12 +86,25 @@ public final class ConcurrentRequestHarness {
 		return rounds;
 	}
 
-	/** The limits actually in effect: Hikari pool size and Tomcat max worker threads. */
+	/**
+	 * The hardware and limits in effect, so CI and local numbers carry their context
+	 * (BUG-003): processors, max heap, Hikari pool size, Tomcat threads and keep-alive.
+	 */
 	public static String serverLimits(DataSource dataSource, WebServerApplicationContext context) throws Exception {
 		int pool = dataSource.unwrap(HikariDataSource.class).getMaximumPoolSize();
 		TomcatWebServer webServer = (TomcatWebServer) context.getWebServer();
-		int threads = ((AbstractProtocol<?>) webServer.getTomcat().getConnector().getProtocolHandler()).getMaxThreads();
-		return "hikari.maximumPoolSize=" + pool + " tomcat.maxThreads=" + threads;
+		AbstractHttp11Protocol<?> protocol = (AbstractHttp11Protocol<?>) webServer.getTomcat()
+			.getConnector()
+			.getProtocolHandler();
+		return "processors=" + Runtime.getRuntime().availableProcessors() + " maxHeapMB="
+				+ Runtime.getRuntime().maxMemory() / 1_048_576 + " hikari.maximumPoolSize=" + pool + " tomcat.maxThreads="
+				+ protocol.getMaxThreads() + " tomcat.minSpareThreads=" + protocol.getMinSpareThreads()
+				+ " tomcat.keepAliveTimeout=" + protocol.getKeepAliveTimeout() + " tomcat.maxKeepAliveRequests="
+				+ protocol.getMaxKeepAliveRequests();
+	}
+
+	public static int processors() {
+		return Runtime.getRuntime().availableProcessors();
 	}
 
 	public static String newKey() {
