@@ -14,7 +14,7 @@ import org.testcontainers.utility.MountableFile;
 // bootstrapped by the same init script as Compose, and the app connects with the same
 // properties as application.yml: ledger_api_app at runtime, ledger_api_owner for Flyway.
 @TestConfiguration(proxyBeanMethods = false)
-class TestcontainersConfiguration {
+public class TestcontainersConfiguration {
 
 	// Relative to the module directory, which is the working directory for Maven tests.
 	private static final Path ROLES_SCRIPT = Path.of("../../infra/postgres/init/01-roles.sh");
