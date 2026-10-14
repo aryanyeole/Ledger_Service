@@ -175,7 +175,15 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
   gh run view 38633176987 --log
   ```
 - **Time to diagnose:**
-- **Root cause:** Under investigation, not yet confirmed. One observation from run 38633176987 so far: the control reached n = 1 even though the client recorded 53 requests "sent" before the first response. So the client-side send timestamp, taken just before `HttpClient.send`, does not show that the request had reached the server.
+- **Root cause:** Partly established; the fix is not settled.
+  - **The client-side metric doesn't measure arrival.** It counts threads that called `HttpClient.send`, not requests that reached the server. In run 38633176987 the control had n = 1 while the client counted 53 "sent" before the first response.
+  - **A cold measured round funnels its connects through `HttpClient`'s single selector thread** (JDK 21 `PlainHttpConnection.connectAsync` → `ConnectEvent`).
+  - **On the 4-processor GitHub runner, overlap stays low even after a warm-up.** Phase 1 (PR #22, commit `2167fa2`, run 38637012761 attempts 1–5) measured server-side "arrived before the first completed":
+    - proof 7, 8, 17, 23, 12;
+    - control 13, 13, 19, 16, 14 (control n = 7–8 every time).
+
+    Locally the same metric is 30–100. The warm-up opened only 53–100 connections, because requests overlapped too little to need more.
+  - **Remaining hypothesis, not yet verified:** the client side on 4 processors, i.e. 100 threads reaching `send()` and the client's selector-thread completion path. That's what keeps arrivals spread over 91–162 ms.
 - **Why it wasn't caught earlier:**
 - **Fix:**
 - **Regression test:**
@@ -188,5 +196,6 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
     CONCURRENCY control round=1 sentBeforeFirstResponse=100 peakInFlight=100 transactions=2 distinctBodies=3 statuses={201=100}
     CONCURRENCY real round=1 sentBeforeFirstResponse=50 peakInFlight=66 transactions=1 distinctBodies=1 statuses={201=100}
     ```
+  - Phase 1's floor rule `max(10, ⌊0.6 × CI min⌋)` gives 10 for CI min 7, which is above two of the five calibration values, so no floor was committed (2026-10-14).
   - **PR #20's own CI runs were also marginal:** 38630949271 had proof peak 50 (then the floor) and control peak 36, n = 7. 38631761721 had proof 85/97 and control 67/74, n = 6.
   - The CI logs carry no CPU count for the runner, so the hardware behind these numbers is unknown.
