@@ -7,6 +7,8 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Optional;
 
 import javax.sql.DataSource;
@@ -97,6 +99,45 @@ final class LedgerTestSupport {
 			ps.setString(1, name);
 			try (ResultSet rs = ps.executeQuery()) {
 				assertThat(rs.next()).as("[%s] account %s exists", APP, name).isTrue();
+				return rs.getLong(1);
+			}
+		}
+	}
+
+	/** Asserts the account's balance and entry sum both moved by exactly {@code amount}. */
+	static void assertMoved(DataSource dataSource, long accountId, Totals before, String amount) throws SQLException {
+		Totals delta = totals(dataSource, accountId).minus(before);
+		assertThat(delta.balance()).as("account %d balance moved", accountId).isEqualByComparingTo(amount);
+		assertThat(delta.entrySum()).as("account %d entry sum moved", accountId).isEqualByComparingTo(amount);
+	}
+
+	/** Entries of one transaction, account id -> amount, in insert (entry id) order. */
+	static Map<Long, BigDecimal> entries(DataSource dataSource, long transactionId) throws SQLException {
+		Map<Long, BigDecimal> entries = new LinkedHashMap<>();
+		try (Connection conn = connectApp(dataSource);
+				PreparedStatement ps = conn
+					.prepareStatement("SELECT account_id, amount FROM entries WHERE transaction_id = ? ORDER BY id")) {
+			ps.setLong(1, transactionId);
+			try (ResultSet rs = ps.executeQuery()) {
+				while (rs.next()) {
+					entries.put(rs.getLong(1), rs.getBigDecimal(2));
+				}
+			}
+		}
+		return entries;
+	}
+
+	/** Distinct transactions of this kind with an entry on this account. */
+	static long transactionsTouching(DataSource dataSource, long accountId, String kind) throws SQLException {
+		try (Connection conn = connectApp(dataSource);
+				PreparedStatement ps = conn.prepareStatement("""
+						SELECT count(DISTINCT e.transaction_id) FROM entries e
+						JOIN transactions t ON t.id = e.transaction_id
+						WHERE e.account_id = ? AND t.kind = ?""")) {
+			ps.setLong(1, accountId);
+			ps.setString(2, kind);
+			try (ResultSet rs = ps.executeQuery()) {
+				assertThat(rs.next()).isTrue();
 				return rs.getLong(1);
 			}
 		}
