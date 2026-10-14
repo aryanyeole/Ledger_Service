@@ -27,7 +27,7 @@ import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilde
 // Web slice for the API edge (M2 T1): API-key auth (D-049), problem+json errors, and the
 // correlation id. No database: these run without Testcontainers. Debug logging is on for
 // the app and Spring MVC so the never-log-the-key check sees everything that is logged.
-@WebMvcTest(properties = { EdgeProbe.API_KEYS_PROPERTY, "logging.level.dev.aryanyeole=DEBUG",
+@WebMvcTest(controllers = EdgeProbe.Controller.class, properties = { EdgeProbe.API_KEYS_PROPERTY, "logging.level.dev.aryanyeole=DEBUG",
 		"logging.level.org.springframework.web=DEBUG" })
 @Import(EdgeProbe.Controller.class)
 @ExtendWith(OutputCaptureExtension.class)

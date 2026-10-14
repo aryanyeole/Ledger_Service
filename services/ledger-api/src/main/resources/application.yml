@@ -13,6 +13,9 @@ spring:
     user: ledger_api_owner
     password: ${LEDGER_API_OWNER_PASSWORD}
     locations: classpath:db/migration
+  jackson:
+    # JSON field names follow spec §7: account_id, as_of, created_at.
+    property-naming-strategy: SNAKE_CASE
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
 

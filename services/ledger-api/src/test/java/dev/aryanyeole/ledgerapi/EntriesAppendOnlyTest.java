@@ -164,6 +164,10 @@ class EntriesAppendOnlyTest {
 	@ParameterizedTest(name = "{0}")
 	@EnumSource(value = Role.class, names = { "APP", "WORKER" })
 	void reversingPostingCorrectsWithoutMutation(Role role) throws SQLException {
+		BigDecimal[] externalBefore;
+		try (Connection conn = connect(Role.APP)) {
+			externalBefore = balanceAndEntrySum(conn, seededExternal());
+		}
 		Posting original = postDeposit();
 		Map<Long, BigDecimal> originalEntries;
 		try (Connection conn = connect(Role.APP)) {
@@ -186,11 +190,16 @@ class EntriesAppendOnlyTest {
 		}
 
 		try (Connection conn = connect(role)) {
-			for (long accountId : new long[] { original.externalId(), original.customerId() }) {
+			// The customer is fresh, so it returns to 0; the shared EXTERNAL returns to where it was.
+			Map<Long, BigDecimal[]> expected = Map.of(original.customerId(),
+					new BigDecimal[] { BigDecimal.ZERO, BigDecimal.ZERO }, original.externalId(), externalBefore);
+			for (Map.Entry<Long, BigDecimal[]> account : expected.entrySet()) {
+				long accountId = account.getKey();
 				BigDecimal[] balanceAndSum = balanceAndEntrySum(conn, accountId);
-				assertThat(balanceAndSum[0].compareTo(BigDecimal.ZERO)).as("%s: account %d balance", role.dbRole, accountId)
+				assertThat(balanceAndSum[0].compareTo(account.getValue()[0]))
+					.as("%s: account %d balance", role.dbRole, accountId)
 					.isZero();
-				assertThat(balanceAndSum[1].compareTo(BigDecimal.ZERO))
+				assertThat(balanceAndSum[1].compareTo(account.getValue()[1]))
 					.as("%s: account %d entry sum", role.dbRole, accountId)
 					.isZero();
 			}
@@ -248,7 +257,7 @@ class EntriesAppendOnlyTest {
 	// Committed EXTERNAL -100.0000 -> CUSTOMER +100.0000 via the app role, balances updated.
 	// The target entry is the CUSTOMER leg.
 	private Posting postDeposit() throws SQLException {
-		long external = createAccount("EXTERNAL");
+		long external = seededExternal();
 		long customer = createAccount("CUSTOMER");
 		try (Connection conn = connect(Role.APP)) {
 			try {
@@ -327,6 +336,18 @@ class EntriesAppendOnlyTest {
 		catch (SQLException | RuntimeException | Error e) {
 			conn.close();
 			throw e;
+		}
+	}
+
+	// The one EXTERNAL account, seeded by V4 (D-048): a second EXTERNAL cannot be created.
+	// Shared across tests, so assertions on it are per transaction or relative to its
+	// balance before the test.
+	private long seededExternal() throws SQLException {
+		try (Connection conn = connect(Role.APP);
+				PreparedStatement ps = conn.prepareStatement("SELECT id FROM accounts WHERE type = 'EXTERNAL'");
+				ResultSet rs = ps.executeQuery()) {
+			assertThat(rs.next()).as("seeded EXTERNAL account").isTrue();
+			return rs.getLong(1);
 		}
 	}
 
