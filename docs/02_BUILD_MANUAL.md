@@ -238,3 +238,30 @@ docker compose exec postgres psql -U ledger -d ledger
 $pw = (Select-String -Path .env -Pattern '^LEDGER_API_APP_PASSWORD=(.+)$').Matches[0].Groups[1].Value
 & "C:\Program Files\PostgreSQL\18\bin\psql.exe" "postgresql://ledger_api_app:$pw@localhost:5433/ledger"
 ```
+
+Proofs and CI evidence (M2):
+```powershell
+# Soak a concurrency proof locally (CI runs 1 round); report numbers with the machine they ran on (D-067)
+cd services\ledger-api; .\mvnw.cmd test "-Dtest=<Test>" "-Dledger.test.concurrency.rounds=20"
+# Replay a shuffled round order exactly (seed is printed in the test's summary line)
+cd services\ledger-api; .\mvnw.cmd test "-Dtest=OppositeTransfersNoDeadlockTest" "-Dledger.test.shuffle.seed=<seed>"
+
+# Failing first (D-038): run a proof with the guarding migration removed, then paste the Flyway line
+cd services\ledger-api; .\mvnw.cmd test "-Dtest=<Test>" "-Dspring.flyway.target=<n-1>"
+
+# Five consecutive CI runs of a branch's latest workflow run (acceptance evidence); stops at the first failure.
+# PowerShell does not throw on a native command's exit code, so each watch is checked explicitly.
+$branch = "<branch>"
+$run = gh run list --branch $branch --limit 1 --json databaseId -q '.[0].databaseId'
+if (-not $run) { throw "no CI run found for $branch" }
+gh run watch $run --exit-status
+if ($LASTEXITCODE -ne 0) { throw "CI run $run failed" }
+foreach ($attempt in 2..5) {
+    gh run rerun $run
+    if ($LASTEXITCODE -ne 0) { throw "could not re-run CI run $run" }
+    Start-Sleep -Seconds 10   # let the new attempt register before watching it
+    gh run watch $run --exit-status
+    if ($LASTEXITCODE -ne 0) { throw "CI run $run failed" }
+}
+# Per-attempt numbers: gh run view $run --attempt <n> --log | Select-String "CONCURRENCY|DEADLOCK"
+```
