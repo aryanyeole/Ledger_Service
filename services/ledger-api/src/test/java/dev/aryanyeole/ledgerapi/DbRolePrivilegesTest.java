@@ -35,7 +35,7 @@ import org.springframework.context.annotation.Import;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 
 // Proof that the database roles match the declared model (D-006, D-033, D-034, D-040,
-// D-043, D-060):
+// D-043, D-060, D-071):
 // role attributes, memberships, ownership, the table/column/sequence privilege matrix,
 // schema and database privileges, trigger hardening, and that the runtime roles cannot
 // bypass any of it. Catalog reads go through the app connection; pg_catalog and the
@@ -67,13 +67,14 @@ class DbRolePrivilegesTest {
 			"REFERENCES", "TRIGGER", "MAINTAIN");
 
 	// Table-level privileges per table and runtime role; anything not listed must be false.
-	// INSERT/UPDATE on accounts and idempotency_keys are column-level grants (COLUMN_GRANTS),
-	// so they are false at table level. Every table in public must have a row here.
+	// INSERT/UPDATE on accounts, idempotency_keys, transactions and entries are column-level
+	// grants (COLUMN_GRANTS), so they are false at table level. Every table in public must have
+	// a row here. Runtime roles can't set ledger created_at (D-071, V8).
 	// settlement_worker gets nothing on idempotency_keys (D-020, D-043).
 	private static final Map<String, Map<Role, Set<String>>> TABLE_MATRIX = Map.of(
 			"accounts", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of("SELECT")),
-			"transactions", Map.of(Role.APP, Set.of("SELECT", "INSERT"), Role.WORKER, Set.of("SELECT", "INSERT")),
-			"entries", Map.of(Role.APP, Set.of("SELECT", "INSERT"), Role.WORKER, Set.of("SELECT", "INSERT")),
+			"transactions", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of("SELECT")),
+			"entries", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of("SELECT")),
 			"idempotency_keys", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of()),
 			"flyway_schema_history", Map.of(Role.APP, Set.of(), Role.WORKER, Set.of()));
 
@@ -81,7 +82,9 @@ class DbRolePrivilegesTest {
 	private static final Map<String, List<String>> TABLE_COLUMNS = Map.of(
 			"accounts", List.of("id", "name", "type", "currency", "balance", "allow_negative", "created_at"),
 			"idempotency_keys", List.of("client_id", "key", "request_hash", "status_code", "response_body",
-					"created_at", "expires_at"));
+					"created_at", "expires_at"),
+			"transactions", List.of("id", "kind", "reference", "correlation_id", "created_at"),
+			"entries", List.of("id", "transaction_id", "account_id", "amount", "created_at"));
 
 	// Expected column ACLs: table -> role -> privilege -> columns, beyond table-level grants.
 	// No other column in public may carry a column-level grant (columnGrantsMatchMap).
@@ -92,7 +95,13 @@ class DbRolePrivilegesTest {
 			"idempotency_keys", Map.of(
 					Role.APP, Map.of("INSERT", Set.of("client_id", "key", "request_hash"), "UPDATE",
 							Set.of("status_code", "response_body")),
-					Role.WORKER, Map.of("INSERT", Set.of(), "UPDATE", Set.of())));
+					Role.WORKER, Map.of("INSERT", Set.of(), "UPDATE", Set.of())),
+			"transactions", Map.of(
+					Role.APP, Map.of("INSERT", Set.of("kind", "reference", "correlation_id"), "UPDATE", Set.of()),
+					Role.WORKER, Map.of("INSERT", Set.of("kind", "reference", "correlation_id"), "UPDATE", Set.of())),
+			"entries", Map.of(
+					Role.APP, Map.of("INSERT", Set.of("transaction_id", "account_id", "amount"), "UPDATE", Set.of()),
+					Role.WORKER, Map.of("INSERT", Set.of("transaction_id", "account_id", "amount"), "UPDATE", Set.of())));
 
 	record TriggerSpec(String table, String function, boolean deferred) {
 	}
@@ -140,7 +149,18 @@ class DbRolePrivilegesTest {
 		APP_UPDATE_KEY(Role.APP, "UPDATE idempotency_keys SET key = key WHERE false"),
 		APP_UPDATE_CLIENT_ID(Role.APP, "UPDATE idempotency_keys SET client_id = client_id WHERE false"),
 		APP_DELETE_KEYS(Role.APP, "DELETE FROM idempotency_keys WHERE false"),
-		APP_TRUNCATE_KEYS(Role.APP, "TRUNCATE idempotency_keys");
+		APP_TRUNCATE_KEYS(Role.APP, "TRUNCATE idempotency_keys"),
+
+		// Ledger timestamps (D-071): neither runtime role may set created_at. The entry insert
+		// gets a real transaction id from a CTE through the allowed columns, so without V8 it
+		// would succeed. The harness rolls back, so nothing (not even an unbalanced row) remains.
+		INSERT_TRANSACTION_CREATED_AT(Set.of(Role.APP, Role.WORKER),
+				"INSERT INTO transactions (kind, created_at) VALUES ('DEPOSIT', now() - interval '1 day')", "transactions"),
+		INSERT_ENTRY_CREATED_AT(Set.of(Role.APP, Role.WORKER),
+				"WITH t AS (INSERT INTO transactions (kind) VALUES ('DEPOSIT') RETURNING id) "
+						+ "INSERT INTO entries (transaction_id, account_id, amount, created_at) "
+						+ "SELECT t.id, (SELECT id FROM accounts WHERE name = 'system:external'), 1, now() - interval '1 day' FROM t",
+				"entries");
 
 		final Set<Role> roles;
 
@@ -161,9 +181,14 @@ class DbRolePrivilegesTest {
 
 		// Rejected for one role; the server message must name idempotency_keys.
 		Bypass(Role role, String sql) {
-			this.roles = Set.of(role);
+			this(Set.of(role), sql, "idempotency_keys");
+		}
+
+		// Rejected for these roles; 42501 is the check, the server message must name the table.
+		Bypass(Set<Role> roles, String sql, String table) {
+			this.roles = roles;
 			this.sql = sql;
-			this.message = "idempotency_keys";
+			this.message = table;
 			this.exactMessage = false;
 		}
 
