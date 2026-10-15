@@ -17,7 +17,8 @@ concurrency:
 jobs:
   ledger-api:
     name: ledger-api
-    runs-on: ubuntu-latest
+    # Pinned image (D-070): concurrency proofs are timing-sensitive; upgrades are explicit PRs.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     defaults:
       run:
@@ -33,7 +34,8 @@ jobs:
 
   settlement-worker:
     name: settlement-worker
-    runs-on: ubuntu-latest
+    # Pinned image (D-070): concurrency proofs are timing-sensitive; upgrades are explicit PRs.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     defaults:
       run:

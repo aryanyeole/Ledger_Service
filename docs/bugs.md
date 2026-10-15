@@ -19,7 +19,7 @@
 |---|---|---|---|---|---|---|
 | BUG-001 | 2026-10-13 17:36 | M2 | Never-log-the-key test fails whenever an earlier test in its class fails | none (component: ledger-api tests) | fixed | ccbff46 |
 | BUG-002 | 2026-10-13 18:12 | M2 | Shared EXTERNAL fixture adds order-dependent failures to UnbalancedTransactionRejectedTest's failing-first run | none (component: ledger-api tests) | fixed | 1b6f5a4 (PR #16) |
-| BUG-003 | 2026-10-14 13:26 | M2 | Concurrency harness produces too little overlap on GitHub runners | P2 proof evidence (component: ledger-api tests) | open | |
+| BUG-003 | 2026-10-14 13:26 | M2 | Concurrency harness produces too little overlap on GitHub runners | P2 proof evidence (component: ledger-api tests) | fixed | aaf2e1a (PR #22) |
 
 ---
 
@@ -148,7 +148,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 ### BUG-003 — Concurrency harness produces too little overlap on GitHub runners
 
 - **Found:** 2026-10-14 13:26 (CI run time, 20:26 UTC) · M2 · after Task T6 (PR #20, merged as `0a414e7`) · branch `main`, then PR #21's branch `m2/t7-idempotency-semantics-proof`
-- **Status:** open (fix committed in `a00e2d3`; awaiting acceptance: 5 consecutive green CI runs of that commit)
+- **Status:** fixed
 - **Component:** ledger-api tests (`ConcurrentRequestHarness`, `ConcurrentIdempotentTransferTest`, `negativecontrols/CheckThenInsertIdempotencyTest`)
 - **Property / invariant touched:** P2's proof evidence (D-067). Production behaviour is not implicated: in every failing run the proof's own assertions on effects held (1 transaction, 1 body, 100 × 201).
 - **Symptom:** **Found on CI after the local green**: locally the 20-round soaks passed (proof 20/20; control n = 5–34 across runs). PR #20's own CI run passed. On GitHub-hosted runners (image `ubuntu-24.04`, version 20261012.334.1) the harness then failed twice:
@@ -184,7 +184,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 
     Locally (i5-1240P, 20 rounds) the proof's value is 40–100. Even after the warm-up, the client opens only 53–100 connections on CI, because requests overlap too little to need more.
 - **Why it wasn't caught earlier:** The floor and the soak were calibrated on the development machine only. PR #20's CI passed twice, once exactly at the floor, and nothing flagged the margin. The CI logs carried no CPU count.
-- **Fix:** Test sources only, no production change. Commits `2167fa2` (phase 1) and `a00e2d3` (phase 2) on `m2/fix-bug-003`, PR #22 (draft); the squash-merge SHA is added at merge.
+- **Fix:** Test sources only, no production change. Commits `2167fa2` (phase 1) and `a00e2d3` (phase 2) on `m2/fix-bug-003`, squash-merged as **`aaf2e1a`** · PR #22.
   - A warm-up round before the measured rounds.
   - A test-only server filter that measures requests that arrived before the first completed.
   - The proof's floor moved to that server-side value, as a tripwire for a serialized harness: `max(2, ⌊0.6 × 7⌋) = 4`.
@@ -193,9 +193,17 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
   - Hardware (processors, heap) and Tomcat/Hikari settings are logged with every run.
 - **Regression test:** `ConcurrentIdempotentTransferTest` and `negativecontrols/CheckThenInsertIdempotencyTest` on CI.
   - **Red before:** runs 38631908435 and 38633176987 (attempt 1).
-  - **Green after:** pending, 5 consecutive CI runs of `a00e2d3`.
+  - **Green after:** main run **38649323261**, attempts 1–5, all green (298 tests each, 4 processors, runner image `ubuntu-24.04`). It runs on commit `1bcc06b` (PR #23's merge), which contains the fix from `aaf2e1a`. The owner referred to it by `116177686515`, which is that run's settlement-worker job id at attempt 5.
+
+    | Attempt | Proof `serverArrivedBeforeFirstCompletion` (floor 4) | Control n (must be > 1) |
+    |---|---|---|
+    | 1 | 7 | 9 |
+    | 2 | 13 | 8 |
+    | 3 | 10 | 7 |
+    | 4 | 10 | 6 |
+    | 5 | 18 | 7 |
 - **Decision Log impact:** D-067 replaced (PR #22 description).
-- **Summary (one sentence):**
+- **Summary (one sentence):** The concurrency harness's overlap floor was calibrated on the development machine and measured client calls rather than server arrivals, so it failed on 4-processor CI runners. A warm-up round, a server-side arrival metric with a CI-calibrated tripwire of 4, and the negative control as the primary CI overlap evidence fixed it (5/5 green on main).
 - **Notes:**
   - Logged 2026-10-14 13:43, when reported, before any fix.
   - **Timing-dependent, confirmed:** CI run 38633176987 was re-run on the same commit (`ac414a3`) and attempt 2 passed (20:51 UTC). It passed narrowly:
