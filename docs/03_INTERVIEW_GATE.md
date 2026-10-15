@@ -30,6 +30,12 @@
 | Why sort account locks by id? What happens if you don't? | A→B and B→A concurrently take locks in opposite order → deadlock; Postgres detects and kills one; ordering removes the cycle |
 | Insufficient funds — is that response idempotent too? | Yes; stored against the key; replay returns the same 422 even if funds arrive later |
 | Why keyset pagination for `/transactions`? When is offset fine? | Offset scans and discards N rows (degrades with depth, unstable under inserts); keyset uses the index; offset is fine for small tables / jump-to-page UIs |
+| Why does a lock timeout sometimes return 409 and sometimes 503? | 55P03 on the key insert = a duplicate still in flight (409, retry with the same key); on the account locks = contention (503 + Retry-After); translated where raised, neither stored, both roll back (D-050) |
+| What guarantees an idempotency key never commits without its response? | Key, effect and response in one transaction; stored outcomes roll back to a savepoint taken after the key claim (D-064); a deferred constraint trigger re-reads the row at COMMIT and raises 23502 if the response is missing (D-059) |
+| How do you know the concurrency test isn't passing by luck? | The check-then-insert negative control on the same harness lets duplicates through every round; server-side overlap floor; red mutation goes red; CI is a regression gate, the overlap figure comes from the local soak with hardware stated (D-067, BUG-003) |
+| What exactly is "byte-identical"? | Response bodies, per key: the owner stores JSONB and returns response_body::text, replays return the same text; headers differ (correlation id); different keys may format the same content differently (D-044) |
+| If the database rejects overdrafts, why check funds in Java? | Without it the no_overdraft CHECK fires as 23514 → an unstored 500, so a retry gets another 500; the Java check produces a stored, idempotent 422; the constraint is the backstop |
+| What's the known gap in your keyset pagination? | created_at is the posting transaction's start time, so a late commit behind a passed cursor is never seen by that traversal; ordering by id has the same gap; pinned by a characterization test; M7's stream must handle it (D-053) |
 
 ## M3 — Outbox and exactly-once effects
 
@@ -92,7 +98,7 @@
 
 | Metric | Value | Where it's proven |
 |---|---|---|
-| Concurrency test: requests / transactions created / distinct response bodies | 100 / 1 / 1 | `ConcurrentIdempotentTransferTest` |
+| Concurrency test: requests / transactions created / distinct response bodies | 100 / 1 / 1 (local soak 20/20, i5-1240P; CI 15/15, 4-processor runners) | `ConcurrentIdempotentTransferTest` |
 | Transfer p50 / p95 / p99 @ 1x | | `docs/load-tests/report.md` |
 | Transfer p50 / p95 / p99 @ 10x | | ″ |
 | 1x definition (req/s) | | ″ |

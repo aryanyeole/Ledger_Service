@@ -18,7 +18,7 @@
 | ID | Found | Milestone | Title | Property / invariant | Status | Fix commit |
 |---|---|---|---|---|---|---|
 | BUG-001 | 2026-10-13 17:36 | M2 | Never-log-the-key test fails whenever an earlier test in its class fails | none (component: ledger-api tests) | fixed | ccbff46 |
-| BUG-002 | 2026-10-13 18:12 | M2 | Shared EXTERNAL fixture adds order-dependent failures to UnbalancedTransactionRejectedTest's failing-first run | none (component: ledger-api tests) | fixed | 1b6f5a4 (PR #16) |
+| BUG-002 | 2026-10-13 18:12 | M2 | Shared EXTERNAL fixture adds order-dependent failures to UnbalancedTransactionRejectedTest's failing-first run | none (component: ledger-api tests) | fixed | 82b29b9 (PR #16) |
 | BUG-003 | 2026-10-14 13:26 | M2 | Concurrency harness produces too little overlap on GitHub runners | P2 proof evidence (component: ledger-api tests) | fixed | aaf2e1a (PR #22) |
 
 ---
@@ -131,7 +131,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
   - Both values must have moved by exactly the EXTERNAL leg (`assertMovedBy`).
   - Fresh CUSTOMER accounts keep the absolute `balance = SUM(entries)` check.
   - Other tests' postings, including commits that leak through below v2, can no longer reach this test's assertions.
-  - Commit `1b6f5a4` on `m2/fix-bug-002` · PR #16 (squash-merge SHA to be added at merge).
+  - Commit `1b6f5a4` on `m2/fix-bug-002`, squash-merged as **`82b29b9`** · PR #16.
 - **Regression test:** The regression check is a local failing-first run (D-038), **not a CI test**. In CI the schema is always at the latest version, where the defect cannot occur.
   - Command: `.\mvnw.cmd test "-Dtest=UnbalancedTransactionRejectedTest" "-Dspring.flyway.target=1"`
   - Red before the fix: the run under Symptom (12 failures, including the 2 extra `decimalAmountsBalanceExactly` failures, one per role). It ran on the PR #15 tree committed as `82e0e27`, squash-merged as `3ec3ae6`.
