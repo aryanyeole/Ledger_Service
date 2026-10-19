@@ -35,7 +35,7 @@ import org.springframework.context.annotation.Import;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 
 // Proof that the database roles match the declared model (D-006, D-033, D-034, D-040,
-// D-043, D-060, D-071):
+// D-043, D-060, D-071, D-076):
 // role attributes, memberships, ownership, the table/column/sequence privilege matrix,
 // schema and database privileges, trigger hardening, and that the runtime roles cannot
 // bypass any of it. Catalog reads go through the app connection; pg_catalog and the
@@ -71,11 +71,13 @@ class DbRolePrivilegesTest {
 	// grants (COLUMN_GRANTS), so they are false at table level. Every table in public must have
 	// a row here. Runtime roles can't set ledger created_at (D-071, V8).
 	// settlement_worker gets nothing on idempotency_keys (D-020, D-043).
+	// payments: INSERT (app) and UPDATE (worker) are column-level too (D-076, V9).
 	private static final Map<String, Map<Role, Set<String>>> TABLE_MATRIX = Map.of(
 			"accounts", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of("SELECT")),
 			"transactions", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of("SELECT")),
 			"entries", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of("SELECT")),
 			"idempotency_keys", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of()),
+			"payments", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of("SELECT")),
 			"flyway_schema_history", Map.of(Role.APP, Set.of(), Role.WORKER, Set.of()));
 
 	// Every column of each table that carries column-level grants.
@@ -84,7 +86,9 @@ class DbRolePrivilegesTest {
 			"idempotency_keys", List.of("client_id", "key", "request_hash", "status_code", "response_body",
 					"created_at", "expires_at"),
 			"transactions", List.of("id", "kind", "reference", "correlation_id", "created_at"),
-			"entries", List.of("id", "transaction_id", "account_id", "amount", "created_at"));
+			"entries", List.of("id", "transaction_id", "account_id", "amount", "created_at"),
+			"payments", List.of("id", "customer_account_id", "merchant_account_id", "amount", "fee", "status",
+					"created_at", "updated_at"));
 
 	// Expected column ACLs: table -> role -> privilege -> columns, beyond table-level grants.
 	// No other column in public may carry a column-level grant (columnGrantsMatchMap).
@@ -101,7 +105,11 @@ class DbRolePrivilegesTest {
 					Role.WORKER, Map.of("INSERT", Set.of("kind", "reference", "correlation_id"), "UPDATE", Set.of())),
 			"entries", Map.of(
 					Role.APP, Map.of("INSERT", Set.of("transaction_id", "account_id", "amount"), "UPDATE", Set.of()),
-					Role.WORKER, Map.of("INSERT", Set.of("transaction_id", "account_id", "amount"), "UPDATE", Set.of())));
+					Role.WORKER, Map.of("INSERT", Set.of("transaction_id", "account_id", "amount"), "UPDATE", Set.of())),
+			"payments", Map.of(
+					Role.APP, Map.of("INSERT", Set.of("customer_account_id", "merchant_account_id", "amount", "fee"),
+							"UPDATE", Set.of()),
+					Role.WORKER, Map.of("INSERT", Set.of(), "UPDATE", Set.of("status"))));
 
 	record TriggerSpec(String table, String function, boolean deferred) {
 	}
@@ -114,7 +122,9 @@ class DbRolePrivilegesTest {
 			"entries_append_only", new TriggerSpec("entries", "forbid_mutation", false),
 			"transactions_append_only", new TriggerSpec("transactions", "forbid_mutation", false),
 			"idempotency_keys_complete",
-			new TriggerSpec("idempotency_keys", "assert_idempotency_key_complete", true));
+			new TriggerSpec("idempotency_keys", "assert_idempotency_key_complete", true),
+			"payments_status_transition", new TriggerSpec("payments", "payments_status_transition", false),
+			"payments_no_delete", new TriggerSpec("payments", "forbid_mutation", false));
 
 	private static final Set<String> TRIGGER_FUNCTIONS = TRIGGERS.values()
 		.stream()
@@ -160,7 +170,41 @@ class DbRolePrivilegesTest {
 				"WITH t AS (INSERT INTO transactions (kind) VALUES ('DEPOSIT') RETURNING id) "
 						+ "INSERT INTO entries (transaction_id, account_id, amount, created_at) "
 						+ "SELECT t.id, (SELECT id FROM accounts WHERE name = 'system:external'), 1, now() - interval '1 day' FROM t",
-				"entries");
+				"entries"),
+
+		// payments (D-076): the app inserts only the parties and the money and never updates;
+		// the worker only updates status; neither deletes. The privilege check runs before the
+		// row is built, so the account ids need not exist (WHERE false for UPDATE/DELETE).
+		APP_INSERT_PAYMENT_ID(Set.of(Role.APP),
+				"INSERT INTO payments (id, customer_account_id, merchant_account_id, amount, fee) VALUES (gen_random_uuid(), 1, 2, 1, 0)",
+				"payments"),
+		APP_INSERT_PAYMENT_STATUS(Set.of(Role.APP),
+				"INSERT INTO payments (customer_account_id, merchant_account_id, amount, fee, status) VALUES (1, 2, 1, 0, 'SETTLED')",
+				"payments"),
+		APP_INSERT_PAYMENT_CREATED_AT(Set.of(Role.APP),
+				"INSERT INTO payments (customer_account_id, merchant_account_id, amount, fee, created_at) VALUES (1, 2, 1, 0, now() - interval '1 day')",
+				"payments"),
+		APP_INSERT_PAYMENT_UPDATED_AT(Set.of(Role.APP),
+				"INSERT INTO payments (customer_account_id, merchant_account_id, amount, fee, updated_at) VALUES (1, 2, 1, 0, now() - interval '1 day')",
+				"payments"),
+		APP_UPDATE_PAYMENT_STATUS(Set.of(Role.APP), "UPDATE payments SET status = 'SETTLED' WHERE false", "payments"),
+		WORKER_INSERT_PAYMENT(Set.of(Role.WORKER),
+				"INSERT INTO payments (customer_account_id, merchant_account_id, amount, fee) VALUES (1, 2, 1, 0)",
+				"payments"),
+		WORKER_UPDATE_PAYMENT_ID(Set.of(Role.WORKER), "UPDATE payments SET id = id WHERE false", "payments"),
+		WORKER_UPDATE_PAYMENT_CUSTOMER(Set.of(Role.WORKER),
+				"UPDATE payments SET customer_account_id = customer_account_id WHERE false", "payments"),
+		WORKER_UPDATE_PAYMENT_MERCHANT(Set.of(Role.WORKER),
+				"UPDATE payments SET merchant_account_id = merchant_account_id WHERE false", "payments"),
+		WORKER_UPDATE_PAYMENT_AMOUNT(Set.of(Role.WORKER), "UPDATE payments SET amount = amount WHERE false",
+				"payments"),
+		WORKER_UPDATE_PAYMENT_FEE(Set.of(Role.WORKER), "UPDATE payments SET fee = fee WHERE false", "payments"),
+		WORKER_UPDATE_PAYMENT_CREATED_AT(Set.of(Role.WORKER), "UPDATE payments SET created_at = created_at WHERE false",
+				"payments"),
+		WORKER_UPDATE_PAYMENT_UPDATED_AT(Set.of(Role.WORKER), "UPDATE payments SET updated_at = now() WHERE false",
+				"payments"),
+		DELETE_PAYMENTS(Set.of(Role.APP, Role.WORKER), "DELETE FROM payments WHERE false", "payments"),
+		TRUNCATE_PAYMENTS(Set.of(Role.APP, Role.WORKER), "TRUNCATE payments", "payments");
 
 		final Set<Role> roles;
 
