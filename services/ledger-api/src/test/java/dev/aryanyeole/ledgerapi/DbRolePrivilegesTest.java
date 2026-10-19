@@ -35,7 +35,7 @@ import org.springframework.context.annotation.Import;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 
 // Proof that the database roles match the declared model (D-006, D-033, D-034, D-040,
-// D-043, D-060, D-071, D-076):
+// D-043, D-060, D-071, D-076, D-077, D-078):
 // role attributes, memberships, ownership, the table/column/sequence privilege matrix,
 // schema and database privileges, trigger hardening, and that the runtime roles cannot
 // bypass any of it. Catalog reads go through the app connection; pg_catalog and the
@@ -72,12 +72,16 @@ class DbRolePrivilegesTest {
 	// a row here. Runtime roles can't set ledger created_at (D-071, V8).
 	// settlement_worker gets nothing on idempotency_keys (D-020, D-043).
 	// payments: INSERT (app) and UPDATE (worker) are column-level too (D-076, V9).
+	// outbox: the worker can insert but not read (D-077, V11). processed_messages: the worker's
+	// SELECT and INSERT are column-level, the app gets nothing (D-078, V12).
 	private static final Map<String, Map<Role, Set<String>>> TABLE_MATRIX = Map.of(
 			"accounts", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of("SELECT")),
 			"transactions", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of("SELECT")),
 			"entries", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of("SELECT")),
 			"idempotency_keys", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of()),
 			"payments", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of("SELECT")),
+			"outbox", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of()),
+			"processed_messages", Map.of(Role.APP, Set.of(), Role.WORKER, Set.of()),
 			"flyway_schema_history", Map.of(Role.APP, Set.of(), Role.WORKER, Set.of()));
 
 	// Every column of each table that carries column-level grants.
@@ -88,7 +92,10 @@ class DbRolePrivilegesTest {
 			"transactions", List.of("id", "kind", "reference", "correlation_id", "created_at"),
 			"entries", List.of("id", "transaction_id", "account_id", "amount", "created_at"),
 			"payments", List.of("id", "customer_account_id", "merchant_account_id", "amount", "fee", "status",
-					"created_at", "updated_at"));
+					"created_at", "updated_at"),
+			"outbox", List.of("id", "event_id", "topic", "message_key", "event_type", "payload", "headers",
+					"created_at", "published_at"),
+			"processed_messages", List.of("consumer_group", "event_id", "processed_at"));
 
 	// Expected column ACLs: table -> role -> privilege -> columns, beyond table-level grants.
 	// No other column in public may carry a column-level grant (columnGrantsMatchMap).
@@ -109,7 +116,17 @@ class DbRolePrivilegesTest {
 			"payments", Map.of(
 					Role.APP, Map.of("INSERT", Set.of("customer_account_id", "merchant_account_id", "amount", "fee"),
 							"UPDATE", Set.of()),
-					Role.WORKER, Map.of("INSERT", Set.of(), "UPDATE", Set.of("status"))));
+					Role.WORKER, Map.of("INSERT", Set.of(), "UPDATE", Set.of("status"))),
+			"outbox", Map.of(
+					Role.APP, Map.of("INSERT", Set.of("topic", "message_key", "event_type", "payload", "headers"),
+							"UPDATE", Set.of("published_at")),
+					Role.WORKER, Map.of("INSERT", Set.of("topic", "message_key", "event_type", "payload", "headers"),
+							"UPDATE", Set.of())),
+			// SELECT is column-level here: ON CONFLICT (consumer_group, event_id) needs it (D-078).
+			"processed_messages", Map.of(
+					Role.APP, Map.of("SELECT", Set.of(), "INSERT", Set.of(), "UPDATE", Set.of()),
+					Role.WORKER, Map.of("SELECT", Set.of("consumer_group", "event_id"), "INSERT",
+							Set.of("consumer_group", "event_id"), "UPDATE", Set.of())));
 
 	record TriggerSpec(String table, String function, boolean deferred) {
 	}
@@ -124,7 +141,9 @@ class DbRolePrivilegesTest {
 			"idempotency_keys_complete",
 			new TriggerSpec("idempotency_keys", "assert_idempotency_key_complete", true),
 			"payments_status_transition", new TriggerSpec("payments", "payments_status_transition", false),
-			"payments_no_delete", new TriggerSpec("payments", "forbid_mutation", false));
+			"payments_no_delete", new TriggerSpec("payments", "forbid_mutation", false),
+			"outbox_publish_once", new TriggerSpec("outbox", "outbox_publish_once", false),
+			"processed_messages_append_only", new TriggerSpec("processed_messages", "forbid_mutation", false));
 
 	private static final Set<String> TRIGGER_FUNCTIONS = TRIGGERS.values()
 		.stream()
@@ -204,7 +223,58 @@ class DbRolePrivilegesTest {
 		WORKER_UPDATE_PAYMENT_UPDATED_AT(Set.of(Role.WORKER), "UPDATE payments SET updated_at = now() WHERE false",
 				"payments"),
 		DELETE_PAYMENTS(Set.of(Role.APP, Role.WORKER), "DELETE FROM payments WHERE false", "payments"),
-		TRUNCATE_PAYMENTS(Set.of(Role.APP, Role.WORKER), "TRUNCATE payments", "payments");
+		TRUNCATE_PAYMENTS(Set.of(Role.APP, Role.WORKER), "TRUNCATE payments", "payments"),
+
+		// outbox (D-077): both writers insert only the event's content; only the app reads it and
+		// only published_at is updatable. GENERATED ALWAYS id is checked before privileges
+		// (428C9), so the id rows use OVERRIDING SYSTEM VALUE / SET id = DEFAULT to reach the
+		// privilege check, as a real attempt would.
+		INSERT_OUTBOX_ID(Set.of(Role.APP, Role.WORKER),
+				"INSERT INTO outbox (id, topic, message_key, event_type, payload) OVERRIDING SYSTEM VALUE VALUES (1, 't', 'k', 'payment.authorized', '{}')",
+				"outbox"),
+		INSERT_OUTBOX_EVENT_ID(Set.of(Role.APP, Role.WORKER),
+				"INSERT INTO outbox (event_id, topic, message_key, event_type, payload) VALUES (gen_random_uuid(), 't', 'k', 'payment.authorized', '{}')",
+				"outbox"),
+		INSERT_OUTBOX_CREATED_AT(Set.of(Role.APP, Role.WORKER),
+				"INSERT INTO outbox (topic, message_key, event_type, payload, created_at) VALUES ('t', 'k', 'payment.authorized', '{}', now() - interval '1 day')",
+				"outbox"),
+		INSERT_OUTBOX_PUBLISHED_AT(Set.of(Role.APP, Role.WORKER),
+				"INSERT INTO outbox (topic, message_key, event_type, payload, published_at) VALUES ('t', 'k', 'payment.authorized', '{}', now())",
+				"outbox"),
+		APP_UPDATE_OUTBOX_ID(Set.of(Role.APP), "UPDATE outbox SET id = DEFAULT WHERE false", "outbox"),
+		APP_UPDATE_OUTBOX_EVENT_ID(Set.of(Role.APP), "UPDATE outbox SET event_id = event_id WHERE false", "outbox"),
+		APP_UPDATE_OUTBOX_TOPIC(Set.of(Role.APP), "UPDATE outbox SET topic = topic WHERE false", "outbox"),
+		APP_UPDATE_OUTBOX_MESSAGE_KEY(Set.of(Role.APP), "UPDATE outbox SET message_key = message_key WHERE false",
+				"outbox"),
+		APP_UPDATE_OUTBOX_EVENT_TYPE(Set.of(Role.APP), "UPDATE outbox SET event_type = event_type WHERE false",
+				"outbox"),
+		APP_UPDATE_OUTBOX_PAYLOAD(Set.of(Role.APP), "UPDATE outbox SET payload = payload WHERE false", "outbox"),
+		APP_UPDATE_OUTBOX_HEADERS(Set.of(Role.APP), "UPDATE outbox SET headers = headers WHERE false", "outbox"),
+		APP_UPDATE_OUTBOX_CREATED_AT(Set.of(Role.APP), "UPDATE outbox SET created_at = created_at WHERE false",
+				"outbox"),
+		WORKER_SELECT_OUTBOX(Set.of(Role.WORKER), "SELECT 1 FROM outbox", "outbox"),
+		WORKER_UPDATE_OUTBOX_PUBLISHED_AT(Set.of(Role.WORKER), "UPDATE outbox SET published_at = now() WHERE false",
+				"outbox"),
+		DELETE_OUTBOX(Set.of(Role.APP, Role.WORKER), "DELETE FROM outbox WHERE false", "outbox"),
+		TRUNCATE_OUTBOX(Set.of(Role.APP, Role.WORKER), "TRUNCATE outbox", "outbox"),
+
+		// processed_messages (D-078): the worker reads and inserts only (consumer_group, event_id);
+		// the app gets nothing.
+		APP_SELECT_PROCESSED(Set.of(Role.APP), "SELECT 1 FROM processed_messages", "processed_messages"),
+		APP_INSERT_PROCESSED(Set.of(Role.APP),
+				"INSERT INTO processed_messages (consumer_group, event_id) VALUES ('g', gen_random_uuid())",
+				"processed_messages"),
+		WORKER_SELECT_PROCESSED_AT(Set.of(Role.WORKER), "SELECT processed_at FROM processed_messages",
+				"processed_messages"),
+		WORKER_SELECT_PROCESSED_ALL(Set.of(Role.WORKER), "SELECT * FROM processed_messages", "processed_messages"),
+		WORKER_INSERT_PROCESSED_AT(Set.of(Role.WORKER),
+				"INSERT INTO processed_messages (consumer_group, event_id, processed_at) VALUES ('g', gen_random_uuid(), now() - interval '1 day')",
+				"processed_messages"),
+		UPDATE_PROCESSED(Set.of(Role.APP, Role.WORKER), "UPDATE processed_messages SET event_id = event_id WHERE false",
+				"processed_messages"),
+		DELETE_PROCESSED(Set.of(Role.APP, Role.WORKER), "DELETE FROM processed_messages WHERE false",
+				"processed_messages"),
+		TRUNCATE_PROCESSED(Set.of(Role.APP, Role.WORKER), "TRUNCATE processed_messages", "processed_messages");
 
 		final Set<Role> roles;
 
