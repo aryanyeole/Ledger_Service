@@ -15,9 +15,11 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import javax.sql.DataSource;
@@ -95,7 +97,10 @@ class EntriesAppendOnlyTest {
 		UPDATE_NO_ROWS("UPDATE entries SET amount = amount WHERE false", Target.NONE, "entries"),
 		DELETE_ENTRY("DELETE FROM entries WHERE id = ?", Target.ENTRY, "entries"),
 		TRUNCATE_ENTRIES("TRUNCATE entries", Target.NONE, "entries"),
-		TRUNCATE_ACCOUNTS_CASCADE("TRUNCATE accounts CASCADE", Target.NONE, "entries"),
+		// Cascades to every table referencing accounts: entries and payments (V9), each with its
+		// own BEFORE TRUNCATE trigger. Which one fires first is Postgres's choice, not part of
+		// the guarantee, so either may reject it.
+		TRUNCATE_ACCOUNTS_CASCADE("TRUNCATE accounts CASCADE", Target.NONE, "entries", "payments"),
 		UPDATE_TRANSACTION("UPDATE transactions SET reference = 'x' WHERE id = ?", Target.TRANSACTION, "transactions"),
 		DELETE_TRANSACTION("DELETE FROM transactions WHERE id = ?", Target.TRANSACTION, "transactions"),
 		TRUNCATE_TRANSACTIONS_CASCADE("TRUNCATE transactions CASCADE", Target.NONE, "transactions");
@@ -104,13 +109,13 @@ class EntriesAppendOnlyTest {
 
 		final Target target;
 
-		// The table whose trigger rejects the statement.
-		final String table;
+		// The tables whose trigger may reject the statement.
+		final Set<String> tables;
 
-		OwnerAttempt(String sql, Target target, String table) {
+		OwnerAttempt(String sql, Target target, String... tables) {
 			this.sql = sql;
 			this.target = target;
-			this.table = table;
+			this.tables = Set.of(tables);
 		}
 
 	}
@@ -118,7 +123,8 @@ class EntriesAppendOnlyTest {
 	record Posting(long transactionId, long entryId, long externalId, long customerId) {
 	}
 
-	record Snapshot(BigDecimal entryAmount, long transactionEntries, String reference, long accounts, long entries) {
+	record Snapshot(BigDecimal entryAmount, long transactionEntries, String reference, long accounts, long entries,
+			long payments) {
 	}
 
 	@Autowired
@@ -142,7 +148,7 @@ class EntriesAppendOnlyTest {
 
 		assertThat((Throwable) e).as("%s: %s must be rejected by the statement itself", role.dbRole, attempt)
 			.isNotNull();
-		assertRootError(e, role, INSUFFICIENT_PRIVILEGE, "permission denied for table " + attempt.table);
+		assertRootError(e, role, INSUFFICIENT_PRIVILEGE, Set.of("permission denied for table " + attempt.table));
 		assertUnchanged(role, attempt.name(), before, snapshot(posting));
 	}
 
@@ -150,13 +156,20 @@ class EntriesAppendOnlyTest {
 	@EnumSource(OwnerAttempt.class)
 	void ownerIsStoppedByAppendOnlyTriggers(OwnerAttempt attempt) throws SQLException {
 		Posting posting = postDeposit();
+		if (attempt.tables.contains("payments")) {
+			insertPayment(posting.customerId());
+		}
 		Snapshot before = snapshot(posting);
+		if (attempt.tables.contains("payments")) {
+			assertThat(before.payments()).as("%s: payments before %s", Role.OWNER.dbRole, attempt).isPositive();
+		}
 
 		SQLException e = attempt(Role.OWNER, attempt.sql, bindId(attempt.target, posting));
 
 		assertThat((Throwable) e).as("%s: %s must be rejected by the statement itself", Role.OWNER.dbRole, attempt)
 			.isNotNull();
-		assertRootError(e, Role.OWNER, RESTRICT_VIOLATION, attempt.table + " is append-only");
+		assertRootError(e, Role.OWNER, RESTRICT_VIOLATION,
+				attempt.tables.stream().map((table) -> table + " is append-only").collect(Collectors.toSet()));
 		assertUnchanged(Role.OWNER, attempt.name(), before, snapshot(posting));
 	}
 
@@ -278,8 +291,29 @@ class EntriesAppendOnlyTest {
 		}
 	}
 
+	// Committed AUTHORIZED payment from this customer to a fresh merchant, via the app role,
+	// so the accounts CASCADE attempt has a payments row to lose.
+	private void insertPayment(long customer) throws SQLException {
+		long merchant = createAccount("MERCHANT");
+		try (Connection conn = connect(Role.APP)) {
+			try (PreparedStatement ps = conn.prepareStatement(
+					"INSERT INTO payments (customer_account_id, merchant_account_id, amount, fee) VALUES (?, ?, ?, ?)")) {
+				ps.setLong(1, customer);
+				ps.setLong(2, merchant);
+				ps.setBigDecimal(3, new BigDecimal("100.00"));
+				ps.setBigDecimal(4, new BigDecimal("2.90"));
+				assertThat(ps.executeUpdate()).isEqualTo(1);
+				conn.commit();
+			}
+			finally {
+				conn.rollback();
+			}
+		}
+	}
+
 	// Fresh app connection; lock_timeout fails fast if a lock is still held. SET LOCAL ends
-	// with the transaction, so the pooled session keeps its defaults.
+	// with the transaction, so the pooled session keeps its defaults. Counts payments, so it
+	// needs V9.
 	private Snapshot snapshot(Posting posting) throws SQLException {
 		try (Connection conn = connect(Role.APP)) {
 			try {
@@ -291,14 +325,15 @@ class EntriesAppendOnlyTest {
 						       (SELECT count(*) FROM entries WHERE transaction_id = ?),
 						       (SELECT reference FROM transactions WHERE id = ?),
 						       (SELECT count(*) FROM accounts),
-						       (SELECT count(*) FROM entries)""")) {
+						       (SELECT count(*) FROM entries),
+						       (SELECT count(*) FROM payments)""")) {
 					ps.setLong(1, posting.entryId());
 					ps.setLong(2, posting.transactionId());
 					ps.setLong(3, posting.transactionId());
 					try (ResultSet rs = ps.executeQuery()) {
 						assertThat(rs.next()).isTrue();
 						return new Snapshot(rs.getBigDecimal(1), rs.getLong(2), rs.getString(3), rs.getLong(4),
-								rs.getLong(5));
+								rs.getLong(5), rs.getLong(6));
 					}
 				}
 			}
@@ -318,6 +353,7 @@ class EntriesAppendOnlyTest {
 		assertThat(after.reference()).as("%s, transaction reference", who).isEqualTo(before.reference());
 		assertThat(after.accounts()).as("%s, accounts count", who).isEqualTo(before.accounts());
 		assertThat(after.entries()).as("%s, entries count", who).isEqualTo(before.entries());
+		assertThat(after.payments()).as("%s, payments count", who).isEqualTo(before.payments());
 	}
 
 	// Connection as the given role, autoCommit off; asserts the session really is that role.
@@ -437,8 +473,9 @@ class EntriesAppendOnlyTest {
 		}
 	}
 
-	// SQLState and server message of the deepest SQLException in the cause chain.
-	private static void assertRootError(SQLException thrown, Role role, String sqlState, String message) {
+	// SQLState and server message of the deepest SQLException in the cause chain; the message
+	// must be one of `messages`.
+	private static void assertRootError(SQLException thrown, Role role, String sqlState, Set<String> messages) {
 		SQLException root = thrown;
 		for (Throwable cause = thrown; cause != null; cause = cause.getCause()) {
 			if (cause instanceof SQLException sql) {
@@ -448,7 +485,7 @@ class EntriesAppendOnlyTest {
 		assertThat(root.getSQLState()).as("%s: SQLState of %s", role.dbRole, root).isEqualTo(sqlState);
 		assertThat((Throwable) root).as("%s: driver exception type", role.dbRole).isInstanceOf(PSQLException.class);
 		assertThat(((PSQLException) root).getServerErrorMessage().getMessage()).as("%s: server message", role.dbRole)
-			.isEqualTo(message);
+			.isIn(messages);
 	}
 
 }
