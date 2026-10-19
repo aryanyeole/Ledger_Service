@@ -47,6 +47,8 @@ services:
       KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_NUM_PARTITIONS: 1
+      # Topics are created only by ledger-api's outbox relay, with their real partition count (D-080).
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
     ports:
       - "127.0.0.1:9092:9092"  # EXTERNAL only; INTERNAL and CONTROLLER are not published (D-029)
     volumes:

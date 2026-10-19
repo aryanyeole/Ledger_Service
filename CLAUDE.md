@@ -18,7 +18,7 @@ Payments ledger: Spring Boot API + Python settlement worker + React/TS dashboard
 2. `entries` is append-only. Corrections are new reversing transactions.
 3. Money is `BigDecimal` / `Decimal` / JSON string. No `double`, `float`, or JS `Number` anywhere in a money path. Rounding mode is always explicit (HALF_EVEN).
 4. Lock accounts in ascending id order before updating balances (Java and Python).
-5. No Kafka or HTTP calls inside a DB transaction. Events go through the `outbox` table.
+5. No network calls (Kafka, HTTP, the payment processor) inside a DB transaction, except the outbox relay's send-and-await inside its batch transaction (D-008, D-079). Events go through the `outbox` table.
 6. Consumer side: `processed_messages` insert + effect + outbox in ONE DB transaction; commit the Kafka offset after the DB commit.
 7. Idempotency key row and the business effect commit in the same transaction.
 

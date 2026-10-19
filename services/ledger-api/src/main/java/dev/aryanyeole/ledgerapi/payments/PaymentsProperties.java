@@ -9,8 +9,11 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 // to BigDecimal and checked to be in [0, 1); anything else fails startup. Quote it in YAML
 // (fee-rate: "0.029"): an unquoted 0.029 is read as a YAML double before Spring binds it.
 // ledger.payments.topic (D-095): the Kafka topic of payment events, written into each outbox row.
+// ledger.payments.partitions / replication-factor (D-080): what the outbox relay creates the topic
+// with if it is absent, and the partition count it requires if it exists.
 @ConfigurationProperties("ledger.payments")
-public record PaymentsProperties(@DefaultValue("0.029") String feeRate, @DefaultValue("ledger.payments.v1") String topic) {
+public record PaymentsProperties(@DefaultValue("0.029") String feeRate, @DefaultValue("ledger.payments.v1") String topic,
+		@DefaultValue("3") int partitions, @DefaultValue("1") short replicationFactor) {
 
 	public PaymentsProperties {
 		BigDecimal rate = parse(feeRate);
@@ -19,6 +22,13 @@ public record PaymentsProperties(@DefaultValue("0.029") String feeRate, @Default
 		}
 		if (topic == null || topic.isBlank()) {
 			throw new IllegalArgumentException("ledger.payments.topic must not be blank");
+		}
+		if (partitions < 1) {
+			throw new IllegalArgumentException("ledger.payments.partitions must be at least 1, was " + partitions);
+		}
+		if (replicationFactor < 1) {
+			throw new IllegalArgumentException(
+					"ledger.payments.replication-factor must be at least 1, was " + replicationFactor);
 		}
 	}
 

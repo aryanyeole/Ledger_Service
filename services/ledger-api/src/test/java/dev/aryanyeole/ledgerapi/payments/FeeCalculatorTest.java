@@ -18,7 +18,7 @@ import dev.aryanyeole.ledgerapi.money.Money;
 class FeeCalculatorTest {
 
 	private static final FeeCalculator DEFAULT_RATE = new FeeCalculator(new PaymentsProperties("0.029",
-			"ledger.payments.v1"));
+			"ledger.payments.v1", 3, (short) 1));
 
 	@ParameterizedTest(name = "{0} -> {1}")
 	@CsvSource({ "100.00, 2.90", "5.00, 0.14", "15.00, 0.44", "0.01, 0.00" })
@@ -34,7 +34,7 @@ class FeeCalculatorTest {
 	@ParameterizedTest
 	@ValueSource(strings = { "1", "-0.01", "abc" })
 	void invalidRatesFailStartup(String rate) {
-		assertThatThrownBy(() -> new PaymentsProperties(rate, "ledger.payments.v1"))
+		assertThatThrownBy(() -> new PaymentsProperties(rate, "ledger.payments.v1", 3, (short) 1))
 			.isInstanceOf(IllegalArgumentException.class)
 			.hasMessageContaining("ledger.payments.fee-rate");
 	}
@@ -42,7 +42,8 @@ class FeeCalculatorTest {
 	@ParameterizedTest
 	@ValueSource(strings = { "", " " })
 	void blankTopicFailsStartup(String topic) {
-		assertThatThrownBy(() -> new PaymentsProperties("0.029", topic)).isInstanceOf(IllegalArgumentException.class)
+		assertThatThrownBy(() -> new PaymentsProperties("0.029", topic, 3, (short) 1))
+			.isInstanceOf(IllegalArgumentException.class)
 			.hasMessageContaining("ledger.payments.topic");
 	}
 

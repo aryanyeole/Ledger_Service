@@ -19,8 +19,17 @@ spring:
     deserialization:
       # Unknown JSON fields are a 400 invalid_request, never silently ignored (D-046).
       fail-on-unknown-properties: true
-  kafka:
-    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+  autoconfigure:
+    # The outbox relay owns the only Kafka client (D-098): no default template or factories.
+    exclude: org.springframework.boot.kafka.autoconfigure.KafkaAutoConfiguration
+
+ledger:
+  outbox:
+    relay:
+      # Tests turn both off in src/test/resources/application.properties (D-096).
+      enabled: true
+      scheduled: true
+      bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
 
 management:
   endpoints:
