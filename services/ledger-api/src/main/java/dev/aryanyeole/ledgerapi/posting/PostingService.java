@@ -61,10 +61,20 @@ public class PostingService {
 
 	/** Id of the seeded system:external account (D-048); not locked. */
 	public long externalAccountId() {
-		return this.jdbc.sql("SELECT id FROM accounts WHERE name = 'system:external'")
+		return systemAccountId("system:external");
+	}
+
+	/** Id of the seeded system:escrow account (D-048); a plain read that takes no lock (D-075). */
+	public long escrowAccountId() {
+		return systemAccountId("system:escrow");
+	}
+
+	private long systemAccountId(String name) {
+		return this.jdbc.sql("SELECT id FROM accounts WHERE name = :name")
+			.param("name", name)
 			.query(Long.class)
 			.optional()
-			.orElseThrow(() -> new IllegalStateException("system:external account is missing"));
+			.orElseThrow(() -> new IllegalStateException(name + " account is missing"));
 	}
 
 	/** Locks the distinct ids in ascending order, in one statement. Missing ids -> stored 404. */
