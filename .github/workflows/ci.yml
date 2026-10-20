@@ -36,8 +36,8 @@ jobs:
     name: settlement-worker
     # Pinned image (D-070): concurrency proofs are timing-sensitive; upgrades are explicit PRs.
     runs-on: ubuntu-24.04
-    # 20 min until T9 measures the crash test and sets it from measured runtime plus margin (D-089).
-    timeout-minutes: 20
+    # Measured runtime plus 50 % (D-089): 2m12s on PR #36's first run (warm caches) x 1.5, rounded up.
+    timeout-minutes: 4
     defaults:
       run:
         working-directory: services/settlement-worker
