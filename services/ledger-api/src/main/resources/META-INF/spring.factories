@@ -1,0 +1,2 @@
+org.springframework.boot.EnvironmentPostProcessor=\
+dev.aryanyeole.ledgerapi.db.MigrateOnlyEnvironmentPostProcessor

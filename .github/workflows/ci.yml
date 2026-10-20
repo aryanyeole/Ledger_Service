@@ -36,12 +36,22 @@ jobs:
     name: settlement-worker
     # Pinned image (D-070): concurrency proofs are timing-sensitive; upgrades are explicit PRs.
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # 20 min until T9 measures the crash test and sets it from measured runtime plus margin (D-089).
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: services/settlement-worker
     steps:
       - uses: actions/checkout@v7
+      # The worker's tests build their schema with the ledger-api jar in migrate-only mode (D-083).
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: services/ledger-api/pom.xml
+      - run: ./mvnw -B -q -DskipTests package
+        working-directory: services/ledger-api
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"

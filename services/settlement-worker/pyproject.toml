@@ -7,10 +7,12 @@ name = "settlement-worker"
 version = "0.0.1"
 requires-python = ">=3.13"
 # Exact pins; full environment in constraints.txt (D-031).
-dependencies = ["structlog==26.1.0"]
+dependencies = ["aiokafka==0.14.0", "asyncpg==0.32.0", "structlog==26.1.0"]
 
 [project.optional-dependencies]
-dev = ["pytest==9.1.1"]
+# testcontainers with no extras (D-084): its Kafka module targets the Confluent image only, so
+# Kafka runs as a generic apache/kafka container (tests/conftest.py).
+dev = ["pytest==9.1.1", "testcontainers==4.15.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
