@@ -65,3 +65,5 @@ jobs:
           CRASH_ITERATIONS: "5"
           # The D-086 negative control's CI size; the local run's N and result are the published figures.
           NEGATIVE_CONTROL_ITERATIONS: "3"
+          # D-087: CI gates correctness only; the local run's lock-wait figures are the published ones.
+          LOCK_ORDER_ROUNDS: "1"
