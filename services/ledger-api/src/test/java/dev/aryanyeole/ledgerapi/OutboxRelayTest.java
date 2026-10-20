@@ -14,7 +14,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -212,8 +211,18 @@ class OutboxRelayTest {
 		OutboxRelay wrongTopicRelay = new OutboxRelay(this.transactions, this.jdbc, this.kafkaTemplate, guard,
 				this.faultHook, this.relayProperties);
 
-		assertThat(wrongTopicRelay.publishBatch()).as("first tick").isZero();
-		assertThat(wrongTopicRelay.publishBatch()).as("second tick").isZero();
+		int firstTick = wrongTopicRelay.publishBatch();
+		int secondTick = wrongTopicRelay.publishBatch();
+		// The stop first, from its one ERROR line: a guard that is still UNCHECKED (the topic not yet
+		// visible in metadata, BUG-006) also makes both ticks return 0, so 0 alone doesn't prove it.
+		// RelayTopicGuard's state isn't visible outside its package; ready() can't tell UNCHECKED
+		// from STOPPED and would check again.
+		String error = "Outbox relay stopped: topic " + topic + " has 1 partitions, expected 3";
+		List<String> errorLines = output.getAll().lines().filter((line) -> line.contains(error)).toList();
+		assertThat(errorLines).as("ERROR lines naming %s", topic).hasSize(1);
+		assertThat(errorLines.get(0)).as("level of the stop line").contains("ERROR");
+		assertThat(firstTick).as("first tick").isZero();
+		assertThat(secondTick).as("second tick").isZero();
 		assertThat(this.relay.publishBatch()).as("the main relay ignores other topics' rows").isZero();
 
 		assertThat(rowsWithKey(key)).as("rows for %s", topic)
@@ -221,11 +230,6 @@ class OutboxRelayTest {
 			.allSatisfy((r) -> assertThat(r.publishedAt()).as("published_at").isNull());
 		assertThat(this.reader.readAll(topic)).as("records on %s", topic).isEmpty();
 		assertThat(this.reader.partitionCount(topic)).as("partitions of %s", topic).isEqualTo(1);
-		String error = "Outbox relay stopped: topic " + topic + " has 1 partitions, expected 3";
-		assertThat(output.getAll().split(Pattern.quote(error), -1).length - 1)
-			.as("ERROR lines naming %s", topic)
-			.isEqualTo(1);
-		assertThat(output.getAll()).contains("ERROR").contains(error);
 	}
 
 	private List<OutboxRow> rowsWithKey(String key) {

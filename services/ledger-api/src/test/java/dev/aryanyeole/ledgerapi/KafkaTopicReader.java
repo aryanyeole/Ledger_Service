@@ -1,6 +1,5 @@
 package dev.aryanyeole.ledgerapi;
 
-import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.fail;
 
 import java.time.Duration;
@@ -9,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
 
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
@@ -17,15 +17,21 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
 import org.apache.kafka.common.serialization.StringDeserializer;
 
 // Test-side Kafka access for the relay tests: a plain KafkaConsumer (own group, earliest, no
 // commits) that reads a topic from the beginning to its current end offsets, and a few Admin
-// calls. No sleeps: the relay returns only after every ack, so the end offsets include everything
-// it published. Records come back in per-partition offset order.
+// calls. Reading never waits for records: the relay returns only after every ack, so the end
+// offsets include everything it published. Records come back in per-partition offset order. A
+// topic can be briefly missing from the broker's metadata after createTopics returns (BUG-006), so
+// createTopic waits until it is visible and readAll waits for its partitions, both polled against
+// a deadline.
 final class KafkaTopicReader {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(15);
+
+	private static final long POLL_PAUSE_MILLIS = 50;
 
 	private final String bootstrapServers;
 
@@ -42,11 +48,7 @@ final class KafkaTopicReader {
 		config.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
 		config.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
 		try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(config)) {
-			List<TopicPartition> partitions = consumer.partitionsFor(topic, TIMEOUT)
-				.stream()
-				.map((info) -> new TopicPartition(topic, info.partition()))
-				.toList();
-			assertThat(partitions).as("partitions of %s", topic).isNotEmpty();
+			List<TopicPartition> partitions = partitionsOf(consumer, topic);
 			consumer.assign(partitions);
 			consumer.seekToBeginning(partitions);
 			Map<TopicPartition, Long> end = consumer.endOffsets(partitions, TIMEOUT);
@@ -71,6 +73,56 @@ final class KafkaTopicReader {
 	void createTopic(String topic, int partitions) throws Exception {
 		try (Admin admin = admin()) {
 			admin.createTopics(List.of(new NewTopic(topic, partitions, (short) 1))).all().get();
+			// createTopics completes before every metadata read is guaranteed to see the topic (BUG-006).
+			long deadline = System.nanoTime() + TIMEOUT.toNanos();
+			String last = "unknown";
+			while (true) {
+				try {
+					int visible = admin.describeTopics(List.of(topic))
+						.allTopicNames()
+						.get()
+						.get(topic)
+						.partitions()
+						.size();
+					if (visible == partitions) {
+						return;
+					}
+					last = visible + " partitions";
+				}
+				catch (ExecutionException ex) {
+					last = (ex.getCause() instanceof UnknownTopicOrPartitionException) ? "unknown"
+							: ex.getCause().toString();
+				}
+				if (System.nanoTime() > deadline) {
+					fail("topic " + topic + " not visible with " + partitions + " partitions within "
+							+ TIMEOUT.toSeconds() + " s of creation (last: " + last + ")");
+				}
+				Thread.sleep(POLL_PAUSE_MILLIS);
+			}
+		}
+	}
+
+	// partitionsFor returns an empty list, without waiting, for a topic the broker doesn't know yet.
+	private static List<TopicPartition> partitionsOf(KafkaConsumer<String, String> consumer, String topic) {
+		long deadline = System.nanoTime() + TIMEOUT.toNanos();
+		while (true) {
+			List<TopicPartition> partitions = consumer.partitionsFor(topic, TIMEOUT)
+				.stream()
+				.map((info) -> new TopicPartition(topic, info.partition()))
+				.toList();
+			if (!partitions.isEmpty()) {
+				return partitions;
+			}
+			if (System.nanoTime() > deadline) {
+				fail("no partitions for " + topic + " within " + TIMEOUT.toSeconds() + " s");
+			}
+			try {
+				Thread.sleep(POLL_PAUSE_MILLIS);
+			}
+			catch (InterruptedException ex) {
+				Thread.currentThread().interrupt();
+				throw new IllegalStateException("interrupted waiting for partitions of " + topic, ex);
+			}
 		}
 	}
 
