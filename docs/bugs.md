@@ -22,7 +22,7 @@
 | BUG-003 | 2026-10-14 13:26 | M2 | Concurrency harness produces too little overlap on GitHub runners | P2 proof evidence (component: ledger-api tests) | fixed | aaf2e1a (PR #22) |
 | BUG-004 | 2026-10-19 19:45 | M3 | OutboxRedeliveryTest case 2 depends on an earlier test having opened the producer's leader connection | P3 proof evidence, D-099 (component: ledger-api tests) | fixed | a44d366 (PR #32) |
 | BUG-005 | 2026-10-19 23:25 | M3 | OppositeTransfersNoDeadlockTest misses the D-067 server-overlap floor on CI | P2 proof evidence, D-067 (component: ledger-api tests) | open | pending (T9b) |
-| BUG-006 | 2026-10-20 00:18 | M3 | KafkaTopicReader finds no partitions for a topic created moments earlier | none (component: ledger-api tests) | open | |
+| BUG-006 | 2026-10-20 00:18 | M3 | KafkaTopicReader finds no partitions for a topic created moments earlier | none (component: ledger-api tests) | fixed | ebc0cd5 (PR #38) |
 
 ---
 
@@ -296,7 +296,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 ### BUG-006 — KafkaTopicReader finds no partitions for a topic created moments earlier
 
 - **Found:** 2026-10-20 00:18 · M3 · Task T9b · branch `m3/t9b-overlap-floor-calibration`
-- **Status:** open
+- **Status:** fixed
 - **Component:** ledger-api tests (`KafkaTopicReader.readAll`, used by `OutboxRelayTest.relayStopsWhenItsTopicHasTheWrongPartitionCount`)
 - **Property / invariant touched:** none observed. The test's assertions on the relay itself (two ticks returning 0, the main relay ignoring the topic, 3 rows with `published_at` null) all passed before the failing line; the failure is in the test's own read of the topic.
 - **Symptom:** CI run 39383847328 attempt 6 on PR #37 head `d376884` (the interim T9b commit; test-only changes to the four overlap-floor tests and the harness constant) failed in ledger-api. 519 of 520 tests passed; attempts 1–5 of the same run, on the same commit, passed.
@@ -326,14 +326,14 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
   - `KafkaTopicReader.createTopic` polls `describeTopics` until the topic is visible with the requested partition count. Deadline 15 s, 50 ms pauses; at the deadline it fails with `topic <t> not visible with <n> partitions within 15 s of creation (last: …)`.
   - `readAll` polls `partitionsFor` until the list is non-empty, under the same deadline and pause; at the deadline it fails with `no partitions for <t> within 15 s`.
   - `OutboxRelayTest`'s wrong-partition case now asserts the stop's single ERROR line straight after the two ticks, before the ticks' return values and anything else that relies on the stop. `RelayTopicGuard`'s state isn't visible from the test package, and `ready()` can't tell UNCHECKED from STOPPED.
-  - Commit on `m3/fix-bug-006`; the commit, PR and squash commit are filled in below after push and merge.
+  - Commit `ebc0cd5` · PR #38 (squash commit to be filled in after merge).
 - **Regression test:** `services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/OutboxRelayTest.java`, `relayStopsWhenItsTopicHasTheWrongPartitionCount`.
   - **Red before:** CI run 39383847328 attempt 6 (the failure above).
   - **Red for the new assertion (local, i5-1240P, D-051):** with `RelayTopicGuard` mutated to return UNCHECKED on a partition mismatch, as if the topic never became visible, the new assertion fails first: `OutboxRelayTest.relayStopsWhenItsTopicHasTheWrongPartitionCount:222 [ERROR lines naming m3t4-one-ee28098e-…] Expected size: 1 but was: 0`. Restored with `git restore`.
   - **Green after (local):** `OutboxRelayTest` 4/4 and `OutboxRedeliveryTest` 5/5; `.\mvnw.cmd clean verify` 520 tests, 0 failures.
-  - **CI five-attempt loop:** pending.
+  - **Green after (CI):** build manual §9's five-attempt loop on `ebc0cd5`, run 39388756885, attempts 1–5. Every attempt was green on both jobs (ledger-api `Tests run: 520, Failures: 0` each time, `OutboxRelayTest` 4/4), and the guard logged the stop on its first check every time. The lag did not recur in these five, so they show no regression, not that the race is gone (see Notes).
 - **Decision Log impact:** none. Test helpers that create a topic wait until it is visible in metadata before returning; no row unless the owner wants one.
-- **Summary (one sentence):**
+- **Summary (one sentence):** A topic the test created could be briefly invisible in the broker's metadata, so the relay guard stayed UNCHECKED and the reader's `partitionsFor` returned no partitions. `createTopic` now waits until the topic is visible with its partitions, `readAll` waits for a non-empty partition list, and the test proves the stop from its ERROR line before relying on it.
 - **Notes:**
   - **Correction to Property / invariant touched** (rule 3): the relay assertions that "passed before the failing line" (both ticks returning 0) passed with the guard UNCHECKED, not STOPPED. They were not evidence that the relay had stopped.
   - **What green runs can show:** the lag can't be induced on demand, so green runs show the fix causes no regression, not that the race is gone. The case for the fix is the mechanism: the test can no longer start the relay ticks before the topic is visible.
