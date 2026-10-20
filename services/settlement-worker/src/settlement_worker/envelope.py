@@ -25,7 +25,8 @@ VERSION = 1
 ENVELOPE_KEYS = frozenset({"event_id", "event_type", "version", "occurred_at", "correlation_id", "data"})
 AUTHORIZED_DATA_KEYS = frozenset({"payment_id", "customer_account_id", "merchant_account_id", "amount", "fee"})
 
-_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+CANONICAL_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_UUID = CANONICAL_UUID
 _OCCURRED_AT = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z")
 
 

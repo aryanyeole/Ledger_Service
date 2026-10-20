@@ -17,7 +17,22 @@ def test_contract():
         "payment_not_authorized": ["correlation_id", "event_id", "payment_id", "status"],
         "payment_settled": ["correlation_id", "event_id", "payment_id", "transaction_id"],
         "payment_released": ["correlation_id", "event_id", "payment_id", "transaction_id"],
+        "worker_started": ["consumer_group", "correlation_id", "fault_point"],
+        "partitions_assigned": ["correlation_id", "partitions"],
+        "processing_failed": ["correlation_id", "error", "offset", "partition", "topic"],
+        "worker_stopped": ["correlation_id", "reason"],
+        "config_invalid": ["correlation_id", "error"],
     }
+
+
+def test_level_is_chosen_by_the_caller_and_checked():
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        events.emit(structlog.get_logger(), events.CONFIG_INVALID, level="error", error="x", correlation_id=None)
+    assert logs[0]["log_level"] == "error"
+    with pytest.raises(ValueError, match="unknown level"):
+        events.emit(structlog.get_logger(), events.CONFIG_INVALID, level="debug", error="x", correlation_id=None)
 
 
 def test_unknown_event_is_refused():
