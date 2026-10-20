@@ -45,8 +45,12 @@ import dev.aryanyeole.ledgerapi.api.EdgeProbe;
 @SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT, properties = EdgeProbe.API_KEYS_PROPERTY)
 class ConcurrentIdempotentTransferTest {
 
-	// D-106: uncalibrated until this test has its own CI distribution.
-	private static final int MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION = ConcurrentRequestHarness.UNCALIBRATED_SERVER_OVERLAP_FLOOR;
+	// D-106 tripwire floor = max(2, floor(0.6 x CI min)) over this test's own CI history, 4-processor
+	// ubuntu-24.04 runners: n = 65, i.e. 55 observations from 39 retained runs (2026-10-14..20) plus
+	// 10 fresh (PR #37: run 39383847328 attempts 1-6, run 39493178184 attempts 1-4). Minimum 6 (run 38641481141 attempt 4, and 2 more), so 3; it was 4, from a 10-run
+	// minimum of 7 that this test itself has since gone below (BUG-005). A miss is logged as a bug and
+	// the floor re-derived from the full history.
+	private static final int MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION = 3;
 
 	@LocalServerPort
 	int port;

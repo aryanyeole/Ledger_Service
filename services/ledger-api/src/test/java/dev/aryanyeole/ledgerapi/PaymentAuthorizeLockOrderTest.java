@@ -52,8 +52,11 @@ class PaymentAuthorizeLockOrderTest {
 
 	private static final int REQUESTS = 3 * EACH;
 
-	// D-106: uncalibrated until this test has its own CI distribution.
-	private static final int MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION = ConcurrentRequestHarness.UNCALIBRATED_SERVER_OVERLAP_FLOOR;
+	// D-106 tripwire floor = max(2, floor(0.6 x CI min)) over this test's own CI history, 4-processor
+	// ubuntu-24.04 runners: n = 35, i.e. 25 observations from 21 retained runs (2026-10-19..20) plus
+	// 10 fresh (PR #37: run 39383847328 attempts 1-6, run 39493178184 attempts 1-4). Minimum 4 (run 39390836141 attempt 1, main), so 2. A miss is logged as a bug and the
+	// floor re-derived from the full history.
+	private static final int MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION = 2;
 
 	@LocalServerPort
 	int port;

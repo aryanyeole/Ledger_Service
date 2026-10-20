@@ -54,8 +54,11 @@ class OppositeTransfersNoDeadlockTest {
 
 	private static final int REQUESTS = 2 * TRANSFERS_EACH_WAY + 2 * DEPOSITS_EACH;
 
-	// D-106: uncalibrated until this test has its own CI distribution.
-	private static final int MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION = ConcurrentRequestHarness.UNCALIBRATED_SERVER_OVERLAP_FLOOR;
+	// D-106 tripwire floor = max(2, floor(0.6 x CI min)) over this test's own CI history, 4-processor
+	// ubuntu-24.04 runners: n = 53, i.e. 43 observations from 35 retained runs (2026-10-14..20) plus
+	// 10 fresh (PR #37: run 39383847328 attempts 1-6, run 39493178184 attempts 1-4). Minimum 3 (run 39380129034 attempt 1, BUG-005), so 2. A miss is logged as a bug and the
+	// floor re-derived from the full history.
+	private static final int MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION = 2;
 
 	@LocalServerPort
 	int port;
