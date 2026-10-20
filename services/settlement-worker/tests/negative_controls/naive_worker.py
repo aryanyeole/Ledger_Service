@@ -27,6 +27,7 @@ import json
 import os
 import sys
 import threading
+import time
 import uuid
 from datetime import timedelta
 
@@ -71,7 +72,7 @@ class _AssignmentLogger(ConsumerRebalanceListener):
         )
 
 
-async def _effect(conn, config: Config, event: AuthorizedEvent, decision: Decision, row) -> int:
+async def _effect(conn, config: Config, event: AuthorizedEvent, decision: Decision, row) -> tuple[int, int]:
     """Transaction 1: the posting and its result event, without the dedup row or the transition."""
     payment = settlement.PaymentRow(
         customer_account_id=row["customer_account_id"],
@@ -85,9 +86,11 @@ async def _effect(conn, config: Config, event: AuthorizedEvent, decision: Decisi
         fees_id = await conn.fetchval("SELECT id FROM accounts WHERE name = $1", settlement.PLATFORM_FEES_NAME)
         posting = sorted(settlement.legs(decision, payment, escrow_id, fees_id))
         account_ids = [account for account, _ in posting]
+        started = time.perf_counter_ns()
         locked = await conn.fetch(
             "SELECT id FROM accounts WHERE id = ANY($1::bigint[]) ORDER BY id FOR UPDATE", account_ids
         )
+        lock_wait_ms = (time.perf_counter_ns() - started) // 1_000_000
         if [r["id"] for r in locked] != account_ids:
             raise RuntimeError(f"accounts missing: {sorted(set(account_ids) - {r['id'] for r in locked})}")
         kind = "PAYMENT_SETTLE" if decision is Decision.APPROVED else "PAYMENT_RELEASE"
@@ -125,7 +128,7 @@ async def _effect(conn, config: Config, event: AuthorizedEvent, decision: Decisi
             json.dumps(payload, separators=(",", ":")),
             json.dumps({"correlation_id": event.correlation_id}, separators=(",", ":")),
         )
-    return transaction_id
+    return transaction_id, lock_wait_ms
 
 
 async def _mark(conn, config: Config, event: AuthorizedEvent, decision: Decision) -> None:
@@ -162,7 +165,7 @@ async def _process(record, *, conn, kafka, config: Config, fault_id, skip_id) ->
         await kafka.commit({tp: record.offset + 1})
         return
     decision = processor.decide(event.payment_id, event.amount, correlation_id=event.correlation_id)
-    transaction_id = await _effect(conn, config, event, decision, row)
+    transaction_id, lock_wait_ms = await _effect(conn, config, event, decision, row)
     name = events.PAYMENT_SETTLED if decision is Decision.APPROVED else events.PAYMENT_RELEASED
     events.emit(
         log,
@@ -170,6 +173,7 @@ async def _process(record, *, conn, kafka, config: Config, fault_id, skip_id) ->
         event_id=str(event.event_id),
         payment_id=str(event.payment_id),
         transaction_id=transaction_id,
+        lock_wait_ms=lock_wait_ms,
         correlation_id=event.correlation_id,
     )
     if event.payment_id == fault_id:

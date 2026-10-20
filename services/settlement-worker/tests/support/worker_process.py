@@ -200,6 +200,25 @@ async def authorized_positions(
     return found
 
 
+async def group_state(bootstrap_servers: str, group: str) -> tuple[str, int]:
+    """(state, member count) of a consumer group, e.g. ("Stable", 2), from the admin client.
+
+    describe_consumer_groups returns DescribeGroupsResponse objects whose groups are tuples of
+    (error_code, group_id, state, protocol_type, protocol, members) (checked on apache/kafka:4.3.1).
+    """
+    admin = AIOKafkaAdminClient(bootstrap_servers=bootstrap_servers)
+    await admin.start()
+    try:
+        responses = await admin.describe_consumer_groups([group])
+    finally:
+        await admin.close()
+    for response in responses:
+        for error_code, group_id, state, _protocol_type, _protocol, members in response.groups:
+            if group_id == group:
+                return (state, len(members)) if error_code == 0 else (f"error {error_code}", 0)
+    return ("unknown", 0)
+
+
 async def wait_quiescent(
     *,
     app_conn,
@@ -208,18 +227,23 @@ async def wait_quiescent(
     payment_ids: list[uuid.UUID],
     timeout: float = 60,
     require_terminal: bool = True,
+    check=None,
 ) -> dict[int, int]:
     """Payments terminal, their outbox rows published, and lag 0 on every partition, twice in a row.
 
     require_terminal=False drops the first condition (D-105): lag 0 alone means every record was
     processed and committed, so a payment still AUTHORIZED afterwards was skipped, and the caller
-    can count it as lost instead of timing out here.
+    can count it as lost instead of timing out here. check, if given, runs on every poll and returns
+    a failure message (e.g. a worker exited) to fail at once instead of waiting out the deadline.
     """
     keys = [str(p) for p in payment_ids]
     deadline = time.monotonic() + timeout
     consecutive = 0
     last = None
     while time.monotonic() < deadline:
+        failure = check() if check else None
+        if failure:
+            raise AssertionError(failure)
         authorized = await app_conn.fetchval(
             "SELECT count(*) FROM payments WHERE id = ANY($1::uuid[]) AND status = 'AUTHORIZED'", payment_ids
         )

@@ -23,6 +23,7 @@ Money is Decimal throughout (invariant 3). Log events go out after the commit.
 
 import enum
 import json
+import time
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
@@ -111,6 +112,7 @@ async def handle(
     status = "SETTLED" if decision is Decision.APPROVED else "FAILED"
     not_authorized_status = None
     transaction_id = None
+    lock_wait_ms = None
     async with conn.transaction(isolation="read_committed"):
         # SET takes no bind parameters; set_config(..., true) is SET LOCAL.
         await conn.execute("SELECT set_config('lock_timeout', $1, true)", _lock_timeout(lock_timeout))
@@ -129,7 +131,7 @@ async def handle(
             else:
                 payment = PaymentRow(**dict(row))
                 _check_matches(event, payment)
-                transaction_id = await _post(conn, event, decision, payment)
+                transaction_id, lock_wait_ms = await _post(conn, event, decision, payment)
                 await _append_result(conn, topic, event, decision, payment, transaction_id)
                 outcome = Outcome.SETTLED if decision is Decision.APPROVED else Outcome.RELEASED
 
@@ -141,7 +143,7 @@ async def handle(
         events.emit(log, events.PAYMENT_NOT_AUTHORIZED, status=not_authorized_status, **base)
     else:
         name = events.PAYMENT_SETTLED if outcome is Outcome.SETTLED else events.PAYMENT_RELEASED
-        events.emit(log, name, transaction_id=transaction_id, **base)
+        events.emit(log, name, transaction_id=transaction_id, lock_wait_ms=lock_wait_ms, **base)
     return outcome
 
 
@@ -162,13 +164,19 @@ async def _system_account(conn: asyncpg.Connection, name: str) -> int:
     return account_id
 
 
-async def _post(conn: asyncpg.Connection, event: AuthorizedEvent, decision: Decision, payment: PaymentRow) -> int:
+async def _post(
+    conn: asyncpg.Connection, event: AuthorizedEvent, decision: Decision, payment: PaymentRow
+) -> tuple[int, int]:
+    """The posting; returns its transaction id and the whole milliseconds spent in the lock statement
+    (report-only, D-087; integer nanoseconds, so no float is involved)."""
     escrow_id = await _system_account(conn, ESCROW_NAME)
     fees_id = await _system_account(conn, PLATFORM_FEES_NAME)
     posting = sorted(legs(decision, payment, escrow_id, fees_id))
     account_ids = [account for account, _ in posting]
 
+    started = time.perf_counter_ns()
     locked = {r["id"]: r["balance"] for r in await conn.fetch(_LOCK_ACCOUNTS, account_ids)}
+    lock_wait_ms = (time.perf_counter_ns() - started) // 1_000_000
     if set(locked) != set(account_ids):
         raise SettlementError(f"accounts missing: {sorted(set(account_ids) - set(locked))}")
     # Under T10's negative control, its ballast payment (D-086) is what keeps a double-applied settle from tripping this.
@@ -191,7 +199,7 @@ async def _post(conn: asyncpg.Connection, event: AuthorizedEvent, decision: Deci
         )
     for account, delta in posting:
         await conn.execute("UPDATE accounts SET balance = balance + $2 WHERE id = $1", account, delta)
-    return transaction_id
+    return transaction_id, lock_wait_ms
 
 
 async def _append_result(
