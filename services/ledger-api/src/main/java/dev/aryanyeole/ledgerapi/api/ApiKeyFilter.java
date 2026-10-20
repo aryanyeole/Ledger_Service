@@ -14,6 +14,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
@@ -27,8 +28,10 @@ import org.springframework.web.servlet.HandlerExceptionResolver;
 // probe. The presented key is hashed and compared against every configured hash with
 // MessageDigest.isEqual, without stopping at the first match. The key itself is never
 // stored, logged, or echoed. Rejections go through the MVC exception resolvers so
-// ProblemHandler renders them like every other error.
+// ProblemHandler renders them like every other error. Only in a servlet web application: the MVC
+// exception resolver it needs doesn't exist otherwise, e.g. in migrate-only mode (D-083).
 @Component
+@ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
 @Order(ApiKeyFilter.ORDER)
 @EnableConfigurationProperties(ApiKeyProperties.class)
 public class ApiKeyFilter extends OncePerRequestFilter {
