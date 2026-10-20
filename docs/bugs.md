@@ -21,7 +21,7 @@
 | BUG-002 | 2026-10-13 18:12 | M2 | Shared EXTERNAL fixture adds order-dependent failures to UnbalancedTransactionRejectedTest's failing-first run | none (component: ledger-api tests) | fixed | 82b29b9 (PR #16) |
 | BUG-003 | 2026-10-14 13:26 | M2 | Concurrency harness produces too little overlap on GitHub runners | P2 proof evidence (component: ledger-api tests) | fixed | aaf2e1a (PR #22) |
 | BUG-004 | 2026-10-19 19:45 | M3 | OutboxRedeliveryTest case 2 depends on an earlier test having opened the producer's leader connection | P3 proof evidence, D-099 (component: ledger-api tests) | fixed | a44d366 (PR #32) |
-| BUG-005 | 2026-10-19 23:25 | M3 | OppositeTransfersNoDeadlockTest misses the D-067 server-overlap floor on CI | P2 proof evidence, D-067 (component: ledger-api tests) | open | pending (T9b) |
+| BUG-005 | 2026-10-19 23:25 | M3 | OppositeTransfersNoDeadlockTest misses the D-067 server-overlap floor on CI | P2 proof evidence, D-067 (component: ledger-api tests) | fixed | PR #37 |
 | BUG-006 | 2026-10-20 00:18 | M3 | KafkaTopicReader finds no partitions for a topic created moments earlier | none (component: ledger-api tests) | fixed | ebc0cd5 (PR #38) |
 
 ---
@@ -262,7 +262,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 ### BUG-005 — OppositeTransfersNoDeadlockTest misses the D-067 server-overlap floor on CI
 
 - **Found:** 2026-10-19 23:25 · M3 · Task T9 · branch `m3/t9-crash-recovery-test`
-- **Status:** open
+- **Status:** fixed
 - **Component:** ledger-api tests (`OppositeTransfersNoDeadlockTest.oppositeTransfersAndDepositsNeverDeadlock`)
 - **Property / invariant touched:** P2's proof evidence (the D-067 tripwire against a serialized harness). Production behaviour is not implicated: in the failing round all 60 requests returned 201, there were exactly 50 new transfers and 10 new deposits, and A, B and EXTERNAL each had balance = entry sum.
 - **Symptom:** ledger-api CI failed on PR #36 head `d01a3dc` (run 39380129034): OppositeTransfersNoDeadlockTest round 1, seed 285447679987, server overlap 3 < floor 4. 519 of 520 tests passed. The branch doesn't touch ledger-api; the same test passed on the branch's two previous CI runs (39376345797 on `a79f44e`, 39376621986 on `0ae5dcf`).
@@ -282,14 +282,30 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
   cd services\ledger-api
   .\mvnw.cmd test "-Dtest=OppositeTransfersNoDeadlockTest" "-Dledger.test.shuffle.seed=285447679987"
   ```
-- **Time to diagnose:** pending.
-- **Root cause:** (hypothesis, to be confirmed in T9b) the D-067 floor of 4 was calibrated from ConcurrentIdempotentTransferTest's CI distribution and applied to OppositeTransfersNoDeadlockTest (D-068) — and later ConcurrentIdempotentPaymentTest and PaymentAuthorizeLockOrderTest — without CI data of their own.
-- **Why it wasn't caught earlier:** pending.
-- **Fix:** pending (T9b).
-- **Regression test:** pending.
-- **Decision Log impact:** pending.
-- **Summary (one sentence):**
+- **Time to diagnose:** under an hour. Found at 23:25; the per-test minima that confirm the root cause came from the first full CI-history analysis in T9b, run on 2026-10-20 between 00:03 (the collection's first test run, file time) and 00:18 (BUG-006's failure, which came after it).
+- **Root cause:** (confirmed from the data in T9b; the hypothesis was only partly right.)
+  - **A 10-observation minimum isn't a stable lower bound.** The D-067 floor of 4 = ⌊0.6 × 7⌋ came from the minimum of 10 CI observations of one test, ConcurrentIdempotentTransferTest. Its 65 observations now reach 6 (7 → 6), first on BUG-003's own follow-up run (38641481141 attempt 4).
+  - **It was applied to three tests with no CI data of their own**, whose tails differ (minimums 3 to 11) even though three of four medians are within 12 ± 1.
+  - **The observation that broke the shared floor** was OppositeTransfersNoDeadlockTest's minimum of 3.
+  - Per-test CI distributions (retained history plus 10 fresh runs; the inclusion rule is in PR #37):
+
+    | Test | n | min | median | max |
+    |---|---|---|---|---|
+    | ConcurrentIdempotentTransferTest | 65 | 6 | 13 | 45 |
+    | OppositeTransfersNoDeadlockTest | 53 | 3 | 12 | 26 |
+    | ConcurrentIdempotentPaymentTest | 35 | 11 | 20 | 52 |
+    | PaymentAuthorizeLockOrderTest | 35 | 4 | 12 | 27 |
+- **Why it wasn't caught earlier:** each test after ConcurrentIdempotentTransferTest adopted the harness's shared constant without any CI data of its own, and nothing asked for a test's floor to be re-derived as its observations grew. The miss needed a tail value below 4, and OppositeTransfersNoDeadlockTest's first came after 35 green observations.
+- **Fix:** each tripwire test has its own floor, derived from its own CI history with D-067's formula (D-106): ConcurrentIdempotentTransferTest 3, OppositeTransfersNoDeadlockTest 2, ConcurrentIdempotentPaymentTest 6, PaymentAuthorizeLockOrderTest 2. Each constant's comment records n, the minimum and the runs. The harness keeps `UNCALIBRATED_SERVER_OVERLAP_FLOOR = 2` as the starting floor for a test without its own calibration. The correctness assertions are unchanged.
+  - **Commits:** PR #37 (`746870f`, interim floors at 2 for the fresh runs, then the calibration commit). The squash commit gets filled in after merge.
+- **Regression test:** the four tripwire tests: `ConcurrentIdempotentTransferTest`, `OppositeTransfersNoDeadlockTest`, `ConcurrentIdempotentPaymentTest`, `PaymentAuthorizeLockOrderTest` (`services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/`).
+  - **Red before:** CI run 39380129034 (`d01a3dc`): overlap 3 < floor 4.
+  - **Green after:** 10 fresh CI attempts (PR #37: run 39383847328 attempts 1–6 on `d376884`, run 39493178184 attempts 1–4 on `746870f`; the harness and test files are byte-identical across the two). Every value is at or above the calibrated floors: fresh minimums 8, 5, 11 and 6. Attempt 6's one failure was BUG-006, not an overlap floor. Then the final head's CI run in PR #37.
+- **Decision Log impact:** D-106 (per-test floors; amends D-067 and D-068), PR #37's description.
+- **Summary (one sentence):** The shared overlap floor of 4 came from a 10-observation minimum of one test and was applied unchanged to three tests with no CI data of their own; OppositeTransfersNoDeadlockTest's tail reached 3. Each test now has its own floor from its own full CI history.
 - **Notes:**
+  - The observation counts were first given as 54 (ConcurrentIdempotentTransferTest, with 6 of the 10 fresh attempts). The 65 above also includes the last 4 fresh attempts and the CI runs from PR #38 and its merge.
+  - ConcurrentIdempotentTransferTest's floor drops from 4 to 3. PaymentAuthorizeLockOrderTest's is 2, not 3: run 39390836141 (main, after PR #38 merged) reached 4.
 
 ---
 

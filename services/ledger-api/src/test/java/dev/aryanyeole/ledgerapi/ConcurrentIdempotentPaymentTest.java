@@ -40,6 +40,12 @@ import dev.aryanyeole.ledgerapi.api.EdgeProbe;
 @SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT, properties = EdgeProbe.API_KEYS_PROPERTY)
 class ConcurrentIdempotentPaymentTest {
 
+	// D-106 tripwire floor = max(2, floor(0.6 x CI min)) over this test's own CI history, 4-processor
+	// ubuntu-24.04 runners: n = 35, i.e. 25 observations from 21 retained runs (2026-10-19..20) plus
+	// 10 fresh (PR #37: run 39383847328 attempts 1-6, run 39493178184 attempts 1-4). Minimum 11 (run 39388756885 attempt 2, run 39383847328 attempt 6), so 6. A miss is
+	// logged as a bug and the floor re-derived from the full history.
+	private static final int MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION = 6;
+
 	@LocalServerPort
 	int port;
 
@@ -130,7 +136,7 @@ class ConcurrentIdempotentPaymentTest {
 		assertThat(server.arrivedBeforeFirstCompletion())
 			.as("%s: requests that arrived at the server before the first completed (was %d)", context,
 					server.arrivedBeforeFirstCompletion())
-			.isGreaterThanOrEqualTo(ConcurrentRequestHarness.MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION);
+			.isGreaterThanOrEqualTo(MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION);
 	}
 
 	private static long funded(ConcurrentRequestHarness harness) {
