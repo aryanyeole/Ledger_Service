@@ -177,9 +177,9 @@ Commit `docs/PROGRESS.md` to the repo, then **replace** `PROGRESS.md` in project
 
 ## 7. CI (GitHub Actions, set up at M0, grows each milestone)
 
-Jobs on every push/PR:
-1. `ledger-api`: `./mvnw verify` (Testcontainers runs on `ubuntu-latest` — Docker is available there).
-2. `settlement-worker`: `pip install -e ".[dev]"` + `pytest`.
+Jobs on every push/PR, both on the pinned `ubuntu-24.04` image (D-070; upgrades are explicit PRs):
+1. `ledger-api`: `./mvnw verify` (Testcontainers; Docker is available on the runner).
+2. `settlement-worker`: builds the ledger-api jar first (`./mvnw -B -q -DskipTests package` in `services/ledger-api`; the worker's tests take their schema from it in migrate-only mode, D-083, D-089), then `pip install -e ".[dev]" -c constraints.txt` + `pytest` with `CRASH_ITERATIONS=5`, `NEGATIVE_CONTROL_ITERATIONS=3` and `LOCK_ORDER_ROUNDS=1`.
 3. `dashboard` (from M7): `npm ci && npm run build` (typecheck included).
 
 By M3, CI must run `ConcurrentIdempotentTransferTest` and `test_crash_recovery.py`. Badge goes in the README from day 1.
@@ -264,4 +264,42 @@ foreach ($attempt in 2..5) {
     if ($LASTEXITCODE -ne 0) { throw "CI run $run failed" }
 }
 # Per-attempt numbers: gh run view $run --attempt <n> --log | Select-String "CONCURRENCY|DEADLOCK"
+```
+
+Several test classes in one run: `-Dtest` takes commas, not `+` (`+` separates methods of one class):
+```powershell
+cd services\ledger-api; .\mvnw.cmd test "-Dtest=OutboxRelayTest,OutboxRedeliveryTest"
+```
+
+Red mutations (D-051): stage first, so `git restore` has an index version to go back to (new files included); restore after each run. A restored file gets a fresh mtime, so Maven recompiles it. After a Java mutation or its restore, rebuild the jar the worker tests use, or their staleness check refuses it.
+```powershell
+git add -A
+# ... mutate, run, record ...
+git restore <path>
+cd services\ledger-api; .\mvnw.cmd -q -DskipTests package
+```
+
+Worker tests and proofs (M3):
+```powershell
+# The worker's tests build their schema with the ledger-api jar (D-083): package it first, and again after any ledger-api change
+cd services\ledger-api; .\mvnw.cmd -q -DskipTests package
+cd services\settlement-worker; .\.venv\Scripts\Activate.ps1; pytest
+# CI sizes are the defaults: CRASH_ITERATIONS=5, NEGATIVE_CONTROL_ITERATIONS=3, LOCK_ORDER_ROUNDS=1
+# Soaks (report each with the machine it ran on; these are the published figures)
+$env:CRASH_ITERATIONS = "100"; pytest tests\e2e\test_crash_recovery.py
+$env:NEGATIVE_CONTROL_ITERATIONS = "20"; pytest tests\negative_controls
+$env:LOCK_ORDER_ROUNDS = "20"; pytest tests\e2e\test_cross_operation_lock_order.py
+# Replay a lock-order round's shuffle: LOCK_ORDER_SEED=<seed from the summary line>
+Remove-Item Env:CRASH_ITERATIONS, Env:NEGATIVE_CONTROL_ITERATIONS, Env:LOCK_ORDER_ROUNDS, Env:LOCK_ORDER_SEED -ErrorAction SilentlyContinue
+```
+
+Dev broker topic check:
+```powershell
+# After changing Kafka settings in Compose (or before the relay first runs against the dev broker)
+docker compose up -d kafka
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic ledger.payments.v1
+#   "does not exist"   → fine: the relay creates it with 3 partitions on its first tick (D-080)
+#   PartitionCount: 1  → docker compose down -v (wipes Postgres and Kafka together, D-028)
+# Optional: confirm auto-create is off (broker id per KAFKA_NODE_ID, usually 1)
+docker compose exec kafka /opt/kafka/bin/kafka-configs.sh --bootstrap-server localhost:9092 --describe --entity-type brokers --entity-name 1 --all | Select-String "auto.create.topics.enable"
 ```

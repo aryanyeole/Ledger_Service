@@ -48,7 +48,16 @@
 | Worker crashes after calling the processor but before the DB commit? | Redelivery → processor called again with same idempotency key (payment id) → same decision → effect applied once |
 | Why poll by `published_at IS NULL` instead of tracking the last published id? | Identity ids can commit out of order; a high-water mark skips late commits |
 | How is per-payment ordering preserved? | Kafka key = payment id → same partition → ordered within partition; consumer processes a partition serially |
-| What's a poison message and what do you do with it? | Message that always fails; bounded retries with backoff → DLQ topic → alert; never block the partition forever |
+| Why must authorize lock accounts before inserting the payment? | FK takes KEY SHARE on customer and merchant; cycle with a settle holding ESCROW; two authorizes deadlock upgrading KEY SHARE; locking only {customer, ESCROW} cycles with a transfer when merchant id < customer id; one ascending FOR UPDATE before any account-locking statement (D-075) |
+| Why does the relay mark rows only after every ack? What does a crash after the acks do? | At-least-once seam; byte-identical republish; consumer dedup; marking before acks loses records (MockProducer case) |
+| Kafka was paused. Did the outbox lose anything, and how did you prove it? | Nothing marked during the outage; a paused broker's kernel still accepts requests, so timeouts later appear as duplicates; pause can't show loss, the MockProducer case shows the loss mechanism |
+| Two relays run at once. What ordering do you keep? | FOR UPDATE SKIP LOCKED gives disjoint batches; per-key order isn't kept; causal order of first copies is; stale redeliveries are absorbed by per-event dedup (D-100) |
+| Why ON CONFLICT (consumer_group, event_id) and not a bare ON CONFLICT? | A target needs SELECT on its columns; untargeted DO NOTHING treats any unique violation as "processed" → silent loss; targeted fails loudly (D-078) |
+| How do you know dedup, not the status guard, caught the redelivery in the crash test? | Separate log events per layer; the mutation that ignores the dedup row count passes the ledger checks and fails only the layer assertion |
+| What did your negative control show? | Effect then mark; 20 of 20 double-applied; every posting balanced so the P1 trigger stayed silent; only ESCROW = Σ AUTHORIZED saw it → the M4 reconciliation check |
+| Why didn't per-leg locking in leg order deadlock, and why sort anyway? | ESCROW has the lowest id and everyone takes it first — that's luck from seeding order, not a protocol; it also held locks far longer (8.4 s) |
+| Why clock_timestamp() for published_at? | now() is the relay transaction's start, before its sends and acks |
+| Why does the worker fail on an event for an unknown payment instead of skipping it? | Outbox row and payment commit together, so it can't happen normally; committing the dedup row would hide corruption forever |
 
 ## M4 — Settlement and reconciliation
 
@@ -57,6 +66,7 @@
 | What does reconciliation check and why does a real ledger need it? | Materialized balance vs `SUM(entries)` per account, global sum = 0; catches bugs in any writer, manual edits, partial deploys |
 | Drift alert fires at 3 AM. How do you find the cause? | Which account(s), since when (entry ids/timestamps), which transaction kinds, which service/version wrote them, correlation id → logs |
 | How do you split a $100 payment with a 2.9% fee without losing a cent? | Fee rounded explicitly; merchant = amount − fee, never computed independently |
+| What's a poison message and what do you do with it? | Message that always fails; bounded retries with backoff → DLQ topic → alert; never block the partition forever |
 
 ## M5 — Redis
 
@@ -99,6 +109,10 @@
 | Metric | Value | Where it's proven |
 |---|---|---|
 | Concurrency test: requests / transactions created / distinct response bodies | 100 / 1 / 1 (local soak 20/20, i5-1240P; CI 15/15, 4-processor runners) | `ConcurrentIdempotentTransferTest` |
+| Crash recovery: iterations / duplicates / lost | 200 (100 per fault point, local soak, i5-1240P) / 0 / 0; CI 5 per point | `test_crash_recovery.py` |
+| Negative control (separate-tx dedup): double-applied | 20 of 20 (local, i5-1240P); 3 of 3 on CI | `tests/negative_controls/test_separate_tx_dedup.py` |
+| Cross-operation lock order: rounds / deadlocks | 20 rounds × 70 requests / 0 deadlocks (local, i5-1240P) | `test_cross_operation_lock_order.py` |
+| Server-overlap floors per test (CI minimum over observations) | Transfer 3 (6 over 65); Opposite 2 (3 over 53); Payment 6 (11 over 35); PayLock 2 (4 over 35); 4-processor CI runners | D-106 |
 | Transfer p50 / p95 / p99 @ 1x | | `docs/load-tests/report.md` |
 | Transfer p50 / p95 / p99 @ 10x | | ″ |
 | 1x definition (req/s) | | ″ |
