@@ -54,6 +54,9 @@ class OppositeTransfersNoDeadlockTest {
 
 	private static final int REQUESTS = 2 * TRANSFERS_EACH_WAY + 2 * DEPOSITS_EACH;
 
+	// D-106: uncalibrated until this test has its own CI distribution.
+	private static final int MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION = ConcurrentRequestHarness.UNCALIBRATED_SERVER_OVERLAP_FLOOR;
+
 	@LocalServerPort
 	int port;
 
@@ -144,7 +147,7 @@ class OppositeTransfersNoDeadlockTest {
 		assertThat(server.arrivedBeforeFirstCompletion())
 			.as("%s: requests that arrived at the server before the first completed (was %d)", context,
 					server.arrivedBeforeFirstCompletion())
-			.isGreaterThanOrEqualTo(ConcurrentRequestHarness.MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION);
+			.isGreaterThanOrEqualTo(MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION);
 	}
 
 	// 25 A->B, 25 B->A, 5 deposits to A, 5 to B; each with its own key; shuffled by seed.

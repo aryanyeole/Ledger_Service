@@ -45,11 +45,12 @@ public final class ConcurrentRequestHarness {
 	public static final int THREADS = 100;
 
 	/**
-	 * Proof tripwire (D-067): requests that arrived at the server before the first completed.
-	 * max(2, floor(0.6 x CI min)) with CI min 7 over 10 runs on 4-processor GitHub runners
-	 * (BUG-003). Guards against a serialized harness; it is not the overlap claim.
+	 * Proof tripwire (D-067, D-106): requests that arrived at the server before the first
+	 * completed. Each test sets its own floor from its own CI distribution,
+	 * max(2, floor(0.6 x CI min)); a test that adopts the tripwire starts here until it has its
+	 * own calibration. Guards against a serialized harness; it is not the overlap claim.
 	 */
-	public static final int MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION = 4;
+	public static final int UNCALIBRATED_SERVER_OVERLAP_FLOOR = 2;
 
 
 	/** -Dledger.test.concurrency.rounds: CI 1, local soak 20. */

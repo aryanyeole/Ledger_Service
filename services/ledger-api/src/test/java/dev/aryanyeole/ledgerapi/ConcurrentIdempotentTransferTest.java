@@ -45,6 +45,9 @@ import dev.aryanyeole.ledgerapi.api.EdgeProbe;
 @SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT, properties = EdgeProbe.API_KEYS_PROPERTY)
 class ConcurrentIdempotentTransferTest {
 
+	// D-106: uncalibrated until this test has its own CI distribution.
+	private static final int MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION = ConcurrentRequestHarness.UNCALIBRATED_SERVER_OVERLAP_FLOOR;
+
 	@LocalServerPort
 	int port;
 
@@ -155,7 +158,7 @@ class ConcurrentIdempotentTransferTest {
 		assertThat(server.arrivedBeforeFirstCompletion())
 			.as("%s: requests that arrived at the server before the first completed (was %d)", context,
 					server.arrivedBeforeFirstCompletion())
-			.isGreaterThanOrEqualTo(ConcurrentRequestHarness.MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION);
+			.isGreaterThanOrEqualTo(MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION);
 	}
 
 	private void assertTotals(long accountId, String expected, String context) throws Exception {

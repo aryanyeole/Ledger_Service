@@ -52,6 +52,9 @@ class PaymentAuthorizeLockOrderTest {
 
 	private static final int REQUESTS = 3 * EACH;
 
+	// D-106: uncalibrated until this test has its own CI distribution.
+	private static final int MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION = ConcurrentRequestHarness.UNCALIBRATED_SERVER_OVERLAP_FLOOR;
+
 	@LocalServerPort
 	int port;
 
@@ -150,7 +153,7 @@ class PaymentAuthorizeLockOrderTest {
 		assertThat(server.arrivedBeforeFirstCompletion())
 			.as("%s: requests that arrived at the server before the first completed (was %d)", context,
 					server.arrivedBeforeFirstCompletion())
-			.isGreaterThanOrEqualTo(ConcurrentRequestHarness.MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION);
+			.isGreaterThanOrEqualTo(MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION);
 	}
 
 	// The merchant first, so its id is lower; both funded with 1000.00 before the gate.
