@@ -21,6 +21,7 @@
 | BUG-002 | 2026-10-13 18:12 | M2 | Shared EXTERNAL fixture adds order-dependent failures to UnbalancedTransactionRejectedTest's failing-first run | none (component: ledger-api tests) | fixed | 82b29b9 (PR #16) |
 | BUG-003 | 2026-10-14 13:26 | M2 | Concurrency harness produces too little overlap on GitHub runners | P2 proof evidence (component: ledger-api tests) | fixed | aaf2e1a (PR #22) |
 | BUG-004 | 2026-10-19 19:45 | M3 | OutboxRedeliveryTest case 2 depends on an earlier test having opened the producer's leader connection | P3 proof evidence, D-099 (component: ledger-api tests) | fixed | a44d366 (PR #32) |
+| BUG-005 | 2026-10-19 23:25 | M3 | OppositeTransfersNoDeadlockTest misses the D-067 server-overlap floor on CI | P2 proof evidence, D-067 (component: ledger-api tests) | open | pending (T9b) |
 
 ---
 
@@ -254,3 +255,37 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 - **Summary (one sentence):** Case 2's `partitionsFor` warm-up loaded metadata but left the partition-leader connection unopened, so run alone the paused tick waited out the relay's 8 s ack wait instead of the producer's 3 s delivery timeout; publishing one real record before the pause makes it pass on its own and in the class.
 - **Notes:**
   - Logged 2026-10-19 20:41, **after the fix**, at the owner's request. Rule 1 (open the entry before the fix) was not followed: the warm-up was changed in place without stopping first, as CLAUDE.md requires. The Symptom and timestamps above are taken from the saved run logs, not reconstructed.
+
+---
+
+### BUG-005 — OppositeTransfersNoDeadlockTest misses the D-067 server-overlap floor on CI
+
+- **Found:** 2026-10-19 23:25 · M3 · Task T9 · branch `m3/t9-crash-recovery-test`
+- **Status:** open
+- **Component:** ledger-api tests (`OppositeTransfersNoDeadlockTest.oppositeTransfersAndDepositsNeverDeadlock`)
+- **Property / invariant touched:** P2's proof evidence (the D-067 tripwire against a serialized harness). Production behaviour is not implicated: in the failing round all 60 requests returned 201, there were exactly 50 new transfers and 10 new deposits, and A, B and EXTERNAL each had balance = entry sum.
+- **Symptom:** ledger-api CI failed on PR #36 head `d01a3dc` (run 39380129034): OppositeTransfersNoDeadlockTest round 1, seed 285447679987, server overlap 3 < floor 4. 519 of 520 tests passed. The branch doesn't touch ledger-api; the same test passed on the branch's two previous CI runs (39376345797 on `a79f44e`, 39376621986 on `0ae5dcf`).
+  ```
+  DEADLOCK round=1 seed=285447679987 processors=4 serverArrivedBeforeFirstCompletion=3 arrivalSpreadMs=39 reusedConnections=60/60 clientSentBeforeFirst=23 peakInFlight=54 statuses={201=60} newTransfers=50 newDeposits=10 A=1005.0000/1005.0000 B=1005.0000/1005.0000
+  [ERROR]   OppositeTransfersNoDeadlockTest.lambda$oppositeTransfersAndDepositsNeverDeadlock$0:82->round:147 [round 1 (seed 285447679987): requests that arrived at the server before the first completed (was 3)]
+  Expecting actual:
+    3
+  to be greater than or equal to:
+    4
+  [ERROR] Tests run: 520, Failures: 1, Errors: 0, Skipped: 0
+  ```
+- **How detected:** CI on a docs/CI-only commit (`d01a3dc`, which only raised the settlement-worker job's `timeout-minutes` from 4 to 8): https://github.com/aryanyeole/Ledger_Service/actions/runs/39380129034. The time above is the failed job's completion (06:25:36 UTC); the log was read and this entry opened at 23:40.
+- **Reproduction:**
+  ```powershell
+  # Not reproduced locally (the floor is a CI-runner calibration). The seed only fixes the request order, not the overlap:
+  cd services\ledger-api
+  .\mvnw.cmd test "-Dtest=OppositeTransfersNoDeadlockTest" "-Dledger.test.shuffle.seed=285447679987"
+  ```
+- **Time to diagnose:** pending.
+- **Root cause:** (hypothesis, to be confirmed in T9b) the D-067 floor of 4 was calibrated from ConcurrentIdempotentTransferTest's CI distribution and applied to OppositeTransfersNoDeadlockTest (D-068) — and later ConcurrentIdempotentPaymentTest and PaymentAuthorizeLockOrderTest — without CI data of their own.
+- **Why it wasn't caught earlier:** pending.
+- **Fix:** pending (T9b).
+- **Regression test:** pending.
+- **Decision Log impact:** pending.
+- **Summary (one sentence):**
+- **Notes:**
