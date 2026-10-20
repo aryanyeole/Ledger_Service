@@ -1,0 +1,165 @@
+"""Running the real worker as a subprocess, and watching it from outside (D-085, D-091, D-104).
+
+The worker runs as python -m settlement_worker with stdin on a pipe and WORKER_STOP_ON_STDIN_EOF=1,
+so closing stdin stops it the same way on Windows and Linux. Its stdout (JSON lines) goes to a
+file the tests parse; PYTHONUNBUFFERED is removed so the worker's own per-line flushing is what
+makes lines visible. Quiescence is judged from outside: the payments are terminal, their outbox
+rows are published, and the group's committed offset equals the end offset on every partition.
+"""
+
+import asyncio
+import json
+import os
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+from aiokafka import AIOKafkaConsumer, TopicPartition
+from aiokafka.admin import AIOKafkaAdminClient
+from aiokafka.errors import KafkaError
+
+from support.stack import TOPIC, WORKER_PASSWORD, Database, topic_partitions
+
+SESSION_TIMEOUT_MS = "6000"  # the broker's minimum group.min.session.timeout.ms (D-085)
+HEARTBEAT_INTERVAL_MS = "2000"
+
+
+class WorkerProcess:
+    def __init__(self, process: subprocess.Popen, stdout_path: Path, stderr_path: Path, group: str) -> None:
+        self.process = process
+        self.stdout_path = stdout_path
+        self.stderr_path = stderr_path
+        self.group = group
+
+    def lines(self) -> list[dict]:
+        text = self.stdout_path.read_text(encoding="utf-8", errors="replace")
+        complete = text[: text.rfind("\n") + 1]
+        return [json.loads(line) for line in complete.splitlines() if line.strip()]
+
+    def events(self, name: str, **match) -> list[dict]:
+        return [e for e in self.lines() if e["event"] == name and all(e.get(k) == v for k, v in match.items())]
+
+    def wait_for(self, name: str, *, timeout: float = 60, **match) -> dict:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            found = self.events(name, **match)
+            if found:
+                return found[0]
+            if self.process.poll() is not None:
+                break
+            time.sleep(0.1)
+        raise AssertionError(f"no {name} {match} in the worker log (exit {self.process.poll()}):\n{self.diagnostics()}")
+
+    def wait_exit(self, timeout: float) -> int:
+        try:
+            return self.process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise AssertionError(f"worker did not exit within {timeout} s:\n{self.diagnostics()}") from None
+
+    def stop(self, timeout: float = 15) -> int:
+        """Close stdin (D-091) and wait for the exit code."""
+        if self.process.stdin and not self.process.stdin.closed:
+            self.process.stdin.close()
+        return self.wait_exit(timeout)
+
+    def diagnostics(self) -> str:
+        out = self.stdout_path.read_text(encoding="utf-8", errors="replace")[-3000:]
+        err = self.stderr_path.read_text(encoding="utf-8", errors="replace")[-3000:]
+        return f"--- stdout ---\n{out}\n--- stderr ---\n{err}"
+
+    def __enter__(self) -> "WorkerProcess":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self.process.poll() is None:
+            try:
+                self.stop()
+            except AssertionError:
+                self.process.kill()
+                self.process.wait(timeout=30)
+
+
+def start_worker(
+    *,
+    database: Database,
+    bootstrap_servers: str,
+    group: str,
+    log_dir: Path,
+    fault_point: str | None = None,
+    fault_payment_id: uuid.UUID | None = None,
+) -> WorkerProcess:
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONUNBUFFERED" and not k.startswith("FAULT_")}
+    env.update(
+        POSTGRES_HOST=database.host,
+        POSTGRES_PORT=str(database.port),
+        POSTGRES_DB=database.name,
+        SETTLEMENT_WORKER_PASSWORD=WORKER_PASSWORD,
+        KAFKA_BOOTSTRAP_SERVERS=bootstrap_servers,
+        LEDGER_PAYMENTS_TOPIC=TOPIC,
+        WORKER_CONSUMER_GROUP=group,
+        WORKER_SESSION_TIMEOUT_MS=SESSION_TIMEOUT_MS,
+        WORKER_HEARTBEAT_INTERVAL_MS=HEARTBEAT_INTERVAL_MS,
+        WORKER_STOP_ON_STDIN_EOF="1",
+    )
+    if fault_point is not None:
+        env.update(FAULT_POINT=fault_point, FAULT_PAYMENT_ID=str(fault_payment_id))
+    name = f"{group}-{uuid.uuid4().hex[:6]}"
+    stdout_path = log_dir / f"{name}.out.jsonl"
+    stderr_path = log_dir / f"{name}.err.txt"
+    with open(stdout_path, "wb") as out, open(stderr_path, "wb") as err:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "settlement_worker"], stdin=subprocess.PIPE, stdout=out, stderr=err, env=env
+        )
+    return WorkerProcess(process, stdout_path, stderr_path, group)
+
+
+async def group_lag(bootstrap_servers: str, group: str, topic: str = TOPIC) -> dict[int, int]:
+    """Per partition: end offset minus the group's committed offset (0 if it has none)."""
+    partitions = [TopicPartition(topic, p) for p in sorted(await topic_partitions(bootstrap_servers, topic) or [])]
+    admin = AIOKafkaAdminClient(bootstrap_servers=bootstrap_servers)
+    probe = AIOKafkaConsumer(bootstrap_servers=bootstrap_servers)
+    await admin.start()
+    await probe.start()
+    try:
+        committed = await admin.list_consumer_group_offsets(group)
+        ends = await probe.end_offsets(partitions)
+        return {
+            tp.partition: ends[tp] - (committed[tp].offset if tp in committed and committed[tp].offset >= 0 else 0)
+            for tp in partitions
+        }
+    finally:
+        await probe.stop()
+        await admin.close()
+
+
+async def wait_quiescent(
+    *, app_conn, bootstrap_servers: str, group: str, payment_ids: list[uuid.UUID], timeout: float = 60
+) -> dict[int, int]:
+    """Payments terminal, their outbox rows published, and lag 0 on every partition, twice in a row."""
+    keys = [str(p) for p in payment_ids]
+    deadline = time.monotonic() + timeout
+    consecutive = 0
+    last = None
+    while time.monotonic() < deadline:
+        authorized = await app_conn.fetchval(
+            "SELECT count(*) FROM payments WHERE id = ANY($1::uuid[]) AND status = 'AUTHORIZED'", payment_ids
+        )
+        unpublished = await app_conn.fetchval(
+            "SELECT count(*) FROM outbox WHERE message_key = ANY($1::text[]) AND published_at IS NULL", keys
+        )
+        try:
+            lag = await group_lag(bootstrap_servers, group)
+        except KafkaError as ex:
+            if not ex.retriable:
+                raise
+            # e.g. the first group on a fresh broker: no coordinator until __consumer_offsets exists.
+            lag = {"retriable": type(ex).__name__}
+        last = (authorized, unpublished, lag)
+        quiet = authorized == 0 and unpublished == 0 and set(lag) == {0, 1, 2} and all(v == 0 for v in lag.values())
+        consecutive = consecutive + 1 if quiet else 0
+        if consecutive == 2:
+            return lag
+        await asyncio.sleep(0.5)
+    raise AssertionError(f"not quiescent within {timeout} s: (authorized, unpublished, lag) = {last}")
