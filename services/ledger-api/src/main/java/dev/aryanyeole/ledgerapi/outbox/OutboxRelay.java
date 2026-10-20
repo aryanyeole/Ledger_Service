@@ -22,8 +22,8 @@ import dev.aryanyeole.ledgerapi.outbox.OutboxEnvelope.Row;
 
 // The outbox relay (spec §6.3, D-008, D-079). One batch per call, in one write transaction:
 //   lock up to batch-size unpublished rows of this relay's topic, oldest id first, skipping rows
-//   another relay holds -> send every record -> wait for every ack -> mark them published ->
-//   commit.
+//   another relay holds -> send every record -> wait for every ack -> fault hook (tests only) ->
+//   mark them published -> commit.
 // This is the one sanctioned network call inside a DB transaction (CLAUDE.md invariant 5): the
 // row locks are what stop two relays from publishing the same row, so they must be held until the
 // row is marked. The producer's timeouts bound how long that can take while Kafka is down.
@@ -101,8 +101,8 @@ public class OutboxRelay {
 			for (Row row : rows) {
 				sends.add(this.kafka.send(record(row)));
 			}
-			this.faultHook.afterSendBeforeMark(ids);
 			awaitAcks(sends);
+			this.faultHook.afterAcksBeforeMark(ids);
 			int marked = this.jdbc.sql(MARK_PUBLISHED).param((Object) ids.toArray(Long[]::new)).update();
 			if (marked != rows.size()) {
 				throw new IllegalStateException("marked " + marked + " outbox rows, expected " + rows.size());
