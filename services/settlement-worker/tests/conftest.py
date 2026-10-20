@@ -8,18 +8,24 @@ Tests are synchronous and drive coroutines with asyncio.run (no pytest-asyncio).
 """
 
 import asyncio
+import hashlib
+import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
 import asyncpg
 import pytest
 from aiokafka.admin import AIOKafkaAdminClient
+from support.api import ApiClient
 from testcontainers.community.postgres import PostgresContainer
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.wait_strategies import LogMessageWaitStrategy
@@ -176,6 +182,104 @@ def migrated_db(postgres: Database, ledger_api_jar: Path) -> Database:
 @pytest.fixture(scope="session")
 def worker_db(migrated_db: Database) -> WorkerDb:
     return WorkerDb(migrated_db)
+
+
+_PASSWORDS = {"settlement_worker": WORKER_PASSWORD, "ledger_api_app": APP_PASSWORD, "ledger_api_owner": OWNER_PASSWORD}
+
+
+@pytest.fixture(scope="session")
+def connect_params(migrated_db: Database):
+    """asyncpg.connect keyword arguments for a role, for tests that check role handling."""
+
+    def params(role: str) -> dict:
+        return {
+            "host": migrated_db.host,
+            "port": migrated_db.port,
+            "database": migrated_db.name,
+            "user": role,
+            "password": _PASSWORDS[role],
+        }
+
+    return params
+
+
+@dataclass(frozen=True)
+class AppDb:
+    """Connections as ledger_api_app (D-036), for reading what the API and the worker wrote."""
+
+    database: Database
+
+    async def connect(self) -> asyncpg.Connection:
+        conn = await asyncpg.connect(
+            host=self.database.host,
+            port=self.database.port,
+            database=self.database.name,
+            user="ledger_api_app",
+            password=APP_PASSWORD,
+        )
+        try:
+            assert await conn.fetchval("SELECT current_user") == "ledger_api_app"
+        except BaseException:
+            await conn.close()
+            raise
+        return conn
+
+
+@pytest.fixture(scope="session")
+def app_db(migrated_db: Database) -> AppDb:
+    return AppDb(migrated_db)
+
+
+@pytest.fixture(scope="session")
+def ledger_api(migrated_db: Database, ledger_api_jar: Path, tmp_path_factory) -> ApiClient:
+    """The jar in server mode on 127.0.0.1, relay off, one test API key (D-103).
+
+    Only the key's SHA-256 reaches the jar (D-049); the key itself stays in this process and is
+    never printed. The jar's output goes to a file, shown only if it fails to start.
+    """
+    port = _free_port()
+    api_key = secrets.token_urlsafe(24)
+    key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    log_path = tmp_path_factory.mktemp("ledger-api") / "ledger-api.log"
+    env = dict(os.environ, LEDGER_API_APP_PASSWORD=APP_PASSWORD, LEDGER_API_OWNER_PASSWORD=OWNER_PASSWORD)
+    command = [
+        _java(),
+        "-jar",
+        str(ledger_api_jar),
+        "--server.address=127.0.0.1",
+        f"--server.port={port}",
+        "--ledger.outbox.relay.enabled=false",
+        "--ledger.outbox.relay.scheduled=false",
+        f"--spring.datasource.url=jdbc:postgresql://{migrated_db.host}:{migrated_db.port}/{migrated_db.name}",
+        f"--ledger.api-keys.{key_hash}=worker-tests",
+    ]
+    with open(log_path, "wb") as log:
+        process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT)
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        _wait_for_health(base_url, process, log_path, deadline=time.monotonic() + 120)
+        yield ApiClient(base_url, api_key)
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=30)
+
+
+def _wait_for_health(base_url: str, process: subprocess.Popen, log_path: Path, *, deadline: float) -> None:
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            pytest.fail(f"ledger-api exited {process.returncode}:\n{log_path.read_text(errors='replace')[-4000:]}")
+        try:
+            with urllib.request.urlopen(base_url + "/actuator/health", timeout=2) as response:
+                if json.loads(response.read()).get("status") == "UP":
+                    return
+        except (urllib.error.URLError, ConnectionError, TimeoutError):
+            pass
+        time.sleep(0.25)
+    pytest.fail(f"ledger-api not healthy at {base_url}:\n{log_path.read_text(errors='replace')[-4000:]}")
 
 
 def _free_port() -> int:
