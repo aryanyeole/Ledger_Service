@@ -91,8 +91,15 @@ def start_worker(
     log_dir: Path,
     fault_point: str | None = None,
     fault_payment_id: uuid.UUID | None = None,
+    command: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> WorkerProcess:
-    env = {k: v for k, v in os.environ.items() if k != "PYTHONUNBUFFERED" and not k.startswith("FAULT_")}
+    """command defaults to the real worker; the negative control passes its naive entrypoint (D-086)."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k != "PYTHONUNBUFFERED" and not k.startswith(("FAULT_", "NAIVE_"))
+    }
     env.update(
         POSTGRES_HOST=database.host,
         POSTGRES_PORT=str(database.port),
@@ -107,12 +114,17 @@ def start_worker(
     )
     if fault_point is not None:
         env.update(FAULT_POINT=fault_point, FAULT_PAYMENT_ID=str(fault_payment_id))
+    env.update(extra_env or {})
     name = f"{group}-{uuid.uuid4().hex[:6]}"
     stdout_path = log_dir / f"{name}.out.jsonl"
     stderr_path = log_dir / f"{name}.err.txt"
     with open(stdout_path, "wb") as out, open(stderr_path, "wb") as err:
         process = subprocess.Popen(
-            [sys.executable, "-m", "settlement_worker"], stdin=subprocess.PIPE, stdout=out, stderr=err, env=env
+            command or [sys.executable, "-m", "settlement_worker"],
+            stdin=subprocess.PIPE,
+            stdout=out,
+            stderr=err,
+            env=env,
         )
     return WorkerProcess(process, stdout_path, stderr_path, group)
 
