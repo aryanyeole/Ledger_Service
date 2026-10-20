@@ -36,8 +36,9 @@ jobs:
     name: settlement-worker
     # Pinned image (D-070): concurrency proofs are timing-sensitive; upgrades are explicit PRs.
     runs-on: ubuntu-24.04
-    # 20 min until T9 measures the crash test and sets it from measured runtime plus margin (D-089).
-    timeout-minutes: 20
+    # 2m12s and 2m31s measured on PR #36 with warm caches;
+    # 8 min leaves room for a cold Maven/pip cache (D-089).
+    timeout-minutes: 8
     defaults:
       run:
         working-directory: services/settlement-worker
@@ -59,3 +60,6 @@ jobs:
           cache-dependency-path: services/settlement-worker/constraints.txt
       - run: python -m pip install -e ".[dev]" -c constraints.txt
       - run: pytest
+        env:
+          # The crash test's CI size (D-085): a regression gate; only the local soak's numbers are published (D-105).
+          CRASH_ITERATIONS: "5"

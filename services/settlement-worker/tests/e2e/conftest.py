@@ -24,6 +24,7 @@ class E2EStack:
     kafka: stack.Kafka
     api: ApiClient
     app_db: stack.AppDb
+    worker_db: stack.WorkerDb
     log_dir: Path
 
 
@@ -46,4 +47,4 @@ def e2e(tmp_path_factory) -> E2EStack:
         with stack.ledger_api(database, jar, log_dir, relay_bootstrap=broker.bootstrap_servers) as api:
             # The relay owns the topic (D-080): it creates it before its first batch.
             assert _wait_for_topic(broker.bootstrap_servers, stack.TOPIC) == {0, 1, 2}
-            yield E2EStack(database, broker, api, stack.AppDb(database), log_dir)
+            yield E2EStack(database, broker, api, stack.AppDb(database), stack.WorkerDb(database), log_dir)

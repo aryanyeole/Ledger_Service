@@ -22,8 +22,10 @@ from aiokafka.errors import KafkaError
 
 from support.stack import TOPIC, WORKER_PASSWORD, Database, topic_partitions
 
-SESSION_TIMEOUT_MS = "6000"  # the broker's minimum group.min.session.timeout.ms (D-085)
-HEARTBEAT_INTERVAL_MS = "2000"
+from settlement_worker import envelope
+
+SESSION_TIMEOUT_MS = "3000"  # the test broker's group.min.session.timeout.ms is 1000 (D-085)
+HEARTBEAT_INTERVAL_MS = "1000"
 
 
 class WorkerProcess:
@@ -115,29 +117,92 @@ def start_worker(
     return WorkerProcess(process, stdout_path, stderr_path, group)
 
 
-async def group_lag(bootstrap_servers: str, group: str, topic: str = TOPIC) -> dict[int, int]:
-    """Per partition: end offset minus the group's committed offset (0 if it has none)."""
-    partitions = [TopicPartition(topic, p) for p in sorted(await topic_partitions(bootstrap_servers, topic) or [])]
+async def committed_offsets(bootstrap_servers: str, group: str, topic: str = TOPIC) -> dict[int, int | None]:
+    """Per partition: the group's committed offset, or None if it has none."""
+    partitions = sorted(await topic_partitions(bootstrap_servers, topic) or [])
     admin = AIOKafkaAdminClient(bootstrap_servers=bootstrap_servers)
-    probe = AIOKafkaConsumer(bootstrap_servers=bootstrap_servers)
     await admin.start()
-    await probe.start()
     try:
         committed = await admin.list_consumer_group_offsets(group)
-        ends = await probe.end_offsets(partitions)
-        return {
-            tp.partition: ends[tp] - (committed[tp].offset if tp in committed and committed[tp].offset >= 0 else 0)
-            for tp in partitions
-        }
+    finally:
+        await admin.close()
+    result: dict[int, int | None] = {}
+    for p in partitions:
+        meta = committed.get(TopicPartition(topic, p))
+        result[p] = meta.offset if meta is not None and meta.offset >= 0 else None
+    return result
+
+
+async def end_offsets(bootstrap_servers: str, partitions: list[int], topic: str = TOPIC) -> dict[int, int]:
+    probe = AIOKafkaConsumer(bootstrap_servers=bootstrap_servers)
+    await probe.start()
+    try:
+        ends = await probe.end_offsets([TopicPartition(topic, p) for p in partitions])
     finally:
         await probe.stop()
-        await admin.close()
+    return {tp.partition: offset for tp, offset in ends.items()}
+
+
+async def group_lag(bootstrap_servers: str, group: str, topic: str = TOPIC) -> dict[int, int]:
+    """Per partition: end offset minus the group's committed offset (0 if it has none)."""
+    committed = await committed_offsets(bootstrap_servers, group, topic)
+    ends = await end_offsets(bootstrap_servers, sorted(committed), topic)
+    return {p: ends[p] - (committed[p] or 0) for p in sorted(committed)}
+
+
+async def authorized_positions(
+    bootstrap_servers: str, group: str, payment_ids: list[uuid.UUID], topic: str = TOPIC
+) -> dict[uuid.UUID, tuple[int, int]]:
+    """(partition, offset) of each payment's payment.authorized record, read from the topic between
+    the group's committed offsets and the end offsets: the real partitioner decides, not a
+    reimplementation of it (D-105)."""
+    committed = await committed_offsets(bootstrap_servers, group, topic)
+    ends = await end_offsets(bootstrap_servers, sorted(committed), topic)
+    wanted = set(payment_ids)
+    found: dict[uuid.UUID, tuple[int, int]] = {}
+    reader = AIOKafkaConsumer(bootstrap_servers=bootstrap_servers, enable_auto_commit=False)
+    await reader.start()
+    try:
+        assigned = [TopicPartition(topic, p) for p in sorted(committed) if ends[p] > (committed[p] or 0)]
+        reader.assign(assigned)
+        for tp in assigned:
+            reader.seek(tp, committed[tp.partition] or 0)
+        remaining = {tp for tp in assigned}
+        deadline = time.monotonic() + 30
+        while remaining:
+            if time.monotonic() > deadline:
+                raise AssertionError(f"could not read {topic} up to {ends}: stuck on {remaining}")
+            batches = await reader.getmany(timeout_ms=500)
+            for tp, records in batches.items():
+                for record in records:
+                    if record.offset >= ends[tp.partition]:
+                        continue
+                    event = envelope.parse(record.value)
+                    if isinstance(event, envelope.AuthorizedEvent) and event.payment_id in wanted:
+                        found[event.payment_id] = (record.partition, record.offset)
+            remaining = {tp for tp in remaining if await reader.position(tp) < ends[tp.partition]}
+    finally:
+        await reader.stop()
+    missing = wanted - set(found)
+    assert not missing, f"payment.authorized not found on {topic} for {sorted(map(str, missing))}"
+    return found
 
 
 async def wait_quiescent(
-    *, app_conn, bootstrap_servers: str, group: str, payment_ids: list[uuid.UUID], timeout: float = 60
+    *,
+    app_conn,
+    bootstrap_servers: str,
+    group: str,
+    payment_ids: list[uuid.UUID],
+    timeout: float = 60,
+    require_terminal: bool = True,
 ) -> dict[int, int]:
-    """Payments terminal, their outbox rows published, and lag 0 on every partition, twice in a row."""
+    """Payments terminal, their outbox rows published, and lag 0 on every partition, twice in a row.
+
+    require_terminal=False drops the first condition (D-105): lag 0 alone means every record was
+    processed and committed, so a payment still AUTHORIZED afterwards was skipped, and the caller
+    can count it as lost instead of timing out here.
+    """
     keys = [str(p) for p in payment_ids]
     deadline = time.monotonic() + timeout
     consecutive = 0
@@ -157,7 +222,7 @@ async def wait_quiescent(
             # e.g. the first group on a fresh broker: no coordinator until __consumer_offsets exists.
             lag = {"retriable": type(ex).__name__}
         last = (authorized, unpublished, lag)
-        quiet = authorized == 0 and unpublished == 0 and set(lag) == {0, 1, 2} and all(v == 0 for v in lag.values())
+        quiet = (authorized == 0 or not require_terminal) and unpublished == 0 and set(lag) == {0, 1, 2} and all(v == 0 for v in lag.values())
         consecutive = consecutive + 1 if quiet else 0
         if consecutive == 2:
             return lag

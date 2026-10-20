@@ -254,6 +254,9 @@ def kafka():
         "KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR": "1",
         "KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR": "1",
         "KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS": "0",  # every group's first join, T8-T11 (D-085)
+        # A crashed member's partitions move only when its session expires; the default minimum
+        # (6000 ms) would make every crash iteration wait that long (D-085).
+        "KAFKA_GROUP_MIN_SESSION_TIMEOUT_MS": "1000",
         "KAFKA_NUM_PARTITIONS": "1",
         "KAFKA_AUTO_CREATE_TOPICS_ENABLE": "false",
     }.items():
