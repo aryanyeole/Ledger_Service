@@ -20,6 +20,7 @@
 | BUG-001 | 2026-10-13 17:36 | M2 | Never-log-the-key test fails whenever an earlier test in its class fails | none (component: ledger-api tests) | fixed | ccbff46 |
 | BUG-002 | 2026-10-13 18:12 | M2 | Shared EXTERNAL fixture adds order-dependent failures to UnbalancedTransactionRejectedTest's failing-first run | none (component: ledger-api tests) | fixed | 82b29b9 (PR #16) |
 | BUG-003 | 2026-10-14 13:26 | M2 | Concurrency harness produces too little overlap on GitHub runners | P2 proof evidence (component: ledger-api tests) | fixed | aaf2e1a (PR #22) |
+| BUG-004 | 2026-10-19 19:45 | M3 | OutboxRedeliveryTest case 2 depends on an earlier test having opened the producer's leader connection | P3 proof evidence, D-099 (component: ledger-api tests) | fixed | a44d366 (PR #32) |
 
 ---
 
@@ -215,3 +216,41 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
   - **The control is close to its own limit on CI:** run 38639703432 attempt 5 had n = 2 (server overlap 4). That's just above n > 1.
   - **PR #20's own CI runs were also marginal:** 38630949271 had proof peak 50 (then the floor) and control peak 36, n = 7. 38631761721 had proof 85/97 and control 67/74, n = 6.
   - The CI logs carry no CPU count for the runner, so the hardware behind these numbers is unknown.
+
+---
+
+### BUG-004 — OutboxRedeliveryTest case 2 depends on an earlier test having opened the producer's leader connection
+
+- **Found:** 2026-10-19 19:45 · M3 · Task T5 · branch `m3/t5-outbox-redelivery-test`
+- **Status:** fixed
+- **Component:** ledger-api tests (`OutboxRedeliveryTest.brokerOutageMarksNothingAndLosesNothing`)
+- **Property / invariant touched:** P3's proof evidence (D-099, case 2). Production behaviour is not implicated: in the failing run the relay threw within its own ack-wait bound and marked nothing, as designed.
+- **Symptom:** OutboxRedeliveryTest case 2 run alone failed the paused-tick bound; the whole class (5 tests) had been green at 19:44 with the same code.
+  ```
+  OUTBOX_REDELIVERY broker_pause duplicates=0 pausedTickMs=8120 recoveryFailures=1 pausedFailure=org.apache.kafka.common.KafkaException: outbox acks not received within PT8S
+  [ERROR]   OutboxRedeliveryTest.brokerOutageMarksNothingAndLosesNothing:323 [paused tick duration]
+  Expecting actual:
+    8.12S
+  to be less than:
+    8S
+  ```
+  In the full-class run the same case had `pausedTickMs=3027` with the producer's own delivery-timeout failure (`outbox send failed: … KafkaProducerException: Failed to send`).
+- **How detected:** running case 2 in isolation (`-Dtest=OutboxRedeliveryTest#brokerOutageMarksNothingAndLosesNothing`) after the class's first green run, to check that the warm-up made the case independent of test order.
+- **Reproduction:**
+  ```powershell
+  # With the warm-up at the start of brokerOutageMarksNothingAndLosesNothing reverted to:
+  #   this.kafkaTemplate.partitionsFor(this.paymentsProperties.topic());
+  cd services\ledger-api
+  .\mvnw.cmd test "-Dtest=OutboxRedeliveryTest#brokerOutageMarksNothingAndLosesNothing"
+  ```
+- **Time to diagnose:** about 1 minute: observed at 19:45 (the run's log ended 19:45:43), and the warm-up was changed for the first fixed run, which started 19:46:49. The root cause below was inferred from the failure message: the relay's own ack wait fired (`acks not received within PT8S`) instead of the producer's delivery timeout. The fixed runs confirmed it; it was not confirmed separately with producer debug logs.
+- **Root cause:** the warm-up used `partitionsFor(topic)`, which loads metadata over the bootstrap connection but doesn't open the connection to the partition leader. During the Docker pause the producer was still setting that connection up, so `delivery.timeout.ms` (3 s) never expired the batch, and the relay's own ack wait (`delivery-timeout + 5 s` = 8 s, `OutboxRelay.awaitAcks`) fired instead. The tick then took 8.12 s, just over the test's `< delivery-timeout + 5 s` bound. With an earlier test in the class, a real publish had already opened the leader connection, which hid it.
+- **Why it wasn't caught earlier:** the warm-up was assumed to open every connection the paused tick would use, and the case was first run only as part of the whole class.
+- **Fix:** the warm-up publishes one real record and awaits its ack before pausing: one committed outbox row, and one tick asserted to return 1. That opens the leader connection, so the paused tick always fails on the producer's delivery timeout. The buggy warm-up was never committed; the fix is part of commit `a44d366` · PR #32 (squash commit to be filled in after merge).
+- **Regression test:** `services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/OutboxRedeliveryTest.java`, case 2 (`brokerOutageMarksNothingAndLosesNothing`), run alone and in the full class.
+  - **Red before:** the isolated run at 19:44:59–19:45:43, `pausedTickMs=8120`, with the `partitionsFor` warm-up (local, i5-1240P).
+  - **Green after:** isolated runs at 19:46:49 and 19:47:27 (`pausedTickMs=3036`, `3038`); full class at 19:48:07 (`pausedTickMs=3033`); `.\mvnw.cmd clean verify` (`pausedTickMs=3031`, 514 tests green). Durations are the test's own `System.nanoTime()` measurement of the paused tick.
+- **Decision Log impact:** D-099 names the warm-up (one published record, not `partitionsFor`) and rejects a metadata-only warm-up (PR #32 description).
+- **Summary (one sentence):** Case 2's `partitionsFor` warm-up loaded metadata but left the partition-leader connection unopened, so run alone the paused tick waited out the relay's 8 s ack wait instead of the producer's 3 s delivery timeout; publishing one real record before the pause makes it pass on its own and in the class.
+- **Notes:**
+  - Logged 2026-10-19 20:41, **after the fix**, at the owner's request. Rule 1 (open the entry before the fix) was not followed: the warm-up was changed in place without stopping first, as CLAUDE.md requires. The Symptom and timestamps above are taken from the saved run logs, not reconstructed.
