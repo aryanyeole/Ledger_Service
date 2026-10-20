@@ -63,3 +63,5 @@ jobs:
         env:
           # The crash test's CI size (D-085): a regression gate; only the local soak's numbers are published (D-105).
           CRASH_ITERATIONS: "5"
+          # The D-086 negative control's CI size; the local run's N and result are the published figures.
+          NEGATIVE_CONTROL_ITERATIONS: "3"
