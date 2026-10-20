@@ -59,3 +59,6 @@ jobs:
           cache-dependency-path: services/settlement-worker/constraints.txt
       - run: python -m pip install -e ".[dev]" -c constraints.txt
       - run: pytest
+        env:
+          # The crash test's CI size (D-085): a regression gate; only the local soak's numbers are published (D-105).
+          CRASH_ITERATIONS: "5"
