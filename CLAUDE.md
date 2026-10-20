@@ -38,6 +38,7 @@ Exception (D-017): negative-control tests may deliberately violate invariants 6�
 - Branch from up-to-date `main`: `m<n>/t<k>-<short-slug>` (e.g. `m1/t2-balance-trigger`).
 - One task = one PR = one commit on `main` (squash merge). Conventional title: `feat(api): ...`, `test(worker): ...`, `chore(ci): ...`. Proof tests get their own task and PR.
 - Never commit or push directly to `main`. Never merge, force-push, or rewrite pushed history — I merge.
+- Never rewrite main's history. Bring a PR branch up to date by merging main into it, not by rebasing a pushed branch.
 - Before pushing: run the tests for every service touched and paste the summary.
 - PR description: Task (M<n> T<k>) · What changed · Invariants touched (1–7 or none) · Tests run + result · Decision Log rows needed (or none) · Bug log entries (or none).
 - Open the PR with `gh pr create` if the GitHub CLI is installed and authenticated; otherwise push the branch and give me the compare URL.
