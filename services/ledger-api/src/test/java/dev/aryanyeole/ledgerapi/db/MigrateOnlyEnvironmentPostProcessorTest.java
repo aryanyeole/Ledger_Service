@@ -22,19 +22,21 @@ import org.springframework.core.io.UrlResource;
 import org.springframework.core.io.support.PropertiesLoaderUtils;
 import org.springframework.core.io.support.SpringFactoriesLoader;
 
-// Migrate-only mode (D-083): ledger.migrate-only=true forces the web server, the outbox relay and
-// its scheduler off, above command-line arguments; otherwise nothing changes. The exit codes are
+// Migrate-only mode (D-083, D-126): ledger.migrate-only=true forces the web server, the outbox
+// relay, the idempotency key purge and their schedulers off, above command-line arguments;
+// otherwise nothing changes. The exit codes are
 // proven out of process by the worker's test harness (it requires exit 0 from java -jar).
 class MigrateOnlyEnvironmentPostProcessorTest {
 
 	private final MigrateOnlyEnvironmentPostProcessor processor = new MigrateOnlyEnvironmentPostProcessor();
 
 	@Test
-	void migrateOnlyForcesWebServerRelayAndSchedulerOffOverArguments() {
+	void migrateOnlyForcesWebServerRelayPurgeAndSchedulersOffOverArguments() {
 		StandardEnvironment environment = new StandardEnvironment();
 		environment.getPropertySources()
 			.addFirst(new SimpleCommandLinePropertySource("--ledger.migrate-only=true",
 					"--ledger.outbox.relay.enabled=true", "--ledger.outbox.relay.scheduled=true",
+					"--ledger.idempotency.purge.enabled=true", "--ledger.idempotency.purge.scheduled=true",
 					"--spring.main.web-application-type=servlet"));
 
 		this.processor.postProcessEnvironment(environment, new SpringApplication());
@@ -42,6 +44,8 @@ class MigrateOnlyEnvironmentPostProcessorTest {
 		assertThat(environment.getProperty("spring.main.web-application-type")).isEqualTo("none");
 		assertThat(environment.getProperty("ledger.outbox.relay.enabled")).isEqualTo("false");
 		assertThat(environment.getProperty("ledger.outbox.relay.scheduled")).isEqualTo("false");
+		assertThat(environment.getProperty("ledger.idempotency.purge.enabled")).isEqualTo("false");
+		assertThat(environment.getProperty("ledger.idempotency.purge.scheduled")).isEqualTo("false");
 		assertThat(environment.getPropertySources().iterator().next().getName())
 			.as("highest-precedence property source")
 			.isEqualTo(MigrateOnlyEnvironmentPostProcessor.SOURCE_NAME);
