@@ -1,4 +1,4 @@
-"""The worker's configuration, from the environment (D-081, D-085, D-091).
+"""The worker's configuration, from the environment (D-081, D-085, D-091, D-113).
 
 Names follow .env.example where it has them. Anything invalid is a ConfigError, and the worker
 refuses to start (exit 2). The password is never part of an error message or the repr.
@@ -37,6 +37,8 @@ class Config:
     fault_point: str | None
     fault_payment_id: uuid.UUID | None
     stop_on_stdin_eof: bool
+    metrics_host: str
+    metrics_port: int
 
     @property
     def fault_armed(self) -> bool:
@@ -106,4 +108,8 @@ class Config:
             fault_point=fault_point,
             fault_payment_id=uuid.UUID(fault_payment) if fault_payment else None,
             stop_on_stdin_eof=stop_on_eof == "1",
+            # /metrics (D-113): loopback by default (D-029); port 0 binds any free port, which the
+            # tests use and read back from metrics_listening.
+            metrics_host=text("WORKER_METRICS_HOST", "127.0.0.1"),
+            metrics_port=integer("WORKER_METRICS_PORT", "8000", 0, 65535),
         )

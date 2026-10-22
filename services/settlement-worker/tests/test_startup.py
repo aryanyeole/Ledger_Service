@@ -12,6 +12,7 @@ import sys
 
 def test_entrypoint_refuses_to_start_without_configuration():
     env = {k: v for k, v in os.environ.items() if k != "SETTLEMENT_WORKER_PASSWORD" and not k.startswith("FAULT_")}
+    env["WORKER_METRICS_PORT"] = "0"
     result = subprocess.run(
         [sys.executable, "-m", "settlement_worker"],
         capture_output=True,

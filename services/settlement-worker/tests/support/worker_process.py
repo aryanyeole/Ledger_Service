@@ -54,6 +54,10 @@ class WorkerProcess:
             time.sleep(0.1)
         raise AssertionError(f"no {name} {match} in the worker log (exit {self.process.poll()}):\n{self.diagnostics()}")
 
+    def metrics_port(self, timeout: float = 60) -> int:
+        """The port the worker's /metrics server bound, from its metrics_listening event (D-113)."""
+        return self.wait_for("metrics_listening", timeout=timeout)["port"]
+
     def wait_exit(self, timeout: float) -> int:
         try:
             return self.process.wait(timeout=timeout)
@@ -111,6 +115,8 @@ def start_worker(
         WORKER_SESSION_TIMEOUT_MS=SESSION_TIMEOUT_MS,
         WORKER_HEARTBEAT_INTERVAL_MS=HEARTBEAT_INTERVAL_MS,
         WORKER_STOP_ON_STDIN_EOF="1",
+        # Any free port: several workers share one host (D-087, D-113); metrics_port() reads it back.
+        WORKER_METRICS_PORT="0",
     )
     if fault_point is not None:
         env.update(FAULT_POINT=fault_point, FAULT_PAYMENT_ID=str(fault_payment_id))
