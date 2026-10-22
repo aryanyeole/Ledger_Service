@@ -29,22 +29,31 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.postgresql.util.PSQLException;
+import org.postgresql.util.ServerErrorMessage;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 
 // Proof that the database roles match the declared model (D-006, D-033, D-034, D-040,
-// D-043, D-060, D-071, D-076, D-077, D-078):
+// D-043, D-060, D-071, D-076, D-077, D-078, D-119, D-120):
 // role attributes, memberships, ownership, the table/column/sequence privilege matrix,
-// schema and database privileges, trigger hardening, and that the runtime roles cannot
-// bypass any of it. Catalog reads go through the app connection; pg_catalog and the
+// schema and database privileges, trigger hardening, that the runtime roles cannot
+// bypass any of it, and that only expired idempotency keys can be deleted. Catalog reads go through the app connection; pg_catalog and the
 // has_*_privilege() functions are readable by every role.
 @Import(TestcontainersConfiguration.class)
 @SpringBootTest
 class DbRolePrivilegesTest {
 
 	private static final String INSUFFICIENT_PRIVILEGE = "42501";
+
+	private static final String CHECK_VIOLATION = "23514";
+
+	private static final String RESTRICT_VIOLATION = "23001";
+
+	private static final String PURGE_GUARD = "idempotency_keys_purge";
+
+	private static final String PURGE_GUARD_MESSAGE = "only expired idempotency keys may be deleted";
 
 	private static final String SEARCH_PATH = "search_path=pg_catalog, public, pg_temp";
 
@@ -70,7 +79,8 @@ class DbRolePrivilegesTest {
 	// INSERT/UPDATE on accounts, idempotency_keys, transactions and entries are column-level
 	// grants (COLUMN_GRANTS), so they are false at table level. Every table in public must have
 	// a row here. Runtime roles can't set ledger created_at (D-071, V8).
-	// settlement_worker gets nothing on idempotency_keys (D-020, D-043).
+	// settlement_worker gets nothing on idempotency_keys (D-020, D-043). The app may DELETE keys
+	// for the purge job, and V15's guard lets only expired ones go (D-119, section K).
 	// payments: INSERT (app) and UPDATE (worker) are column-level too (D-076, V9).
 	// outbox: the worker can insert but not read (D-077, V11). processed_messages: the worker's
 	// SELECT and INSERT are column-level, the app gets nothing (D-078, V12).
@@ -78,7 +88,7 @@ class DbRolePrivilegesTest {
 			"accounts", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of("SELECT")),
 			"transactions", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of("SELECT")),
 			"entries", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of("SELECT")),
-			"idempotency_keys", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of()),
+			"idempotency_keys", Map.of(Role.APP, Set.of("SELECT", "DELETE"), Role.WORKER, Set.of()),
 			"payments", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of("SELECT")),
 			"outbox", Map.of(Role.APP, Set.of("SELECT"), Role.WORKER, Set.of()),
 			"processed_messages", Map.of(Role.APP, Set.of(), Role.WORKER, Set.of()),
@@ -133,17 +143,23 @@ class DbRolePrivilegesTest {
 
 	// Every non-internal trigger in public, exactly (D-060). Their functions are the exact set
 	// of trigger functions allowed in public, and each must be hardened (D-040).
-	private static final Map<String, TriggerSpec> TRIGGERS = Map.of(
-			"entries_balanced", new TriggerSpec("entries", "assert_transaction_balanced", true),
-			"transactions_have_entries", new TriggerSpec("transactions", "assert_transaction_has_entries", true),
-			"entries_append_only", new TriggerSpec("entries", "forbid_mutation", false),
-			"transactions_append_only", new TriggerSpec("transactions", "forbid_mutation", false),
-			"idempotency_keys_complete",
-			new TriggerSpec("idempotency_keys", "assert_idempotency_key_complete", true),
-			"payments_status_transition", new TriggerSpec("payments", "payments_status_transition", false),
-			"payments_no_delete", new TriggerSpec("payments", "forbid_mutation", false),
-			"outbox_publish_once", new TriggerSpec("outbox", "outbox_publish_once", false),
-			"processed_messages_append_only", new TriggerSpec("processed_messages", "forbid_mutation", false));
+	private static final Map<String, TriggerSpec> TRIGGERS = Map.ofEntries(
+			Map.entry("entries_balanced", new TriggerSpec("entries", "assert_transaction_balanced", true)),
+			Map.entry("transactions_have_entries",
+					new TriggerSpec("transactions", "assert_transaction_has_entries", true)),
+			Map.entry("entries_append_only", new TriggerSpec("entries", "forbid_mutation", false)),
+			Map.entry("transactions_append_only", new TriggerSpec("transactions", "forbid_mutation", false)),
+			Map.entry("idempotency_keys_complete",
+					new TriggerSpec("idempotency_keys", "assert_idempotency_key_complete", true)),
+			Map.entry("idempotency_keys_purge",
+					new TriggerSpec("idempotency_keys", "idempotency_keys_purge_guard", false)),
+			Map.entry("idempotency_keys_no_truncate", new TriggerSpec("idempotency_keys", "forbid_mutation", false)),
+			Map.entry("payments_status_transition",
+					new TriggerSpec("payments", "payments_status_transition", false)),
+			Map.entry("payments_no_delete", new TriggerSpec("payments", "forbid_mutation", false)),
+			Map.entry("outbox_publish_once", new TriggerSpec("outbox", "outbox_publish_once", false)),
+			Map.entry("processed_messages_append_only",
+					new TriggerSpec("processed_messages", "forbid_mutation", false)));
 
 	private static final Set<String> TRIGGER_FUNCTIONS = TRIGGERS.values()
 		.stream()
@@ -168,6 +184,7 @@ class DbRolePrivilegesTest {
 		// idempotency_keys (D-043): role-specific; 42501 is the check, the message only has to
 		// name the table. WHERE false still runs the privilege check, so no row is needed.
 		WORKER_SELECT_KEYS(Role.WORKER, "SELECT 1 FROM idempotency_keys"),
+		WORKER_DELETE_KEYS(Role.WORKER, "DELETE FROM idempotency_keys WHERE false"),
 		WORKER_INSERT_KEY(Role.WORKER,
 				"INSERT INTO idempotency_keys (client_id, key, request_hash) VALUES ('t3', 'probe', decode(repeat('00', 32), 'hex'))"),
 		APP_INSERT_EXPIRES_AT(Role.APP,
@@ -177,7 +194,6 @@ class DbRolePrivilegesTest {
 		APP_UPDATE_CREATED_AT(Role.APP, "UPDATE idempotency_keys SET created_at = created_at WHERE false"),
 		APP_UPDATE_KEY(Role.APP, "UPDATE idempotency_keys SET key = key WHERE false"),
 		APP_UPDATE_CLIENT_ID(Role.APP, "UPDATE idempotency_keys SET client_id = client_id WHERE false"),
-		APP_DELETE_KEYS(Role.APP, "DELETE FROM idempotency_keys WHERE false"),
 		APP_TRUNCATE_KEYS(Role.APP, "TRUNCATE idempotency_keys"),
 
 		// Ledger timestamps (D-071): neither runtime role may set created_at. The entry insert
@@ -701,6 +717,208 @@ class DbRolePrivilegesTest {
 		}
 	}
 
+	// K: the purge guard (D-119). Any role may delete only keys past expires_at, and one live row
+	// fails the whole statement; TRUNCATE is rejected for the owner by forbid_mutation() and for
+	// the runtime roles by grants (Bypass rows). A row must be committed to be seen from another
+	// role's connection, so each test uses its own client_id and removes its rows in finally,
+	// the owner backdating them first (D-120). The owner's TRUNCATE and DELETE always run in a
+	// rolled-back transaction, so a missing guard can't wipe other tests' keys.
+	@Test
+	void appCannotDeleteLiveKey() throws SQLException {
+		String client = purgeClientId();
+		String key = "live-" + UUID.randomUUID();
+		try {
+			insertCompletedKey(client, key);
+			SQLException e = rejectedAndRolledBack(Role.APP,
+					"DELETE FROM idempotency_keys WHERE client_id = ? AND key = ?", client, key);
+			assertPurgeGuardRejected(e, Role.APP, client, key);
+			assertThat(countKeys(client)).as("ledger_api_app: live key still present").isEqualTo(1);
+		}
+		finally {
+			deleteFixtureRows(client);
+		}
+	}
+
+	@Test
+	void appDeletesExpiredKey() throws SQLException {
+		String client = purgeClientId();
+		String key = "expired-" + UUID.randomUUID();
+		try {
+			insertCompletedKey(client, key);
+			backdate(client, key);
+			assertThat(updateAndCommit(Role.APP, "DELETE FROM idempotency_keys WHERE client_id = ? AND key = ?",
+					client, key))
+				.as("ledger_api_app: expired keys deleted")
+				.isEqualTo(1);
+			assertThat(countKeys(client)).as("ledger_api_app: expired key gone").isZero();
+		}
+		finally {
+			deleteFixtureRows(client);
+		}
+	}
+
+	@Test
+	void oneLiveRowRejectsTheWholeDelete() throws SQLException {
+		String client = purgeClientId();
+		String expired = "expired-" + UUID.randomUUID();
+		String live = "live-" + UUID.randomUUID();
+		try {
+			insertCompletedKey(client, expired);
+			insertCompletedKey(client, live);
+			backdate(client, expired);
+			SQLException e = rejectedAndRolledBack(Role.APP, "DELETE FROM idempotency_keys WHERE client_id = ?",
+					client);
+			assertPurgeGuardRejected(e, Role.APP, client, live);
+			assertThat(countKeys(client)).as("ledger_api_app: neither key deleted").isEqualTo(2);
+		}
+		finally {
+			deleteFixtureRows(client);
+		}
+	}
+
+	// The row trigger never fires for a statement that matches nothing.
+	@Test
+	void appZeroRowDeleteSucceeds() throws SQLException {
+		assertThat(updateAndCommit(Role.APP, "DELETE FROM idempotency_keys WHERE false"))
+			.as("ledger_api_app: rows deleted by DELETE ... WHERE false")
+			.isZero();
+	}
+
+	@Test
+	void ownerCannotTruncateKeys() throws SQLException {
+		SQLException e = rejectedAndRolledBack(Role.OWNER, "TRUNCATE idempotency_keys");
+		assertRootErrorContains(e, Role.OWNER, RESTRICT_VIOLATION, "idempotency_keys");
+	}
+
+	@Test
+	void ownerCannotDeleteLiveKey() throws SQLException {
+		String client = purgeClientId();
+		String key = "live-" + UUID.randomUUID();
+		try {
+			insertCompletedKey(client, key);
+			SQLException e = rejectedAndRolledBack(Role.OWNER,
+					"DELETE FROM idempotency_keys WHERE client_id = ? AND key = ?", client, key);
+			assertPurgeGuardRejected(e, Role.OWNER, client, key);
+			assertThat(countKeys(client)).as("ledger_api_owner: live key still present").isEqualTo(1);
+		}
+		finally {
+			deleteFixtureRows(client);
+		}
+	}
+
+	private static String purgeClientId() {
+		return "t1-purge-" + UUID.randomUUID();
+	}
+
+	// A complete key (V6 checks completeness at commit), inserted through the app's grants.
+	private void insertCompletedKey(String client, String key) throws SQLException {
+		try (Connection conn = connect(Role.APP)) {
+			try {
+				try (PreparedStatement ps = prepare(conn,
+						"INSERT INTO idempotency_keys (client_id, key, request_hash) VALUES (?, ?, decode(repeat('00', 32), 'hex'))",
+						client, key)) {
+					assertThat(ps.executeUpdate()).as("ledger_api_app: key inserted").isEqualTo(1);
+				}
+				try (PreparedStatement ps = prepare(conn,
+						"UPDATE idempotency_keys SET status_code = 201, response_body = '{}'::jsonb WHERE client_id = ? AND key = ?",
+						client, key)) {
+					assertThat(ps.executeUpdate()).as("ledger_api_app: response stored").isEqualTo(1);
+				}
+				conn.commit();
+			}
+			finally {
+				conn.rollback();
+			}
+		}
+	}
+
+	// expires_at has no runtime grant (D-043); only the owner can move it into the past (D-120).
+	private void backdate(String client, String key) throws SQLException {
+		assertThat(updateAndCommit(Role.OWNER,
+				"UPDATE idempotency_keys SET expires_at = now() - interval '1 hour' WHERE client_id = ? AND key = ?",
+				client, key))
+			.as("ledger_api_owner: keys backdated")
+			.isEqualTo(1);
+	}
+
+	// Cleanup as the owner in one transaction: backdate, then delete, so the guard lets the rows
+	// go. The owner holds DELETE whatever the migration target, so cleanup can't hide the
+	// assertion that failed in a failing-first run (D-038).
+	private void deleteFixtureRows(String client) throws SQLException {
+		try (Connection conn = connect(Role.OWNER)) {
+			try {
+				try (PreparedStatement ps = prepare(conn,
+						"UPDATE idempotency_keys SET expires_at = now() - interval '1 hour' WHERE client_id = ?",
+						client)) {
+					ps.executeUpdate();
+				}
+				try (PreparedStatement ps = prepare(conn, "DELETE FROM idempotency_keys WHERE client_id = ?", client)) {
+					ps.executeUpdate();
+				}
+				conn.commit();
+			}
+			finally {
+				conn.rollback();
+			}
+		}
+		assertThat(countKeys(client)).as("fixture keys left for %s", client).isZero();
+	}
+
+	private long countKeys(String client) throws SQLException {
+		try (Connection conn = connect(Role.APP)) {
+			try {
+				return queryLong(conn, "SELECT count(*) FROM idempotency_keys WHERE client_id = ?", client);
+			}
+			finally {
+				conn.rollback();
+			}
+		}
+	}
+
+	private int updateAndCommit(Role role, String sql, String... params) throws SQLException {
+		try (Connection conn = connect(role)) {
+			try {
+				int count;
+				try (PreparedStatement ps = prepare(conn, sql, params)) {
+					count = ps.executeUpdate();
+				}
+				conn.commit();
+				return count;
+			}
+			finally {
+				conn.rollback();
+			}
+		}
+	}
+
+	private SQLException rejectedAndRolledBack(Role role, String sql, String... params) throws SQLException {
+		SQLException e;
+		try (Connection conn = connect(role)) {
+			try {
+				e = catchThrowableOfType(SQLException.class, () -> {
+					try (PreparedStatement ps = prepare(conn, sql, params)) {
+						ps.execute();
+					}
+				});
+			}
+			finally {
+				conn.rollback();
+			}
+		}
+		assertThat((Throwable) e).as("%s: %s must be rejected", role.dbRole, sql).isNotNull();
+		return e;
+	}
+
+	// 23514 naming idempotency_keys_purge, with the fixed message: no client id or key in it.
+	private static void assertPurgeGuardRejected(SQLException thrown, Role role, String client, String key) {
+		ServerErrorMessage error = rootServerError(thrown, role, CHECK_VIOLATION);
+		assertThat(error.getConstraint()).as("%s: constraint", role.dbRole).isEqualTo(PURGE_GUARD);
+		assertThat(error.getMessage()).as("%s: server message", role.dbRole)
+			.isEqualTo(PURGE_GUARD_MESSAGE)
+			.doesNotContain(client)
+			.doesNotContain(key);
+	}
+
 	// Tables (relkind r/p) in public from pg_class: information_schema would hide tables the
 	// querying role has no privilege on.
 	private static MatrixDiff tableMatrixDiff(Connection conn) throws SQLException {
@@ -896,6 +1114,10 @@ class DbRolePrivilegesTest {
 	}
 
 	private static String rootServerMessage(SQLException thrown, Role role, String sqlState) {
+		return rootServerError(thrown, role, sqlState).getMessage();
+	}
+
+	private static ServerErrorMessage rootServerError(SQLException thrown, Role role, String sqlState) {
 		SQLException root = thrown;
 		for (Throwable cause = thrown; cause != null; cause = cause.getCause()) {
 			if (cause instanceof SQLException sql) {
@@ -904,7 +1126,7 @@ class DbRolePrivilegesTest {
 		}
 		assertThat(root.getSQLState()).as("%s: SQLState of %s", role.dbRole, root).isEqualTo(sqlState);
 		assertThat((Throwable) root).as("%s: driver exception type", role.dbRole).isInstanceOf(PSQLException.class);
-		return ((PSQLException) root).getServerErrorMessage().getMessage();
+		return ((PSQLException) root).getServerErrorMessage();
 	}
 
 }
