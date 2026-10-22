@@ -24,17 +24,20 @@ import org.springframework.core.env.Environment;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 
 import dev.aryanyeole.ledgerapi.api.ApiKeyFilter;
+import dev.aryanyeole.ledgerapi.idempotency.IdempotencyKeyPurgeScheduler;
+import dev.aryanyeole.ledgerapi.idempotency.IdempotencyKeyPurger;
 import dev.aryanyeole.ledgerapi.outbox.OutboxRelay;
 import dev.aryanyeole.ledgerapi.outbox.OutboxRelayScheduler;
 
 // Migrate-only mode in process (D-083): with ledger.migrate-only=true the application context
-// starts without a web server, a web filter, the outbox relay or its scheduler, and Flyway has
-// applied every migration. Exiting is main()'s job, proven out of process by the worker's test
-// harness (java -jar ... --ledger.migrate-only=true must exit 0). Relay switches passed as
-// properties don't matter: the post-processor overrides them.
+// starts without a web server, a web filter, the outbox relay, the idempotency key purge or their
+// schedulers, and Flyway has applied every migration. Exiting is main()'s job, proven out of
+// process by the worker's test harness (java -jar ... --ledger.migrate-only=true must exit 0).
+// Relay and purge switches passed as properties don't matter: the post-processor overrides them.
 @Import(TestcontainersConfiguration.class)
 @SpringBootTest(webEnvironment = WebEnvironment.NONE, properties = { "ledger.migrate-only=true",
-		"ledger.outbox.relay.enabled=true", "ledger.outbox.relay.scheduled=true" })
+		"ledger.outbox.relay.enabled=true", "ledger.outbox.relay.scheduled=true",
+		"ledger.idempotency.purge.enabled=true", "ledger.idempotency.purge.scheduled=true" })
 class MigrateOnlyContextTest {
 
 	// Relative to the module directory, the working directory for Maven tests.
@@ -52,11 +55,14 @@ class MigrateOnlyContextTest {
 	PostgreSQLContainer postgres;
 
 	@Test
-	void contextHasNoWebServerFilterOrRelay() {
+	void contextHasNoWebServerFilterRelayOrPurge() {
 		assertThat(this.context).isNotInstanceOf(WebServerApplicationContext.class);
 		assertThat(this.environment.getProperty("ledger.outbox.relay.enabled")).isEqualTo("false");
 		assertThat(this.environment.getProperty("ledger.outbox.relay.scheduled")).isEqualTo("false");
-		for (Class<?> type : List.of(ApiKeyFilter.class, OutboxRelay.class, OutboxRelayScheduler.class)) {
+		assertThat(this.environment.getProperty("ledger.idempotency.purge.enabled")).isEqualTo("false");
+		assertThat(this.environment.getProperty("ledger.idempotency.purge.scheduled")).isEqualTo("false");
+		for (Class<?> type : List.of(ApiKeyFilter.class, OutboxRelay.class, OutboxRelayScheduler.class,
+				IdempotencyKeyPurger.class, IdempotencyKeyPurgeScheduler.class)) {
 			assertThat(this.context.getBeanNamesForType(type)).as("beans of type %s", type.getSimpleName()).isEmpty();
 		}
 	}

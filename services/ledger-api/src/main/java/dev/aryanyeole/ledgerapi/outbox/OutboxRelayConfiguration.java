@@ -13,7 +13,6 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.kafka.core.DefaultKafkaProducerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
-import org.springframework.scheduling.annotation.EnableScheduling;
 
 import dev.aryanyeole.ledgerapi.db.WriteTransactions;
 import dev.aryanyeole.ledgerapi.payments.PaymentsProperties;
@@ -22,7 +21,7 @@ import dev.aryanyeole.ledgerapi.payments.PaymentsProperties;
 // auto-configuration is excluded, so with ledger.outbox.relay.enabled=false there is no producer,
 // template or admin client at all, and nothing can publish outside the outbox (invariant 5).
 // The scheduler is a nested configuration that also needs ledger.outbox.relay.scheduled=true;
-// @EnableScheduling lives there only.
+// @EnableScheduling is SchedulingConfiguration's, active whenever any scheduler is on (D-127).
 // Producer (D-079): acks=all with the idempotent producer, so retries within a producer session
 // neither duplicate nor reorder records (max.in.flight <= 5 keeps per-partition order). No
 // transactional id: Kafka transactions can't include the Postgres commit.
@@ -78,7 +77,6 @@ class OutboxRelayConfiguration {
 
 	@Configuration(proxyBeanMethods = false)
 	@ConditionalOnBooleanProperty("ledger.outbox.relay.scheduled")
-	@EnableScheduling
 	static class Scheduling {
 
 		@Bean

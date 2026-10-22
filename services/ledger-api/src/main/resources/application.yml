@@ -22,6 +22,12 @@ spring:
   autoconfigure:
     # The outbox relay owns the only Kafka client (D-098): no default template or factories.
     exclude: org.springframework.boot.kafka.autoconfigure.KafkaAutoConfiguration
+  task:
+    scheduling:
+      pool:
+        # The relay (200 ms) and the idempotency key purge (5 min, runs until a short batch) each
+        # get a thread, so a long purge run can't hold up the relay's ticks (D-127).
+        size: 2
 
 ledger:
   outbox:
@@ -30,6 +36,12 @@ ledger:
       enabled: true
       scheduled: true
       bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+  idempotency:
+    purge:
+      # Tests turn both off in src/test/resources/application.properties (D-096, D-126);
+      # batch-size (1000) and interval (5m) keep their defaults.
+      enabled: true
+      scheduled: true
 
 management:
   endpoints:
