@@ -24,7 +24,8 @@ public class IdempotencyKeyPurger {
 
 	private static final String CHECK_VIOLATION = "23514";
 
-	private static final String PURGE_BATCH = """
+	// Package-private so IdempotencyKeyExpiryTest EXPLAINs and runs this exact text (D-128).
+	static final String PURGE_BATCH = """
 			DELETE FROM idempotency_keys WHERE (client_id, key) IN (
 			  SELECT client_id, key FROM idempotency_keys WHERE expires_at < now()
 			  ORDER BY expires_at LIMIT :batchSize FOR UPDATE SKIP LOCKED)""";
