@@ -273,6 +273,7 @@ def test_main_worker_rejects_the_naive_fault_point():
         SETTLEMENT_WORKER_PASSWORD=WORKER_PASSWORD,
         FAULT_POINT=FAULT_POINT,
         FAULT_PAYMENT_ID=str(uuid.uuid4()),
+        WORKER_METRICS_PORT="0",
     )
     result = subprocess.run(
         [sys.executable, "-m", "settlement_worker"], env=env, capture_output=True, text=True, timeout=60, check=False

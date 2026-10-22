@@ -71,10 +71,39 @@ def test_invalid(overrides, message):
 )
 def test_invalid_fault_config_exits_2(overrides):
     env = {k: v for k, v in os.environ.items() if not k.startswith("FAULT_")}
-    env.update(_env(**overrides))
+    env.update(_env(WORKER_METRICS_PORT="0", **overrides))
     result = subprocess.run([sys.executable, "-m", "settlement_worker"], capture_output=True, text=True, env=env, timeout=30)
     assert result.returncode == 2, result.stdout + result.stderr
     assert [json.loads(line)["event"] for line in result.stdout.splitlines()] == ["config_invalid"]
+
+
+def test_metrics_defaults():
+    config = Config.from_env(_env())
+    assert (config.metrics_host, config.metrics_port) == ("127.0.0.1", 8000)
+    assert Config.from_env(_env(WORKER_METRICS_PORT="0")).metrics_port == 0
+    assert Config.from_env(_env(WORKER_METRICS_PORT="65535")).metrics_port == 65535
+
+
+# D-113: an invalid metrics setting is refused before the worker connects anywhere or opens a port.
+@pytest.mark.parametrize(
+    "variable, value",
+    [
+        ("WORKER_METRICS_PORT", "65536"),
+        ("WORKER_METRICS_PORT", "-1"),
+        ("WORKER_METRICS_PORT", "abc"),
+        ("WORKER_METRICS_HOST", ""),
+    ],
+)
+def test_invalid_metrics_config_exits_2(variable, value):
+    with pytest.raises(ConfigError, match=variable):
+        Config.from_env(_env(**{variable: value}))
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("FAULT_", "WORKER_"))}
+    env.update(_env(**{"WORKER_METRICS_PORT": "0", variable: value}))
+    result = subprocess.run([sys.executable, "-m", "settlement_worker"], capture_output=True, text=True, env=env, timeout=30)
+    assert result.returncode == 2, result.stdout + result.stderr
+    lines = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [line["event"] for line in lines] == ["config_invalid"], lines
+    assert variable in lines[0]["error"]
 
 
 @pytest.mark.parametrize("armed, level", [(True, "warning"), (False, "info")])

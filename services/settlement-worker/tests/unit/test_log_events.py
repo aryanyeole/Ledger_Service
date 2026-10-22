@@ -22,6 +22,7 @@ def test_contract():
         "processing_failed": ["correlation_id", "error", "offset", "partition", "topic"],
         "worker_stopped": ["correlation_id", "reason"],
         "config_invalid": ["correlation_id", "error"],
+        "metrics_listening": ["correlation_id", "host", "port"],
     }
 
 

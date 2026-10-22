@@ -25,7 +25,7 @@ import structlog
 from aiokafka import AIOKafkaConsumer, ConsumerRebalanceListener, TopicPartition
 from aiokafka.errors import KafkaError
 
-from settlement_worker import db, envelope, events, processor, settlement
+from settlement_worker import db, envelope, events, metrics, processor, settlement
 from settlement_worker.config import AFTER_DB_BEFORE_OFFSET, AFTER_PROCESSOR_BEFORE_DB, Config
 from settlement_worker.envelope import AuthorizedEvent, InvalidEvent, OwnResultEvent
 
@@ -111,6 +111,9 @@ class _AssignmentLogger(ConsumerRebalanceListener):
 
 
 async def run(config: Config, stop: asyncio.Event, stop_reason: dict) -> int:
+    """Startup order (D-113): the role check, then /metrics, then the consumer. A worker that
+    refuses its role opens no port; a port it can't bind is invalid configuration (exit 2). The
+    metrics server is closed before worker_stopped, so a stop still exits 0."""
     log = structlog.get_logger()
     try:
         conn = await db.connect(**config.db_params())
@@ -121,6 +124,32 @@ async def run(config: Config, stop: asyncio.Event, stop_reason: dict) -> int:
         events.emit(log, events.WORKER_STOPPED, level="error", reason=f"db_unavailable: {ex}", correlation_id=None)
         return EXIT_PROCESSING_ERROR
 
+    try:
+        server = metrics.start(config.metrics_host, config.metrics_port)
+    except metrics.MetricsBindError as ex:
+        await conn.close()
+        events.emit(log, events.CONFIG_INVALID, level="error", error=str(ex), correlation_id=None)
+        return EXIT_CONFIG
+    events.emit(log, events.METRICS_LISTENING, host=server.host, port=server.port, correlation_id=None)
+
+    try:
+        code, reason = await _consume(config, stop, conn)
+    finally:
+        await asyncio.to_thread(server.close)
+    events.emit(
+        log,
+        events.WORKER_STOPPED,
+        level="error" if code else "info",
+        reason=reason or stop_reason.get("why", "stopped"),
+        correlation_id=None,
+    )
+    return code
+
+
+async def _consume(config: Config, stop: asyncio.Event, conn: asyncpg.Connection) -> tuple[int, str | None]:
+    """Runs the consumer until a stop request or a processing error; closes the DB connection.
+    Returns the exit code and the reason (None for a requested stop)."""
+    log = structlog.get_logger()
     consumer = AIOKafkaConsumer(
         bootstrap_servers=config.bootstrap_servers,
         group_id=config.consumer_group,
@@ -133,8 +162,7 @@ async def run(config: Config, stop: asyncio.Event, stop_reason: dict) -> int:
         await consumer.start()
     except KafkaError as ex:
         await conn.close()
-        events.emit(log, events.WORKER_STOPPED, level="error", reason=f"broker_unavailable: {ex}", correlation_id=None)
-        return EXIT_PROCESSING_ERROR
+        return EXIT_PROCESSING_ERROR, f"broker_unavailable: {ex}"
 
     code, reason = EXIT_STOPPED, None
     try:
@@ -167,11 +195,4 @@ async def run(config: Config, stop: asyncio.Event, stop_reason: dict) -> int:
         # With auto-commit off, stop() commits nothing; it leaves the group so others take over fast.
         await consumer.stop()
         await conn.close()
-    events.emit(
-        log,
-        events.WORKER_STOPPED,
-        level="error" if code else "info",
-        reason=reason or stop_reason.get("why", "stopped"),
-        correlation_id=None,
-    )
-    return code
+    return code, reason
