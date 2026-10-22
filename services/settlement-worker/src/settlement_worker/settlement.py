@@ -24,6 +24,7 @@ Money is Decimal throughout (invariant 3). Log events go out after the commit.
 import enum
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
@@ -73,6 +74,11 @@ class EscrowShortfall(SettlementError):
     pass
 
 
+class MissingAccount(SettlementError):
+    """A system account that isn't there, or a leg's account missing after the lock: the FKs and
+    the seed guarantee both exist, so either means the ledger is broken (fatal, D-107)."""
+
+
 @dataclass(frozen=True)
 class PaymentRow:
     customer_account_id: int
@@ -107,7 +113,11 @@ async def handle(
     consumer_group: str,
     topic: str,
     lock_timeout: timedelta,
+    before_commit: Callable[[], None] | None = None,
 ) -> Outcome:
+    """before_commit, when given, is called inside the transaction after the result outbox row
+    (only on the path that posts): the RAISE_BEFORE_COMMIT fault (D-125) raises there, so the whole
+    transaction, dedup row included, rolls back."""
     log = structlog.get_logger()
     status = "SETTLED" if decision is Decision.APPROVED else "FAILED"
     not_authorized_status = None
@@ -133,7 +143,9 @@ async def handle(
                 _check_matches(event, payment)
                 transaction_id, lock_wait_ms = await _post(conn, event, decision, payment)
                 await _append_result(conn, topic, event, decision, payment, transaction_id)
-                outcome = Outcome.SETTLED if decision is Decision.APPROVED else Outcome.RELEASED
+                if before_commit is not None:
+                    before_commit()
+                outcome =Outcome.SETTLED if decision is Decision.APPROVED else Outcome.RELEASED
 
     # Committed.
     base = {"event_id": str(event.event_id), "payment_id": str(event.payment_id), "correlation_id": event.correlation_id}
@@ -160,7 +172,7 @@ def _check_matches(event: AuthorizedEvent, payment: PaymentRow) -> None:
 async def _system_account(conn: asyncpg.Connection, name: str) -> int:
     account_id = await conn.fetchval("SELECT id FROM accounts WHERE name = $1", name)
     if account_id is None:
-        raise SettlementError(f"{name} account is missing")
+        raise MissingAccount(f"{name} account is missing")
     return account_id
 
 
@@ -178,7 +190,7 @@ async def _post(
     locked = {r["id"]: r["balance"] for r in await conn.fetch(_LOCK_ACCOUNTS, account_ids)}
     lock_wait_ms = (time.perf_counter_ns() - started) // 1_000_000
     if set(locked) != set(account_ids):
-        raise SettlementError(f"accounts missing: {sorted(set(account_ids) - set(locked))}")
+        raise MissingAccount(f"accounts missing: {sorted(set(account_ids) - set(locked))}")
     # Under T10's negative control, its ballast payment (D-086) is what keeps a double-applied settle from tripping this.
     if locked[escrow_id] < payment.amount:
         raise EscrowShortfall(f"escrow balance {locked[escrow_id]} < {payment.amount} for {event.payment_id}")

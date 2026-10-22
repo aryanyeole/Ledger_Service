@@ -23,6 +23,17 @@ def test_contract():
         "worker_stopped": ["correlation_id", "reason"],
         "config_invalid": ["correlation_id", "error"],
         "metrics_listening": ["correlation_id", "host", "port"],
+        "retry_scheduled": [
+            "attempt",
+            "correlation_id",
+            "delay_ms",
+            "error",
+            "error_class",
+            "offset",
+            "partition",
+            "sqlstate",
+            "topic",
+        ],
     }
 
 

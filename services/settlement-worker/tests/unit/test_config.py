@@ -77,6 +77,37 @@ def test_invalid_fault_config_exits_2(overrides):
     assert [json.loads(line)["event"] for line in result.stdout.splitlines()] == ["config_invalid"]
 
 
+def test_retry_defaults():
+    config = Config.from_env(_env())
+    assert (config.retry_base_ms, config.retry_max_ms, config.max_attempts, config.retry_jitter) == (200, 30000, 5, True)
+    tuned = Config.from_env(
+        _env(WORKER_RETRY_BASE_MS="50", WORKER_RETRY_MAX_MS="50", WORKER_MAX_ATTEMPTS="1", WORKER_RETRY_JITTER="0")
+    )
+    assert (tuned.retry_base_ms, tuned.retry_max_ms, tuned.max_attempts, tuned.retry_jitter) == (50, 50, 1, False)
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"WORKER_RETRY_BASE_MS": "0"}, "WORKER_RETRY_BASE_MS"),
+        ({"WORKER_RETRY_BASE_MS": "x"}, "WORKER_RETRY_BASE_MS"),
+        ({"WORKER_RETRY_BASE_MS": "500", "WORKER_RETRY_MAX_MS": "499"}, "must be at least WORKER_RETRY_BASE_MS"),
+        ({"WORKER_MAX_ATTEMPTS": "0"}, "WORKER_MAX_ATTEMPTS"),
+        ({"WORKER_RETRY_JITTER": "yes"}, "WORKER_RETRY_JITTER"),
+    ],
+)
+def test_invalid_retry_config(overrides, message):
+    with pytest.raises(ConfigError, match=message):
+        Config.from_env(_env(**overrides))
+
+
+def test_raise_before_commit_follows_the_arming_rules():
+    armed = Config.from_env(_env(FAULT_POINT="RAISE_BEFORE_COMMIT", FAULT_PAYMENT_ID=PAYMENT))
+    assert armed.fault_armed and armed.fault_point == "RAISE_BEFORE_COMMIT"
+    with pytest.raises(ConfigError, match="FAULT_PAYMENT_ID is not"):
+        Config.from_env(_env(FAULT_POINT="RAISE_BEFORE_COMMIT"))
+
+
 def test_metrics_defaults():
     config = Config.from_env(_env())
     assert (config.metrics_host, config.metrics_port) == ("127.0.0.1", 8000)

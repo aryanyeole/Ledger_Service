@@ -1,4 +1,4 @@
-"""The worker's configuration, from the environment (D-081, D-085, D-091, D-113).
+"""The worker's configuration, from the environment (D-081, D-085, D-091, D-108, D-113, D-125).
 
 Names follow .env.example where it has them. Anything invalid is a ConfigError, and the worker
 refuses to start (exit 2). The password is never part of an error message or the repr.
@@ -13,7 +13,9 @@ from datetime import timedelta
 
 AFTER_PROCESSOR_BEFORE_DB = "AFTER_PROCESSOR_BEFORE_DB"
 AFTER_DB_BEFORE_OFFSET = "AFTER_DB_BEFORE_OFFSET"
-FAULT_POINTS = (AFTER_PROCESSOR_BEFORE_DB, AFTER_DB_BEFORE_OFFSET)
+# Not a crash: raises a plain RuntimeError inside the settle transaction on every attempt (D-125).
+RAISE_BEFORE_COMMIT = "RAISE_BEFORE_COMMIT"
+FAULT_POINTS = (AFTER_PROCESSOR_BEFORE_DB, AFTER_DB_BEFORE_OFFSET, RAISE_BEFORE_COMMIT)
 
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
@@ -39,6 +41,10 @@ class Config:
     stop_on_stdin_eof: bool
     metrics_host: str
     metrics_port: int
+    retry_base_ms: int
+    retry_max_ms: int
+    max_attempts: int
+    retry_jitter: bool
 
     @property
     def fault_armed(self) -> bool:
@@ -94,6 +100,15 @@ class Config:
         if stop_on_eof not in ("", "0", "1"):
             raise ConfigError(f"WORKER_STOP_ON_STDIN_EOF must be 0 or 1, was {stop_on_eof!r}")
 
+        # Retry in place (D-108): integer milliseconds, cap >= base.
+        retry_base = integer("WORKER_RETRY_BASE_MS", "200", 1, 3_600_000)
+        retry_max = integer("WORKER_RETRY_MAX_MS", "30000", 1, 3_600_000)
+        if retry_max < retry_base:
+            raise ConfigError(f"WORKER_RETRY_MAX_MS ({retry_max}) must be at least WORKER_RETRY_BASE_MS ({retry_base})")
+        jitter = env.get("WORKER_RETRY_JITTER", "1")
+        if jitter not in ("0", "1"):
+            raise ConfigError(f"WORKER_RETRY_JITTER must be 0 or 1, was {jitter!r}")
+
         return cls(
             postgres_host=text("POSTGRES_HOST", "localhost"),
             postgres_port=integer("POSTGRES_PORT", "5433", 1, 65535),
@@ -112,4 +127,8 @@ class Config:
             # tests use and read back from metrics_listening.
             metrics_host=text("WORKER_METRICS_HOST", "127.0.0.1"),
             metrics_port=integer("WORKER_METRICS_PORT", "8000", 0, 65535),
+            retry_base_ms=retry_base,
+            retry_max_ms=retry_max,
+            max_attempts=integer("WORKER_MAX_ATTEMPTS", "5", 1, 1000),
+            retry_jitter=jitter == "1",
         )

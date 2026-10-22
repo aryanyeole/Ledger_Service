@@ -117,6 +117,10 @@ def start_worker(
         WORKER_STOP_ON_STDIN_EOF="1",
         # Any free port: several workers share one host (D-087, D-113); metrics_port() reads it back.
         WORKER_METRICS_PORT="0",
+        # Exact, short backoffs (D-123): 50, 100, 200, 400 ms. Tests that measure timing override them.
+        WORKER_RETRY_JITTER="0",
+        WORKER_RETRY_BASE_MS="50",
+        WORKER_RETRY_MAX_MS="400",
     )
     if fault_point is not None:
         env.update(FAULT_POINT=fault_point, FAULT_PAYMENT_ID=str(fault_payment_id))
