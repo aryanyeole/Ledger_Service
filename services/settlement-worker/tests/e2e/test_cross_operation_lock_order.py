@@ -121,6 +121,7 @@ def workers(e2e, report, request):
     with _worker(e2e) as primer:
         run(_quiescent(e2e, everything))
         assert primer.stop() == 0, primer.diagnostics()
+    assert primer.events("retry_scheduled") == [], primer.diagnostics()  # tripwire: nothing in this proof retries in place (D-108, D-123)
 
     pair = (_worker(e2e), _worker(e2e))
     try:
@@ -303,6 +304,9 @@ def test_api_and_worker_postings_never_deadlock(e2e, workers, report, round_):
     for w in workers:
         assert w.process.poll() is None, w.diagnostics()
         assert w.events("processing_failed") == [], w.diagnostics()
+        # Stricter than the deadlock markers below: nothing in this test may retry at all, so a
+        # deadlock the worker retried (40P01, D-108) fails here too (D-123).
+        assert w.events("retry_scheduled") == [], w.diagnostics()
         text = _log_text(w.stdout_path) + _log_text(w.stderr_path)
         assert [marker for marker in DEADLOCK_MARKERS if marker in text] == [], w.diagnostics()
     jar_text = _log_text(jar_log, jar_offset)

@@ -27,6 +27,8 @@ from support import hardware
 from support.stack import WORKER_PASSWORD
 from support.worker_process import start_worker, wait_quiescent
 
+from settlement_worker.config import FAULT_POINTS
+
 GROUP = "negative-control-separate-tx"
 FAULT_POINT = "AFTER_EFFECT_BEFORE_MARK"
 NAIVE = [sys.executable, str(Path(__file__).with_name("naive_worker.py"))]
@@ -203,6 +205,7 @@ def ballast(control, tally):
         run(_quiescent(control, [payment]))
         assert primer.stop() == 0, primer.diagnostics()
     assert primer.events("processing_failed") == [], primer.diagnostics()
+    assert primer.events("retry_scheduled") == [], primer.diagnostics()  # tripwire: nothing in this proof retries in place (D-108, D-123)
     assert _status(control, payment) == "AUTHORIZED"
     return payment
 
@@ -225,6 +228,7 @@ def test_separate_transaction_dedup_double_applies(control, ballast, tally, iter
     # 2. Crash between the effect and the mark.
     with _naive(control, NAIVE_FAULT_PAYMENT_ID=target, NAIVE_SKIP_PAYMENT_ID=ballast) as w1:
         assert w1.wait_exit(60) == 86, w1.diagnostics()
+    assert w1.events("retry_scheduled") == [], w1.diagnostics()  # tripwire: nothing in this proof retries in place (D-108, D-123)
     assert len(w1.events("fault_injected", point=FAULT_POINT, payment_id=str(target))) == 1, w1.diagnostics()
     w1_calls = w1.events("processor_called", payment_id=str(target))
     assert len(w1_calls) == 1, w1.diagnostics()
@@ -242,6 +246,7 @@ def test_separate_transaction_dedup_double_applies(control, ballast, tally, iter
         run(_quiescent(control, [ballast, target]))
         assert w2.stop() == 0, w2.diagnostics()
     assert w2.events("processing_failed") == [], w2.diagnostics()
+    assert w2.events("retry_scheduled") == [], w2.diagnostics()  # tripwire: nothing in this proof retries in place (D-108, D-123)
 
     # 5. The naive variant FAILS: two balanced postings, two result events, one dedup row.
     postings = _postings(control, target, kind)
@@ -282,4 +287,22 @@ def test_main_worker_rejects_the_naive_fault_point():
     lines = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
     assert [line["event"] for line in lines] == ["config_invalid"], lines
     assert FAULT_POINT in lines[0]["error"]
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize("main_point", FAULT_POINTS)
+def test_naive_worker_rejects_main_fault_points(main_point):
+    """The naive entrypoint honours none of main's fault points, so it refuses an armed one (D-125)."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("FAULT_", "NAIVE_", "WORKER_"))}
+    env.update(
+        SETTLEMENT_WORKER_PASSWORD=WORKER_PASSWORD,
+        FAULT_POINT=main_point,
+        FAULT_PAYMENT_ID=str(uuid.uuid4()),
+        WORKER_METRICS_PORT="0",
+    )
+    result = subprocess.run(NAIVE, env=env, capture_output=True, text=True, timeout=60, check=False)
+    assert result.returncode == 2, result
+    lines = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    assert [line["event"] for line in lines] == ["config_invalid"], lines
+    assert main_point in lines[0]["error"]
     assert result.stderr == ""

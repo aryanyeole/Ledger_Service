@@ -20,6 +20,7 @@ PROCESSING_FAILED = "processing_failed"
 WORKER_STOPPED = "worker_stopped"
 CONFIG_INVALID = "config_invalid"
 METRICS_LISTENING = "metrics_listening"
+RETRY_SCHEDULED = "retry_scheduled"
 
 EVENT_KEYS: dict[str, frozenset[str]] = {
     FAULT_INJECTED: frozenset({"point", "payment_id", "correlation_id"}),
@@ -34,6 +35,9 @@ EVENT_KEYS: dict[str, frozenset[str]] = {
     WORKER_STOPPED: frozenset({"reason", "correlation_id"}),
     CONFIG_INVALID: frozenset({"error", "correlation_id"}),
     METRICS_LISTENING: frozenset({"host", "port", "correlation_id"}),
+    RETRY_SCHEDULED: frozenset(
+        {"topic", "partition", "offset", "attempt", "delay_ms", "error_class", "sqlstate", "error", "correlation_id"}
+    ),
 }
 
 LEVELS = frozenset({"info", "warning", "error"})

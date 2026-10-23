@@ -24,7 +24,7 @@ from pathlib import Path
 
 import asyncpg
 import pytest
-from aiokafka.admin import AIOKafkaAdminClient
+from aiokafka.admin import AIOKafkaAdminClient, NewTopic
 from testcontainers.community.postgres import PostgresContainer
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.wait_strategies import LogMessageWaitStrategy
@@ -39,6 +39,7 @@ MIGRATIONS = LEDGER_API / "src" / "main" / "resources" / "db" / "migration"
 POSTGRES_IMAGE = "postgres:17.11"  # D-027
 KAFKA_IMAGE = "apache/kafka:4.3.1"  # D-027
 TOPIC = "ledger.payments.v1"
+DLQ_TOPIC = "ledger.payments.dlq.v1"  # D-110: ledger-api owns it; the failure_modes harness creates it
 
 # Test-only credentials for throwaway containers, as in ledger-api's TestcontainersConfiguration.
 SUPERUSER_PASSWORD = "test-superuser-password"
@@ -226,6 +227,19 @@ async def topic_partitions(bootstrap: str, topic: str) -> set[int] | None:
     if entry is None or entry["error_code"] != 0:
         return None
     return {p["partition"] for p in entry["partitions"]}
+
+
+async def create_topics(bootstrap: str, topics: dict[str, tuple[int, dict[str, str]]]) -> None:
+    """Creates topics as their owner would (D-080, D-110), for stacks where the relay is off:
+    name -> (partitions, topic configs). Replication factor 1, as in dev."""
+    admin = AIOKafkaAdminClient(bootstrap_servers=bootstrap)
+    await admin.start()
+    try:
+        await admin.create_topics(
+            [NewTopic(name, num_partitions=n, replication_factor=1, topic_configs=configs) for name, (n, configs) in topics.items()]
+        )
+    finally:
+        await admin.close()
 
 
 @contextmanager

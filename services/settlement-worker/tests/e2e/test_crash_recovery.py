@@ -107,6 +107,7 @@ def _drain(e2e) -> None:
         run(_quiescent(e2e, everything))
         assert worker.stop() == 0, worker.diagnostics()
     assert worker.events("processing_failed") == [], worker.diagnostics()
+    assert worker.events("retry_scheduled") == [], worker.diagnostics()  # tripwire: nothing in this proof retries in place (D-108, D-123)
 
 
 def _group_is_quiet(e2e) -> bool:
@@ -297,6 +298,7 @@ def test_crash_recovery(e2e, crash_group, collector, point, iteration):
     # 2. Crash.
     with _worker(e2e, fault_point=point, fault_payment_id=target) as w1:
         assert w1.wait_exit(60) == 86, w1.diagnostics()
+    assert w1.events("retry_scheduled") == [], w1.diagnostics()  # tripwire: nothing in this proof retries in place (D-108, D-123)
     assert len(w1.events("fault_injected", point=point, payment_id=str(target))) == 1, w1.diagnostics()
     w1_calls = w1.events("processor_called", payment_id=str(target))
     assert len(w1_calls) == 1, w1.diagnostics()
@@ -363,6 +365,7 @@ def test_crash_recovery(e2e, crash_group, collector, point, iteration):
     w2_calls = w2.events("processor_called", payment_id=str(target))
     assert [c["decision"] for c in w2_calls] == [decision], w2.diagnostics()
     assert w2.events("processing_failed") == [], w2.diagnostics()
+    assert w2.events("retry_scheduled") == [], w2.diagnostics()  # tripwire: nothing in this proof retries in place (D-108, D-123)
     effect = "payment_settled" if approve else "payment_released"
     if point == AFTER_DB_BEFORE_OFFSET:
         assert len(w2.events("duplicate_skipped", event_id=str(t_event))) == 1, w2.diagnostics()
@@ -399,3 +402,4 @@ def test_clean_restart_after_the_crashes_redelivers_nothing(e2e, crash_group):
     assert worker.events("processor_called") == []
     assert worker.events("duplicate_skipped") == []
     assert worker.events("processing_failed") == []
+    assert worker.events("retry_scheduled") == []  # tripwire: nothing in this proof retries in place (D-108, D-123)

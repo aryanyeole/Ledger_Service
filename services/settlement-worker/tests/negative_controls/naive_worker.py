@@ -268,6 +268,12 @@ def main() -> int:
     logging_setup.configure()
     try:
         config = Config.from_env()
+        # It honours none of main's fault points; silently ignoring an armed one would look like it
+        # ran the scenario (D-125).
+        if config.fault_armed:
+            raise ConfigError(
+                f"the naive worker honours only {FAULT_ENV}, not FAULT_POINT={config.fault_point}"
+            )
         fault_id = _payment_id(FAULT_ENV)
         skip_id = _payment_id(SKIP_ENV)
     except ConfigError as ex:
