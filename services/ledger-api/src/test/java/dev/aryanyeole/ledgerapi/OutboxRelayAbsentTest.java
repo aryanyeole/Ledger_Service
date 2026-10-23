@@ -17,6 +17,7 @@ import org.springframework.kafka.core.KafkaAdmin;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.core.ProducerFactory;
 
+import dev.aryanyeole.ledgerapi.outbox.DlqTopicGuard;
 import dev.aryanyeole.ledgerapi.outbox.OutboxRelay;
 import dev.aryanyeole.ledgerapi.outbox.OutboxRelayScheduler;
 import dev.aryanyeole.ledgerapi.outbox.RelayFaultHook;
@@ -40,7 +41,7 @@ class OutboxRelayAbsentTest {
 	@Test
 	void noRelayOrKafkaClientBeansWithoutOptIn() {
 		for (Class<?> type : List.of(OutboxRelay.class, OutboxRelayScheduler.class, RelayTopicGuard.class,
-				RelayFaultHook.class, ProducerFactory.class, KafkaTemplate.class, KafkaAdmin.class)) {
+				DlqTopicGuard.class, RelayFaultHook.class, ProducerFactory.class, KafkaTemplate.class, KafkaAdmin.class)) {
 			assertThat(this.context.getBeanNamesForType(type)).as("beans of type %s", type.getSimpleName()).isEmpty();
 		}
 		assertThat(this.environment.getProperty("ledger.outbox.relay.enabled")).isEqualTo("false");

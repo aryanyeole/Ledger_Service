@@ -38,6 +38,7 @@ import com.jayway.jsonpath.JsonPath;
 import dev.aryanyeole.ledgerapi.api.CorrelationIdFilter;
 import dev.aryanyeole.ledgerapi.api.EdgeProbe;
 import dev.aryanyeole.ledgerapi.db.WriteTransactions;
+import dev.aryanyeole.ledgerapi.outbox.DlqTopicGuard;
 import dev.aryanyeole.ledgerapi.outbox.OutboxRelay;
 import dev.aryanyeole.ledgerapi.outbox.OutboxRelayProperties;
 import dev.aryanyeole.ledgerapi.outbox.OutboxWriter;
@@ -86,6 +87,12 @@ class OutboxRelayTest {
 
 	@Autowired
 	PaymentsProperties paymentsProperties;
+
+	@Autowired
+	RelayTopicGuard mainGuard;
+
+	@Autowired
+	DlqTopicGuard dlqGuard;
 
 	@Autowired
 	KafkaContainer kafka;
@@ -208,8 +215,9 @@ class OutboxRelayTest {
 		});
 		RelayTopicGuard guard = new RelayTopicGuard(List.of(this.kafka.getBootstrapServers()), topic, 3, (short) 1,
 				10_000);
+		// (d, D-110) with a correct DLQ guard: the main topic's mismatch still stops the relay.
 		OutboxRelay wrongTopicRelay = new OutboxRelay(this.transactions, this.jdbc, this.kafkaTemplate, guard,
-				this.faultHook, this.relayProperties);
+				this.dlqGuard, this.faultHook, this.relayProperties);
 
 		int firstTick = wrongTopicRelay.publishBatch();
 		int secondTick = wrongTopicRelay.publishBatch();
@@ -230,6 +238,118 @@ class OutboxRelayTest {
 			.allSatisfy((r) -> assertThat(r.publishedAt()).as("published_at").isNull());
 		assertThat(this.reader.readAll(topic)).as("records on %s", topic).isEmpty();
 		assertThat(this.reader.partitionCount(topic)).as("partitions of %s", topic).isEqualTo(1);
+	}
+
+	// --- the DLQ topic (D-110) ---
+
+	// (a) The context's relay ensured the DLQ on its first tick (the drain in @BeforeEach): created
+	// with 1 partition, retention.ms=-1 and the shared replication factor. Main-topic events are
+	// published as before.
+	@Test
+	void relayCreatesTheDlqWithOnePartitionAndInfiniteRetention() throws Exception {
+		String dlq = this.paymentsProperties.dlq().topic();
+		assertThat(this.reader.partitionCount(dlq)).as("partitions of %s", dlq).isEqualTo(1);
+		assertThat(this.reader.config(dlq, "retention.ms")).as("retention.ms of %s", dlq).isEqualTo("-1");
+		assertThat(this.reader.replicationFactor(dlq)).as("replication factor of %s", dlq)
+			.isEqualTo(this.paymentsProperties.replicationFactor());
+
+		String key = "m4t6-main-" + UUID.randomUUID();
+		appendMain(key, 2);
+		assertThat(this.relay.publishBatch()).as("main-topic rows published").isEqualTo(2);
+		assertThat(recordsWithKey(this.paymentsProperties.topic(), key)).hasSize(2);
+	}
+
+	// (b) A DLQ with the wrong partition count: one ERROR naming it and the counts across several
+	// ticks, and main-topic rows are published on every tick (independent guard states).
+	@Test
+	void dlqPartitionMismatchLogsOnceAndPublishingContinues(CapturedOutput output) throws Exception {
+		String dlq = "m4t6-dlq-partitions-" + UUID.randomUUID();
+		this.reader.createTopic(dlq, 3, Map.of("retention.ms", "-1"));
+		OutboxRelay relay = relayWithDlq(dlq);
+
+		String key = "m4t6-b-" + UUID.randomUUID();
+		for (int tick = 0; tick < 3; tick++) {
+			appendMain(key, 2);
+			assertThat(relay.publishBatch()).as("tick %d: main-topic rows published", tick).isEqualTo(2);
+		}
+		List<String> errors = linesContaining(output, "DLQ topic " + dlq + " does not match");
+		assertThat(errors).as("ERROR lines naming %s", dlq).hasSize(1);
+		assertThat(errors.get(0)).contains("ERROR").contains("has 3 partitions, expected 1");
+		assertThat(this.reader.partitionCount(dlq)).as("never altered").isEqualTo(3);
+		assertThat(recordsWithKey(this.paymentsProperties.topic(), key)).hasSize(6);
+	}
+
+	// (c) A DLQ with the broker's default retention: one ERROR naming retention.ms, publishing
+	// continues, and the topic's config is unchanged afterwards (never altered).
+	@Test
+	void dlqRetentionMismatchLogsOnceAndTheTopicIsNeverAltered(CapturedOutput output) throws Exception {
+		String dlq = "m4t6-dlq-retention-" + UUID.randomUUID();
+		this.reader.createTopic(dlq, 1);
+		String retentionBefore = this.reader.config(dlq, "retention.ms");
+		assertThat(retentionBefore).as("broker default retention").isNotEqualTo("-1");
+		OutboxRelay relay = relayWithDlq(dlq);
+
+		String key = "m4t6-c-" + UUID.randomUUID();
+		for (int tick = 0; tick < 3; tick++) {
+			appendMain(key, 1);
+			assertThat(relay.publishBatch()).as("tick %d: main-topic rows published", tick).isEqualTo(1);
+		}
+		List<String> errors = linesContaining(output, "DLQ topic " + dlq + " does not match");
+		assertThat(errors).as("ERROR lines naming %s", dlq).hasSize(1);
+		assertThat(errors.get(0)).contains("ERROR").contains("retention.ms=" + retentionBefore + ", expected -1");
+		assertThat(this.reader.config(dlq, "retention.ms")).as("retention.ms afterwards").isEqualTo(retentionBefore);
+	}
+
+	// (e) The relay's producer never sends to the DLQ: after publishing, every DLQ partition is empty.
+	@Test
+	void relayNeverProducesToTheDlq() throws Exception {
+		String key = "m4t6-e-" + UUID.randomUUID();
+		appendMain(key, 3);
+		assertThat(this.relay.publishBatch()).isEqualTo(3);
+		assertThat(this.reader.endOffsets(this.paymentsProperties.dlq().topic())).as("DLQ end offsets")
+			.isNotEmpty()
+			.allSatisfy((partition, end) -> assertThat(end).as("end offset of partition %d", partition).isZero());
+	}
+
+	// (g) Independence, not a retry policy: a DLQ creation the broker rejects (a 250-character name,
+	// which configuration refuses, so the guard is built directly here) keeps the DLQ guard
+	// UNCHECKED, so every tick tries again with a WARN naming the exception, and it never delays the
+	// main topic's batches. A name the broker always rejects is a configuration error (D-110).
+	@Test
+	void failedDlqCreationIsRetriedWithoutDelayingMainTopicBatches(CapturedOutput output) throws Exception {
+		String dlq = "g".repeat(250);
+		OutboxRelay relay = relayWithDlq(dlq);
+
+		String key = "m4t6-g-" + UUID.randomUUID();
+		for (int tick = 0; tick < 3; tick++) {
+			appendMain(key, 1);
+			assertThat(relay.publishBatch()).as("tick %d: main-topic rows published", tick).isEqualTo(1);
+		}
+		List<String> warnings = linesContaining(output, "DLQ topic check for " + dlq + " failed");
+		assertThat(warnings).as("one WARN per tick (still UNCHECKED)").hasSize(3);
+		assertThat(warnings).allSatisfy((line) -> assertThat(line).contains("WARN").contains("InvalidTopicException"));
+		assertThat(linesContaining(output, "DLQ topic " + dlq + " does not match")).as("never MISMATCHED").isEmpty();
+		assertThat(recordsWithKey(this.paymentsProperties.topic(), key)).hasSize(3);
+	}
+
+	private OutboxRelay relayWithDlq(String dlq) {
+		DlqTopicGuard guard = new DlqTopicGuard(List.of(this.kafka.getBootstrapServers()), dlq, 1, (short) 1, 10_000);
+		return new OutboxRelay(this.transactions, this.jdbc, this.kafkaTemplate, this.mainGuard, guard,
+				this.faultHook, this.relayProperties);
+	}
+
+	private void appendMain(String key, int rows) {
+		this.transactions.execute((status) -> {
+			for (int i = 0; i < rows; i++) {
+				this.outbox.append(this.paymentsProperties.topic(), key, "payment.authorized", Map.of("seq", i),
+						Map.of());
+			}
+			return null;
+		});
+	}
+
+	private static List<String> linesContaining(CapturedOutput output, String text) {
+		return output.getAll().lines().filter((line) -> line.contains(text)).toList();
 	}
 
 	private List<OutboxRow> rowsWithKey(String key) {

@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 
@@ -17,6 +18,7 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
 import org.apache.kafka.common.serialization.StringDeserializer;
 
@@ -71,8 +73,13 @@ final class KafkaTopicReader {
 	}
 
 	void createTopic(String topic, int partitions) throws Exception {
+		createTopic(topic, partitions, Map.of());
+	}
+
+	/** A topic created by the test, with these topic configs (empty = the broker's defaults). */
+	void createTopic(String topic, int partitions, Map<String, String> configs) throws Exception {
 		try (Admin admin = admin()) {
-			admin.createTopics(List.of(new NewTopic(topic, partitions, (short) 1))).all().get();
+			admin.createTopics(List.of(new NewTopic(topic, partitions, (short) 1).configs(configs))).all().get();
 			// createTopics completes before every metadata read is guaranteed to see the topic (BUG-006).
 			long deadline = System.nanoTime() + TIMEOUT.toNanos();
 			String last = "unknown";
@@ -99,6 +106,40 @@ final class KafkaTopicReader {
 				}
 				Thread.sleep(POLL_PAUSE_MILLIS);
 			}
+		}
+	}
+
+	/** A topic config value as the broker reports it (the override, or the broker's default). */
+	String config(String topic, String key) throws Exception {
+		try (Admin admin = admin()) {
+			ConfigResource resource = new ConfigResource(ConfigResource.Type.TOPIC, topic);
+			return admin.describeConfigs(List.of(resource)).all().get().get(resource).get(key).value();
+		}
+	}
+
+	short replicationFactor(String topic) throws Exception {
+		try (Admin admin = admin()) {
+			return (short) admin.describeTopics(List.of(topic))
+				.allTopicNames()
+				.get()
+				.get(topic)
+				.partitions()
+				.get(0)
+				.replicas()
+				.size();
+		}
+	}
+
+	/** Each partition's end offset. */
+	Map<Integer, Long> endOffsets(String topic) {
+		Properties config = new Properties();
+		config.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, this.bootstrapServers);
+		config.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+		config.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+		try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(config)) {
+			Map<Integer, Long> ends = new TreeMap<>();
+			consumer.endOffsets(partitionsOf(consumer, topic), TIMEOUT).forEach((tp, end) -> ends.put(tp.partition(), end));
+			return ends;
 		}
 	}
 

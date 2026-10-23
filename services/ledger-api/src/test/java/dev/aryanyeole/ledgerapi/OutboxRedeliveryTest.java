@@ -67,6 +67,7 @@ import com.jayway.jsonpath.JsonPath;
 import dev.aryanyeole.ledgerapi.api.CorrelationIdFilter;
 import dev.aryanyeole.ledgerapi.api.EdgeProbe;
 import dev.aryanyeole.ledgerapi.db.WriteTransactions;
+import dev.aryanyeole.ledgerapi.outbox.DlqTopicGuard;
 import dev.aryanyeole.ledgerapi.outbox.OutboxRelay;
 import dev.aryanyeole.ledgerapi.outbox.OutboxRelayProperties;
 import dev.aryanyeole.ledgerapi.outbox.OutboxWriter;
@@ -134,6 +135,9 @@ class OutboxRedeliveryTest {
 
 	@Autowired
 	PaymentsProperties paymentsProperties;
+
+	@Autowired
+	DlqTopicGuard dlqGuard;
 
 	@Autowired
 	KafkaContainer kafka;
@@ -358,7 +362,7 @@ class OutboxRedeliveryTest {
 				new KafkaTemplate<>(new MockProducerFactory<>(() -> mock)),
 				new RelayTopicGuard(this.relayProperties.bootstrapServers(), topic, this.paymentsProperties.partitions(),
 						this.paymentsProperties.replicationFactor(), (int) this.relayProperties.requestTimeout().toMillis()),
-				this.hook, this.relayProperties);
+				this.dlqGuard, this.hook, this.relayProperties);
 		this.transactions.execute((status) -> {
 			for (String key : keys) {
 				this.outbox.append(topic, key, "payment.authorized", Map.of("key", key), Map.of());
@@ -456,7 +460,7 @@ class OutboxRedeliveryTest {
 		OutboxRelay second = new OutboxRelay(this.transactions, this.jdbc, this.kafkaTemplate,
 				new RelayTopicGuard(this.relayProperties.bootstrapServers(), topic, this.paymentsProperties.partitions(),
 						this.paymentsProperties.replicationFactor(), (int) this.relayProperties.requestTimeout().toMillis()),
-				this.hook, this.relayProperties);
+				this.dlqGuard, this.hook, this.relayProperties);
 		this.hook.barrier = new CyclicBarrier(2);
 		ConcurrentLinkedQueue<Throwable> exceptions = new ConcurrentLinkedQueue<>();
 		CountDownLatch gate = new CountDownLatch(1);
