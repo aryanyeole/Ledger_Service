@@ -58,6 +58,8 @@ public class OutboxRelay {
 
 	private final RelayTopicGuard guard;
 
+	private final DlqTopicGuard dlqGuard;
+
 	private final RelayFaultHook faultHook;
 
 	private final int batchSize;
@@ -65,11 +67,12 @@ public class OutboxRelay {
 	private final Duration ackWait;
 
 	public OutboxRelay(WriteTransactions transactions, JdbcClient jdbc, KafkaTemplate<String, String> kafka,
-			RelayTopicGuard guard, RelayFaultHook faultHook, OutboxRelayProperties properties) {
+			RelayTopicGuard guard, DlqTopicGuard dlqGuard, RelayFaultHook faultHook, OutboxRelayProperties properties) {
 		this.transactions = transactions;
 		this.jdbc = jdbc;
 		this.kafka = kafka;
 		this.guard = guard;
+		this.dlqGuard = dlqGuard;
 		this.faultHook = faultHook;
 		this.batchSize = properties.batchSize();
 		this.ackWait = properties.deliveryTimeout().plus(ACK_WAIT_MARGIN);
@@ -109,6 +112,9 @@ public class OutboxRelay {
 			}
 			return marked;
 		});
+		// After the batch's transaction has committed, never inside it: the DLQ guard's admin calls are
+		// network calls, and its outcome never decides whether a batch runs (D-110).
+		this.dlqGuard.ensure();
 		return published;
 	}
 

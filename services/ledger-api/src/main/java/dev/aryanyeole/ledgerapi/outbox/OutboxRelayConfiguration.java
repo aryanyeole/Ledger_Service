@@ -17,7 +17,7 @@ import org.springframework.kafka.core.KafkaTemplate;
 import dev.aryanyeole.ledgerapi.db.WriteTransactions;
 import dev.aryanyeole.ledgerapi.payments.PaymentsProperties;
 
-// The relay and the only Kafka client in ledger-api (D-079, D-080, D-098). Boot's Kafka
+// The relay and the only Kafka client in ledger-api (D-079, D-080, D-098, D-110). Boot's Kafka
 // auto-configuration is excluded, so with ledger.outbox.relay.enabled=false there is no producer,
 // template or admin client at all, and nothing can publish outside the outbox (invariant 5).
 // The scheduler is a nested configuration that also needs ledger.outbox.relay.scheduled=true;
@@ -68,11 +68,17 @@ class OutboxRelayConfiguration {
 	}
 
 	@Bean
+	DlqTopicGuard dlqTopicGuard(OutboxRelayProperties relay, PaymentsProperties payments) {
+		return new DlqTopicGuard(relay.bootstrapServers(), payments.dlq().topic(), payments.dlq().partitions(),
+				payments.replicationFactor(), (int) relay.requestTimeout().toMillis());
+	}
+
+	@Bean
 	OutboxRelay outboxRelay(WriteTransactions transactions, JdbcClient jdbc,
 			KafkaTemplate<String, String> outboxRelayKafkaTemplate, RelayTopicGuard relayTopicGuard,
-			RelayFaultHook relayFaultHook, OutboxRelayProperties properties) {
-		return new OutboxRelay(transactions, jdbc, outboxRelayKafkaTemplate, relayTopicGuard, relayFaultHook,
-				properties);
+			DlqTopicGuard dlqTopicGuard, RelayFaultHook relayFaultHook, OutboxRelayProperties properties) {
+		return new OutboxRelay(transactions, jdbc, outboxRelayKafkaTemplate, relayTopicGuard, dlqTopicGuard,
+				relayFaultHook, properties);
 	}
 
 	@Configuration(proxyBeanMethods = false)

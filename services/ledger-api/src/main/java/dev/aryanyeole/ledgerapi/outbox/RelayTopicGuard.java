@@ -1,18 +1,11 @@
 package dev.aryanyeole.ledgerapi.outbox;
 
 import java.util.List;
-import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 import org.apache.kafka.clients.admin.Admin;
-import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.NewTopic;
-import org.apache.kafka.clients.admin.TopicDescription;
-import org.apache.kafka.common.errors.TopicExistsException;
-import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -24,7 +17,8 @@ import org.slf4j.LoggerFactory;
 // broker or a timeout leaves the guard unchecked, so the next tick tries again; ledger-api keeps
 // serving while Kafka is down. Runs before the relay opens its DB transaction, so these network
 // calls never happen inside one (invariant 5). A short-lived Admin client per check, with bounded
-// timeouts; no NewTopic bean (KafkaAdmin could reconcile partition counts on its own).
+// timeouts (TopicAdmin); no NewTopic bean (KafkaAdmin could reconcile partition counts on its own).
+// The DLQ has its own guard with its own state (DlqTopicGuard, D-110): nothing about it stops this one.
 public class RelayTopicGuard {
 
 	private static final Logger log = LoggerFactory.getLogger(RelayTopicGuard.class);
@@ -73,14 +67,11 @@ public class RelayTopicGuard {
 	}
 
 	private State check() {
-		try (Admin admin = Admin.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG,
-				String.join(",", this.bootstrapServers), AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG,
-				this.timeoutMillis, AdminClientConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, this.timeoutMillis,
-				AdminClientConfig.CLIENT_ID_CONFIG, "ledger-api-outbox-relay-admin"))) {
-			int actual = partitionCount(admin);
+		try (Admin admin = TopicAdmin.open(this.bootstrapServers, this.timeoutMillis, "ledger-api-outbox-relay-admin")) {
+			int actual = TopicAdmin.partitionCount(admin, this.topic, this.timeoutMillis);
 			if (actual < 0) {
 				create(admin);
-				actual = partitionCount(admin);
+				actual = TopicAdmin.partitionCount(admin, this.topic, this.timeoutMillis);
 				if (actual < 0) {
 					// Created but not yet visible in metadata: not a mismatch, check again next tick.
 					log.info("Outbox relay topic {} not visible yet after creation; retrying next tick", this.topic);
@@ -106,36 +97,12 @@ public class RelayTopicGuard {
 		}
 	}
 
-	// Partition count of the topic, or -1 if it doesn't exist.
-	private int partitionCount(Admin admin) throws InterruptedException, ExecutionException, TimeoutException {
-		try {
-			TopicDescription description = admin.describeTopics(Set.of(this.topic))
-				.allTopicNames()
-				.get(this.timeoutMillis, TimeUnit.MILLISECONDS)
-				.get(this.topic);
-			return description.partitions().size();
-		}
-		catch (ExecutionException ex) {
-			if (ex.getCause() instanceof UnknownTopicOrPartitionException) {
-				return -1;
-			}
-			throw ex;
-		}
-	}
-
 	private void create(Admin admin) throws InterruptedException, ExecutionException, TimeoutException {
-		try {
-			admin.createTopics(Set.of(new NewTopic(this.topic, this.partitions, this.replicationFactor)))
-				.all()
-				.get(this.timeoutMillis, TimeUnit.MILLISECONDS);
+		// Created concurrently (another relay instance): described like any existing topic.
+		if (TopicAdmin.create(admin, new NewTopic(this.topic, this.partitions, this.replicationFactor),
+				this.timeoutMillis)) {
 			log.info("Outbox relay created topic {} with {} partitions, replication factor {}", this.topic,
 					this.partitions, this.replicationFactor);
-		}
-		catch (ExecutionException ex) {
-			// Created concurrently (another relay instance): describe it like any existing topic.
-			if (!(ex.getCause() instanceof TopicExistsException)) {
-				throw ex;
-			}
 		}
 	}
 
