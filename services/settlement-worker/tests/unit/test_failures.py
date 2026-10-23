@@ -3,6 +3,7 @@
 import asyncpg
 import pytest
 
+from settlement_worker.db import DbTimeout, DbUnavailable
 from settlement_worker.envelope import InvalidEvent
 from settlement_worker.failures import ErrorClass, Failure, classify
 from settlement_worker.settlement import EscrowShortfall, EventMismatch, MissingAccount, SettlementError, UnknownPayment
@@ -24,8 +25,12 @@ T, P, U, F = ErrorClass.TRANSIENT, ErrorClass.POISON, ErrorClass.UNCLASSIFIED, E
         (asyncpg.CrashShutdownError("crash"), Failure(T, "57P02", connection=True)),
         (asyncpg.CannotConnectNowError("starting"), Failure(T, "57P03", connection=True)),
         (asyncpg.TooManyConnectionsError("full"), Failure(T, "53300", connection=True)),
-        (ConnectionResetError("reset"), Failure(T, connection=True)),
-        (TimeoutError("timeout"), Failure(T, connection=True)),
+        # DB call sites wrap their timeouts and socket errors (D-109): connection loss.
+        (DbTimeout("DB call timed out"), Failure(T, connection=True)),
+        (DbUnavailable("ConnectionRefusedError"), Failure(T, connection=True)),
+        # A raw OSError/TimeoutError didn't come from a DB call: transient, but the DB is left alone.
+        (ConnectionResetError("reset"), Failure(T)),
+        (TimeoutError("timeout"), Failure(T)),
         # Fatal: the deployment or the ledger is broken.
         (asyncpg.InsufficientPrivilegeError("grant"), Failure(F, "42501")),
         (asyncpg.UndefinedTableError("table"), Failure(F, "42P01")),
@@ -59,3 +64,22 @@ def test_classify(exc, expected):
 
 def test_metric_labels_are_the_class_names():
     assert [c.value for c in ErrorClass] == ["Transient", "Poison", "Unclassified", "Fatal"]
+
+
+# D-109: an asyncpg InterfaceError is connection loss only when the connection is closed at the
+# point of failure; on a live connection it is a client-side bug (Unclassified, bounded). DataError
+# (a bad query argument) is never connection loss.
+@pytest.mark.parametrize(
+    "exc, closed, expected",
+    [
+        (asyncpg.InterfaceError("cannot perform operation: connection is closed"), True, Failure(T, connection=True)),
+        (asyncpg.InterfaceError("cannot perform operation: another operation is in progress"), False, Failure(U)),
+        # asyncpg raises DataError (a PostgresError, 22000) for an invalid query argument too.
+        (asyncpg.DataError("invalid input for query argument $1"), True, Failure(U, "22000")),
+        (asyncpg.DataError("invalid input for query argument $1"), False, Failure(U, "22000")),
+        (asyncpg.ClientConfigurationError("bad config"), True, Failure(U)),
+    ],
+    ids=["closed", "live", "data-error-closed", "data-error-live", "client-config"],
+)
+def test_interface_error_by_connection_state(exc, closed, expected):
+    assert classify(exc, connection_closed=closed) == expected

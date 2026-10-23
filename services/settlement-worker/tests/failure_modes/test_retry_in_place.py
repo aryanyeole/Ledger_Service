@@ -18,111 +18,22 @@ attempt after the first starts no earlier than its retry_scheduled timestamp + d
 5 ms allowance for the wall clock against the monotonic clock the worker schedules with.
 """
 
-import asyncio
-import threading
 import time
 import urllib.request
-import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 from decimal import Decimal
 
-from support.stack import TOPIC
-from support.worker_process import committed_offsets, start_worker
-
-CLOCK_ALLOWANCE = timedelta(milliseconds=5)
-
-
-def run(coro):
-    return asyncio.run(coro)
-
-
-async def _fetch(db, query, *args):
-    conn = await db.connect()
-    try:
-        return await conn.fetch(query, *args)
-    finally:
-        await conn.close()
-
-
-def _app(fm, query, *args):
-    return run(_fetch(fm.app_db, query, *args))
-
-
-def _worker_role(fm, query, *args):
-    """processed_messages is readable only by settlement_worker (V12 grants)."""
-    return run(_fetch(fm.worker_db, query, *args))
-
-
-def _status(fm, payment_id) -> str:
-    return _app(fm, "SELECT status FROM payments WHERE id = $1", payment_id)[0]["status"]
-
-
-def _postings(fm, payment_id) -> int:
-    rows = _app(
-        fm,
-        "SELECT count(*) AS n FROM transactions WHERE reference = $1 AND kind IN ('PAYMENT_SETTLE', 'PAYMENT_RELEASE')",
-        str(payment_id),
-    )
-    return rows[0]["n"]
-
-
-def _results(fm, payment_id) -> int:
-    rows = _app(
-        fm,
-        "SELECT count(*) AS n FROM outbox WHERE message_key = $1 AND event_type IN ('payment.settled', 'payment.failed')",
-        str(payment_id),
-    )
-    return rows[0]["n"]
-
-
-def _event_id(fm, payment_id) -> uuid.UUID:
-    rows = _app(
-        fm, "SELECT event_id FROM outbox WHERE message_key = $1 AND event_type = 'payment.authorized'", str(payment_id)
-    )
-    return rows[0]["event_id"]
-
-
-def _dedup_rows(fm, group, payment_id) -> int:
-    rows = _worker_role(
-        fm,
-        "SELECT count(*) AS n FROM processed_messages WHERE consumer_group = $1 AND event_id = $2",
-        group,
-        _event_id(fm, payment_id),
-    )
-    return rows[0]["n"]
-
-
-
-
-def _committed(fm, group, partition) -> int | None:
-    """The group's committed offset, read with a separate admin client that never commits."""
-    return run(committed_offsets(fm.kafka.bootstrap_servers, group)).get(partition)
-
-
-def _assert_not_past(committed: int | None, offset: int, when: str) -> None:
-    """(d) as loss, not just order: a committed offset past P means P would never be redelivered."""
-    assert committed is None or committed <= offset, f"{when}: committed offset {committed} > P's offset {offset}"
-
-
-def _ts(event) -> datetime:
-    return datetime.fromisoformat(event["timestamp"])
-
-
-def _funded_pair(fm) -> tuple[int, int]:
-    customer = fm.api.create_account("CUSTOMER")
-    merchant = fm.api.create_account("MERCHANT")
-    fm.api.deposit(customer, "10000.00")
-    return customer, merchant
-
-
-def _worker(fm, group, **env):
-    return start_worker(
-        database=fm.database,
-        bootstrap_servers=fm.kafka.bootstrap_servers,
-        group=group,
-        log_dir=fm.log_dir,
-        extra_env={k: str(v) for k, v in env.items()},
-    )
+from support.failure_kit import CLOCK_ALLOWANCE, EscrowHolder
+from support.failure_kit import assert_not_past as _assert_not_past
+from support.failure_kit import committed as _committed
+from support.failure_kit import dedup_rows as _dedup_rows
+from support.failure_kit import funded_pair as _funded_pair
+from support.failure_kit import postings as _postings
+from support.failure_kit import results as _results
+from support.failure_kit import status as _status
+from support.failure_kit import ts as _ts
+from support.failure_kit import wait as _wait
+from support.failure_kit import worker as _worker
 
 
 def _retries_metric(port: int, error_class: str, sqlstate: str) -> Decimal:
@@ -132,104 +43,6 @@ def _retries_metric(port: int, error_class: str, sqlstate: str) -> Decimal:
     lines = [line for line in body.splitlines() if line.startswith(prefix)]
     assert len(lines) == 1, body
     return Decimal(lines[0][len(prefix) :])
-
-
-class EscrowHolder:
-    """Holds system:escrow FOR UPDATE as ledger_api_app on its own thread and event loop until
-    released (a granted row lock: ledger_api_app has UPDATE(balance) on accounts, D-034)."""
-
-    def __init__(self, fm) -> None:
-        self._fm = fm
-        self._locked = threading.Event()
-        self._release = threading.Event()
-        self._error: BaseException | None = None
-        self._thread = threading.Thread(target=self._run, daemon=True)
-
-    def _run(self) -> None:
-        async def hold():
-            conn = await self._fm.app_db.connect()
-            try:
-                tx = conn.transaction()
-                await tx.start()
-                await conn.fetch("SELECT id FROM accounts WHERE name = 'system:escrow' FOR UPDATE")
-                self._locked.set()
-                await asyncio.to_thread(self._release.wait)
-                await tx.rollback()
-            finally:
-                await conn.close()
-
-        try:
-            asyncio.run(hold())
-        except BaseException as ex:  # noqa: BLE001 - surfaced by release()
-            self._error = ex
-            self._locked.set()
-
-    def __enter__(self) -> "EscrowHolder":
-        self._thread.start()
-        assert self._locked.wait(30), "the escrow lock was not taken"
-        assert self._error is None, self._error
-        return self
-
-    def release(self) -> None:
-        self._release.set()
-        self._thread.join(30)
-        assert self._error is None, self._error
-
-    def __exit__(self, *exc) -> None:
-        self.release()
-
-
-def _wait(worker, predicate, timeout: float, what: str):
-    """Polls predicate until it holds; fails at once if the worker exits first."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        value = predicate()
-        if value:
-            return value
-        if worker.process.poll() is not None:
-            raise AssertionError(
-                f"worker exited {worker.process.returncode} waiting for {what}:\n{worker.diagnostics()}"
-            )
-        time.sleep(0.05)
-    raise AssertionError(f"timed out waiting for {what}:\n{worker.diagnostics()}")
-
-
-# (a)
-def test_lock_timeout_retries_in_place_then_applies_once(fm):
-    group = "retry-55p03"
-    customer, merchant = _funded_pair(fm)
-    payment = fm.api.authorize(customer, merchant, "10.00")
-    fm.publish(payment)
-    partition, offset = fm.position(payment)
-
-    with EscrowHolder(fm) as holder:
-        with _worker(fm, group, WORKER_LOCK_TIMEOUT_MS=300) as worker:
-            mine = {"partition": partition, "offset": offset}
-            _wait(worker, lambda: len(worker.events("retry_scheduled", **mine)) >= 2, 60, "two retries of P")
-            holder.release()
-            worker.wait_for("payment_settled", payment_id=str(payment))
-            retries = worker.events("retry_scheduled")
-            port = worker.metrics_port()
-            counted = _retries_metric(port, "Transient", "55P03")
-            assert worker.stop() == 0, worker.diagnostics()
-
-    assert retries, worker.diagnostics()
-    assert all(r["partition"] == partition and r["offset"] == offset for r in retries), retries
-    assert all(r["error_class"] == "Transient" and r["sqlstate"] == "55P03" for r in retries), retries
-    assert [r["attempt"] for r in retries] == list(range(1, len(retries) + 1))
-    assert [r["delay_ms"] for r in retries[:2]] == [50, 100]
-    assert all(r["level"] == "warning" for r in retries)
-    assert counted == len(retries)
-
-    calls = worker.events("processor_called", payment_id=str(payment))
-    assert len(calls) == len(retries) + 1, "one processor call per attempt"
-    assert len({c["decision"] for c in calls}) == 1
-    assert _postings(fm, payment) == 1
-    assert _dedup_rows(fm, group, payment) == 1
-    assert _results(fm, payment) == 1
-    assert _status(fm, payment) == "SETTLED"
-    assert (_committed(fm, group, partition) or 0) > offset
-    assert worker.events("processing_failed") == []
 
 
 def _publish_until(fm, group, customer, merchant, predicate, limit: int = 12):

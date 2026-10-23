@@ -57,6 +57,8 @@ class Database:
     host: str
     port: int
     name: str = "ledger"
+    # The Postgres container, for tests that pause it or exec into it (D-129).
+    container_id: str | None = None
 
     def params(self, role: str) -> dict:
         """asyncpg.connect keyword arguments for a role."""
@@ -149,7 +151,11 @@ def postgres():
     )
     container.start()
     try:
-        yield Database(host=_host(container), port=int(container.get_exposed_port(5432)))
+        yield Database(
+            host=_host(container),
+            port=int(container.get_exposed_port(5432)),
+            container_id=container.get_wrapped_container().id,
+        )
     finally:
         container.stop()
 

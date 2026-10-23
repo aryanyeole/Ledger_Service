@@ -5,7 +5,7 @@ import random
 import pytest
 from aiokafka import TopicPartition
 
-from settlement_worker.retry import RetryState, backoff_ms
+from settlement_worker.retry import PendingCommits, RetryState, backoff_ms
 
 TP = TopicPartition("ledger.payments.v1", 1)
 OTHER = TopicPartition("ledger.payments.v1", 2)
@@ -69,3 +69,59 @@ def test_due_returns_only_ended_backoffs_once():
     assert state.due(200) == [TP]
     assert state.due(200) == []
     assert state.next_due_ns() == 300
+
+
+def test_pending_commit_attempts_due_and_success():
+    pending = PendingCommits()
+    assert not pending
+    assert pending.failed(TP, 7) == 1
+    pending.schedule(TP, 1_000)
+    assert pending and pending.offset(TP) == 7
+    assert pending.due(999) == []
+    assert pending.due(1_000) == [(TP, 7)]
+    assert pending.failed(TP, 7) == 2
+    pending.committed(TP, 7)
+    assert not pending
+
+
+def test_pending_commit_keeps_the_highest_offset_and_the_attempt_count():
+    pending = PendingCommits()
+    pending.failed(TP, 7)
+    assert pending.failed(TP, 9) == 2, "a higher offset replaces the lower one, attempts carry on"
+    assert pending.offset(TP) == 9
+    assert pending.failed(TP, 8) == 3
+    assert pending.offset(TP) == 9, "never lowered"
+
+
+def test_a_later_commit_supersedes_and_nothing_is_rewound():
+    pending = PendingCommits()
+    pending.failed(TP, 7)
+    pending.schedule(TP, 0)
+    pending.committed(TP, 6)
+    assert pending.offset(TP) == 7, "a lower commit doesn't clear it"
+    pending.committed(TP, 8)
+    assert not pending
+    # A failure reported after a higher offset already committed is dropped when due, not committed.
+    pending.failed(TP, 7)
+    pending.schedule(TP, 0)
+    assert pending.due(1) == []
+    assert not pending
+
+
+def test_revoke_drops_pending_commits():
+    pending = PendingCommits()
+    pending.failed(TP, 7)
+    pending.failed(OTHER, 3)
+    pending.schedule(TP, 5)
+    pending.schedule(OTHER, 9)
+    pending.revoked([TP])
+    assert pending.offset(TP) is None
+    assert pending.next_due_ns() == 9
+
+
+def test_scheduled_lists_partitions_in_backoff():
+    state = RetryState()
+    state.schedule(TP, 100)
+    assert state.scheduled() == {TP}
+    state.due(100)
+    assert state.scheduled() == set()

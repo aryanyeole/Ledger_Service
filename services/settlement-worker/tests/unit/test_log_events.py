@@ -34,6 +34,8 @@ def test_contract():
             "sqlstate",
             "topic",
         ],
+        "db_reconnected": ["attempt", "correlation_id", "current_user"],
+        "offset_commit_failed": ["attempt", "correlation_id", "delay_ms", "error", "offset", "partition", "topic"],
     }
 
 

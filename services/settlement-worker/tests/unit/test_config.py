@@ -101,6 +101,34 @@ def test_invalid_retry_config(overrides, message):
         Config.from_env(_env(**overrides))
 
 
+def test_db_and_poll_defaults():
+    config = Config.from_env(_env())
+    assert (config.db_command_timeout_ms, config.max_poll_interval_ms) == (10000, 300000)
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"WORKER_DB_COMMAND_TIMEOUT_MS": "5000"}, "must be greater than WORKER_LOCK_TIMEOUT_MS"),
+        ({"WORKER_LOCK_TIMEOUT_MS": "300", "WORKER_DB_COMMAND_TIMEOUT_MS": "300"}, "must be greater than"),
+        ({"WORKER_DB_COMMAND_TIMEOUT_MS": "0"}, "WORKER_DB_COMMAND_TIMEOUT_MS"),
+        ({"WORKER_DB_COMMAND_TIMEOUT_MS": "3600001"}, "WORKER_DB_COMMAND_TIMEOUT_MS"),
+        ({"WORKER_MAX_POLL_INTERVAL_MS": "0"}, "WORKER_MAX_POLL_INTERVAL_MS"),
+        ({"WORKER_MAX_POLL_INTERVAL_MS": "2147483648"}, "WORKER_MAX_POLL_INTERVAL_MS"),
+    ],
+)
+def test_invalid_db_and_poll_config(overrides, message):
+    with pytest.raises(ConfigError, match=message):
+        Config.from_env(_env(**overrides))
+
+
+def test_fail_offset_commit_follows_the_arming_rules():
+    armed = Config.from_env(_env(FAULT_POINT="FAIL_OFFSET_COMMIT", FAULT_PAYMENT_ID=PAYMENT))
+    assert armed.fault_armed and armed.fault_point == "FAIL_OFFSET_COMMIT"
+    with pytest.raises(ConfigError, match="FAULT_PAYMENT_ID is not"):
+        Config.from_env(_env(FAULT_POINT="FAIL_OFFSET_COMMIT"))
+
+
 def test_raise_before_commit_follows_the_arming_rules():
     armed = Config.from_env(_env(FAULT_POINT="RAISE_BEFORE_COMMIT", FAULT_PAYMENT_ID=PAYMENT))
     assert armed.fault_armed and armed.fault_point == "RAISE_BEFORE_COMMIT"
