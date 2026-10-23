@@ -108,6 +108,8 @@ def _drain(e2e) -> None:
         assert worker.stop() == 0, worker.diagnostics()
     assert worker.events("processing_failed") == [], worker.diagnostics()
     assert worker.events("retry_scheduled") == [], worker.diagnostics()  # tripwire: nothing in this proof retries in place (D-108, D-123)
+    assert worker.events("db_reconnected") == [], worker.diagnostics()  # tripwire (D-109)
+    assert worker.events("offset_commit_failed") == [], worker.diagnostics()  # tripwire (D-109)
 
 
 def _group_is_quiet(e2e) -> bool:
@@ -299,6 +301,8 @@ def test_crash_recovery(e2e, crash_group, collector, point, iteration):
     with _worker(e2e, fault_point=point, fault_payment_id=target) as w1:
         assert w1.wait_exit(60) == 86, w1.diagnostics()
     assert w1.events("retry_scheduled") == [], w1.diagnostics()  # tripwire: nothing in this proof retries in place (D-108, D-123)
+    assert w1.events("db_reconnected") == [], w1.diagnostics()  # tripwire (D-109)
+    assert w1.events("offset_commit_failed") == [], w1.diagnostics()  # tripwire (D-109)
     assert len(w1.events("fault_injected", point=point, payment_id=str(target))) == 1, w1.diagnostics()
     w1_calls = w1.events("processor_called", payment_id=str(target))
     assert len(w1_calls) == 1, w1.diagnostics()
@@ -366,6 +370,8 @@ def test_crash_recovery(e2e, crash_group, collector, point, iteration):
     assert [c["decision"] for c in w2_calls] == [decision], w2.diagnostics()
     assert w2.events("processing_failed") == [], w2.diagnostics()
     assert w2.events("retry_scheduled") == [], w2.diagnostics()  # tripwire: nothing in this proof retries in place (D-108, D-123)
+    assert w2.events("db_reconnected") == [], w2.diagnostics()  # tripwire (D-109)
+    assert w2.events("offset_commit_failed") == [], w2.diagnostics()  # tripwire (D-109)
     effect = "payment_settled" if approve else "payment_released"
     if point == AFTER_DB_BEFORE_OFFSET:
         assert len(w2.events("duplicate_skipped", event_id=str(t_event))) == 1, w2.diagnostics()
@@ -403,3 +409,5 @@ def test_clean_restart_after_the_crashes_redelivers_nothing(e2e, crash_group):
     assert worker.events("duplicate_skipped") == []
     assert worker.events("processing_failed") == []
     assert worker.events("retry_scheduled") == []  # tripwire: nothing in this proof retries in place (D-108, D-123)
+    assert worker.events("db_reconnected") == []  # tripwire (D-109)
+    assert worker.events("offset_commit_failed") == []  # tripwire (D-109)

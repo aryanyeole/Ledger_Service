@@ -30,7 +30,14 @@ class FailureModesStack:
     log_dir: Path
 
     def publish(self, *payment_ids) -> None:
-        asyncio.run(_publish(self, payment_ids))
+        self.produce(self.read_events(*payment_ids))
+
+    def read_events(self, *payment_ids) -> list[tuple]:
+        """(payment_id, record value) from the outbox, read before anything that takes the DB away."""
+        return asyncio.run(_read_events(self, payment_ids))
+
+    def produce(self, values: list[tuple]) -> None:
+        asyncio.run(_produce(self.kafka.bootstrap_servers, values))
 
     def position(self, payment_id) -> tuple[int, int]:
         """(partition, offset) of the payment's payment.authorized record, read from the topic
@@ -64,13 +71,16 @@ async def _position(bootstrap: str, payment_id) -> tuple[int, int]:
     raise AssertionError(f"no record for {payment_id} on {stack.TOPIC}: ends {ends}, read up to {seen}")
 
 
-async def _publish(fm: FailureModesStack, payment_ids) -> None:
+async def _read_events(fm: FailureModesStack, payment_ids) -> list[tuple]:
     conn = await fm.app_db.connect()  # the outbox is readable by ledger_api_app only (D-077)
     try:
-        values = [(pid, await outbox_events.authorized_event(conn, pid)) for pid in payment_ids]
+        return [(pid, await outbox_events.authorized_event(conn, pid)) for pid in payment_ids]
     finally:
         await conn.close()
-    producer = AIOKafkaProducer(bootstrap_servers=fm.kafka.bootstrap_servers, acks="all", enable_idempotence=True)
+
+
+async def _produce(bootstrap: str, values: list[tuple]) -> None:
+    producer = AIOKafkaProducer(bootstrap_servers=bootstrap, acks="all", enable_idempotence=True)
     await producer.start()
     try:
         for pid, value in values:

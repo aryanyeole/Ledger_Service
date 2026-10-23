@@ -1,4 +1,4 @@
-"""The worker's configuration, from the environment (D-081, D-085, D-091, D-108, D-113, D-125).
+"""The worker's configuration, from the environment (D-081, D-085, D-091, D-108, D-109, D-113, D-125, D-129).
 
 Names follow .env.example where it has them. Anything invalid is a ConfigError, and the worker
 refuses to start (exit 2). The password is never part of an error message or the repr.
@@ -15,7 +15,9 @@ AFTER_PROCESSOR_BEFORE_DB = "AFTER_PROCESSOR_BEFORE_DB"
 AFTER_DB_BEFORE_OFFSET = "AFTER_DB_BEFORE_OFFSET"
 # Not a crash: raises a plain RuntimeError inside the settle transaction on every attempt (D-125).
 RAISE_BEFORE_COMMIT = "RAISE_BEFORE_COMMIT"
-FAULT_POINTS = (AFTER_PROCESSOR_BEFORE_DB, AFTER_DB_BEFORE_OFFSET, RAISE_BEFORE_COMMIT)
+# Not a crash: the first two offset commits of the payment's record fail, then commits are real (D-129).
+FAIL_OFFSET_COMMIT = "FAIL_OFFSET_COMMIT"
+FAULT_POINTS = (AFTER_PROCESSOR_BEFORE_DB, AFTER_DB_BEFORE_OFFSET, RAISE_BEFORE_COMMIT, FAIL_OFFSET_COMMIT)
 
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
@@ -45,6 +47,8 @@ class Config:
     retry_max_ms: int
     max_attempts: int
     retry_jitter: bool
+    db_command_timeout_ms: int
+    max_poll_interval_ms: int
 
     @property
     def fault_armed(self) -> bool:
@@ -105,6 +109,15 @@ class Config:
         retry_max = integer("WORKER_RETRY_MAX_MS", "30000", 1, 3_600_000)
         if retry_max < retry_base:
             raise ConfigError(f"WORKER_RETRY_MAX_MS ({retry_max}) must be at least WORKER_RETRY_BASE_MS ({retry_base})")
+        # Every DB call, BEGIN/COMMIT/ROLLBACK included, and connect (D-109). Above lock_timeout, so a
+        # lock wait ends as 55P03 on a live connection, not as a client timeout.
+        lock_timeout_ms = integer("WORKER_LOCK_TIMEOUT_MS", "5000", 1, 2_147_483_647)
+        command_timeout_ms = integer("WORKER_DB_COMMAND_TIMEOUT_MS", "10000", 1, 3_600_000)
+        if command_timeout_ms <= lock_timeout_ms:
+            raise ConfigError(
+                f"WORKER_DB_COMMAND_TIMEOUT_MS ({command_timeout_ms}) must be greater than "
+                f"WORKER_LOCK_TIMEOUT_MS ({lock_timeout_ms})"
+            )
         jitter = env.get("WORKER_RETRY_JITTER", "1")
         if jitter not in ("0", "1"):
             raise ConfigError(f"WORKER_RETRY_JITTER must be 0 or 1, was {jitter!r}")
@@ -119,7 +132,7 @@ class Config:
             consumer_group=text("WORKER_CONSUMER_GROUP", "settlement-worker"),
             session_timeout_ms=session,
             heartbeat_interval_ms=heartbeat,
-            lock_timeout=timedelta(milliseconds=integer("WORKER_LOCK_TIMEOUT_MS", "5000", 1, 2_147_483_647)),
+            lock_timeout=timedelta(milliseconds=lock_timeout_ms),
             fault_point=fault_point,
             fault_payment_id=uuid.UUID(fault_payment) if fault_payment else None,
             stop_on_stdin_eof=stop_on_eof == "1",
@@ -131,4 +144,7 @@ class Config:
             retry_max_ms=retry_max,
             max_attempts=integer("WORKER_MAX_ATTEMPTS", "5", 1, 1000),
             retry_jitter=jitter == "1",
+            db_command_timeout_ms=command_timeout_ms,
+            # aiokafka passes it to the broker as the int32 rebalance timeout; it doesn't validate it.
+            max_poll_interval_ms=integer("WORKER_MAX_POLL_INTERVAL_MS", "300000", 1, 2_147_483_647),
         )
