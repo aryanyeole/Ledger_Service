@@ -16,6 +16,9 @@ failure_modes stack. Cases run in order; each restores the container before the 
     absorbed by dedup.
 (f) A commit pending longer than max.poll.interval: the worker keeps polling with every partition
     paused, so it stays in the group (one partitions_assigned) and the commit lands.
+(g) A stop while the DB is paused and the connection is idle: the final close is bounded by the
+    command timeout (then terminated), so the worker still stops cleanly: worker_stopped, exit 0,
+    no processing_failed, no traceback.
 """
 
 import sys
@@ -257,3 +260,27 @@ def test_a_long_pending_commit_keeps_polling_and_stays_in_the_group(fm):
     assert len(w.events("partitions_assigned")) == 1, w.diagnostics()
     assert len(w.events("processor_called", payment_id=str(payment))) == 1
     _settled_once(fm, group, payment)
+
+
+# (g)
+def test_a_stop_while_the_database_is_paused_exits_0_within_the_bound(fm):
+    group = "conn-stop-paused"
+    command_timeout_ms = 1000
+    bound_s = command_timeout_ms / 1000 + 2
+
+    with worker(fm, group, WORKER_DB_COMMAND_TIMEOUT_MS=command_timeout_ms, WORKER_LOCK_TIMEOUT_MS=300) as w:
+        wait_idle(fm, w, group)  # idle, with its live connection
+        with Paused(fm):
+            stopped_at = time.monotonic()
+            code = w.stop(timeout=bound_s + 10)  # wait past the bound, so a hang shows as a measured miss
+            stop_s = time.monotonic() - stopped_at
+        stderr = w.stderr_path.read_text(encoding="utf-8", errors="replace")
+
+    print(f"STOP_WHILE_PAUSED stop_s={stop_s:.2f} bound_s={bound_s:.0f}")
+    assert code == 0, w.diagnostics()
+    assert stop_s <= bound_s, f"stop took {stop_s:.2f} s, bound {bound_s} s:\n{w.diagnostics()}"
+    events = [e["event"] for e in w.lines()]
+    assert events[-1] == "worker_stopped", events
+    assert w.events("worker_stopped")[0]["level"] == "info"
+    assert w.events("processing_failed") == []
+    assert "Traceback" not in stderr, stderr[-3000:]
