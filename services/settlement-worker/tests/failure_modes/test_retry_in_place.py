@@ -95,7 +95,13 @@ def _dedup_rows(fm, group, payment_id) -> int:
 
 
 def _committed(fm, group, partition) -> int | None:
+    """The group's committed offset, read with a separate admin client that never commits."""
     return run(committed_offsets(fm.kafka.bootstrap_servers, group)).get(partition)
+
+
+def _assert_not_past(committed: int | None, offset: int, when: str) -> None:
+    """(d) as loss, not just order: a committed offset past P means P would never be redelivered."""
+    assert committed is None or committed <= offset, f"{when}: committed offset {committed} > P's offset {offset}"
 
 
 def _ts(event) -> datetime:
@@ -260,10 +266,13 @@ def test_unclassified_retries_in_place_without_blocking_other_partitions(fm):
         checked = 0
         while worker.process.poll() is None:
             retries = worker.events("retry_scheduled", **mine)
-            for _ in retries[checked:]:
+            for retry in retries[checked:]:
                 checks.append(
                     (_dedup_rows(fm, group, payment), _postings(fm, payment), _status(fm, payment))
                     + tuple(_status(fm, w) for w in witnesses)
+                )
+                _assert_not_past(
+                    _committed(fm, group, p_partition), p_offset, f"after P's retry_scheduled attempt {retry['attempt']}"
                 )
             checked = len(retries)
             if retries and q is None:
@@ -294,7 +303,6 @@ def test_unclassified_retries_in_place_without_blocking_other_partitions(fm):
     assert [(f["partition"], f["offset"]) for f in failed] == [(p_partition, p_offset)]
     assert _dedup_rows(fm, group, payment) == 0 and _postings(fm, payment) == 0
     assert _status(fm, payment) == "AUTHORIZED"
-    assert (_committed(fm, group, p_partition) or 0) <= p_offset
 
     # (c)
     assert q is not None
@@ -302,7 +310,9 @@ def test_unclassified_retries_in_place_without_blocking_other_partitions(fm):
     assert len(q_settled) == 1, worker.diagnostics()
     assert _ts(q_settled[0]) < _ts(retries[-1]), (q_settled, retries[-1])
 
-    # (d): in every check and after the exit.
+    # (d): in every check and after the exit. Nothing behind P was applied, and nothing was committed
+    # past P (sampled after each retry above, and here), so P is still redelivered.
+    _assert_not_past(_committed(fm, group, p_partition), p_offset, "after the worker exited")
     assert all(c[3:] == tuple("AUTHORIZED" for _ in c[3:]) for c in checks), checks
     for w in witnesses:
         assert _status(fm, w) == "AUTHORIZED", w
