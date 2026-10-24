@@ -45,6 +45,44 @@ def _retries_metric(port: int, error_class: str, sqlstate: str) -> Decimal:
     return Decimal(lines[0][len(prefix) :])
 
 
+# (a)
+def test_lock_timeout_retries_in_place_then_applies_once(fm):
+    group = "retry-55p03"
+    customer, merchant = _funded_pair(fm)
+    payment = fm.api.authorize(customer, merchant, "10.00")
+    fm.publish(payment)
+    partition, offset = fm.position(payment)
+
+    with EscrowHolder(fm) as holder:
+        with _worker(fm, group, WORKER_LOCK_TIMEOUT_MS=300) as worker:
+            mine = {"partition": partition, "offset": offset}
+            _wait(worker, lambda: len(worker.events("retry_scheduled", **mine)) >= 2, 60, "two retries of P")
+            holder.release()
+            worker.wait_for("payment_settled", payment_id=str(payment))
+            retries = worker.events("retry_scheduled")
+            port = worker.metrics_port()
+            counted = _retries_metric(port, "Transient", "55P03")
+            assert worker.stop() == 0, worker.diagnostics()
+
+    assert retries, worker.diagnostics()
+    assert all(r["partition"] == partition and r["offset"] == offset for r in retries), retries
+    assert all(r["error_class"] == "Transient" and r["sqlstate"] == "55P03" for r in retries), retries
+    assert [r["attempt"] for r in retries] == list(range(1, len(retries) + 1))
+    assert [r["delay_ms"] for r in retries[:2]] == [50, 100]
+    assert all(r["level"] == "warning" for r in retries)
+    assert counted == len(retries)
+
+    calls = worker.events("processor_called", payment_id=str(payment))
+    assert len(calls) == len(retries) + 1, "one processor call per attempt"
+    assert len({c["decision"] for c in calls}) == 1
+    assert _postings(fm, payment) == 1
+    assert _dedup_rows(fm, group, payment) == 1
+    assert _results(fm, payment) == 1
+    assert _status(fm, payment) == "SETTLED"
+    assert (_committed(fm, group, partition) or 0) > offset
+    assert worker.events("processing_failed") == []
+
+
 def _publish_until(fm, group, customer, merchant, predicate, limit: int = 12):
     """Authorizes and publishes candidates one at a time, reading each one's partition back from
     the topic (D-105), until predicate((partition, offset)) holds. Returns (chosen, others), where
