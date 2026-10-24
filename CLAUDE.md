@@ -18,8 +18,8 @@ Payments ledger: Spring Boot API + Python settlement worker + React/TS dashboard
 2. `entries` is append-only. Corrections are new reversing transactions.
 3. Money is `BigDecimal` / `Decimal` / JSON string. No `double`, `float`, or JS `Number` anywhere in a money path. Rounding mode is always explicit (HALF_EVEN).
 4. Lock accounts in ascending id order before updating balances (Java and Python).
-5. No network calls (Kafka, HTTP, the payment processor) inside a DB transaction, except the outbox relay's send-and-await inside its batch transaction (D-008, D-079). Events go through the `outbox` table.
-6. Consumer side: `processed_messages` insert + effect + outbox in ONE DB transaction; commit the Kafka offset after the DB commit.
+5. No network calls (Kafka, HTTP, the payment processor) inside a DB transaction, except the outbox relay's send-and-await inside its batch transaction (D-008, D-079). Events go through the `outbox` table, except dead letters, which the worker produces directly to `ledger.payments.dlq.v1` outside any DB transaction (D-111).
+6. Consumer side: `processed_messages` insert + effect + outbox in ONE DB transaction; commit the Kafka offset after the DB commit, or, for a dead-lettered record, after the DLQ ack (D-111).
 7. Idempotency key row and the business effect commit in the same transaction.
 
 Exception (D-017): negative-control tests may deliberately violate invariants 6–7 to prove the proof tests can detect those bugs. They live only in `services/ledger-api/src/test/java/**/negativecontrols/` and `services/settlement-worker/tests/negative_controls/`. Main code never imports them. Each one asserts that the naive variant FAILS (duplicates appear). They never disable, alter, or bypass DB triggers, schema, or roles, and invariants 1–5 still apply inside them. They run in CI like any other test. Any violation outside these folders is a bug.

@@ -20,7 +20,7 @@ from aiokafka import AIOKafkaConsumer, TopicPartition
 from aiokafka.admin import AIOKafkaAdminClient
 from aiokafka.errors import KafkaError
 
-from support.stack import TOPIC, WORKER_PASSWORD, Database, topic_partitions
+from support.stack import DLQ_TOPIC, TOPIC, WORKER_PASSWORD, Database, topic_partitions
 
 from settlement_worker import envelope
 
@@ -121,6 +121,8 @@ def start_worker(
         WORKER_RETRY_JITTER="0",
         WORKER_RETRY_BASE_MS="50",
         WORKER_RETRY_MAX_MS="400",
+        # Dead letters (D-111): the topic this stack's owner created (relay, or the failure_modes harness).
+        WORKER_DLQ_TOPIC=DLQ_TOPIC,
     )
     if fault_point is not None:
         env.update(FAULT_POINT=fault_point, FAULT_PAYMENT_ID=str(fault_payment_id))

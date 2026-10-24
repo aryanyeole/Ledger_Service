@@ -4,6 +4,7 @@ import asyncpg
 import pytest
 
 from settlement_worker.db import DbTimeout, DbUnavailable
+from settlement_worker.dlq import DlqUnavailable
 from settlement_worker.envelope import InvalidEvent
 from settlement_worker.failures import ErrorClass, Failure, classify
 from settlement_worker.settlement import EscrowShortfall, EventMismatch, MissingAccount, SettlementError, UnknownPayment
@@ -31,6 +32,8 @@ T, P, U, F = ErrorClass.TRANSIENT, ErrorClass.POISON, ErrorClass.UNCLASSIFIED, E
         # A raw OSError/TimeoutError didn't come from a DB call: transient, but the DB is left alone.
         (ConnectionResetError("reset"), Failure(T)),
         (TimeoutError("timeout"), Failure(T)),
+        # The dead letter couldn't be produced (D-111): transient, the DB left alone.
+        (DlqUnavailable("not acknowledged"), Failure(T)),
         # Fatal: the deployment or the ledger is broken.
         (asyncpg.InsufficientPrivilegeError("grant"), Failure(F, "42501")),
         (asyncpg.UndefinedTableError("table"), Failure(F, "42P01")),

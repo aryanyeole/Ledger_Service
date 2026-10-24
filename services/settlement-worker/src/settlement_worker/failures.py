@@ -13,7 +13,7 @@ Fatal       the deployment or the ledger is broken: processing_failed, exit 1, n
 
 A failed offset commit is not a record failure and never comes here: the effect has already
 committed, so the commit path handles it (D-107, D-109). Each later task adds its own exception
-types here (the DLQ produce in T7, processor errors in T8).
+types here (processor errors in T8).
 """
 
 import enum
@@ -22,6 +22,7 @@ from dataclasses import dataclass
 import asyncpg
 
 from settlement_worker.db import DbTimeout, DbUnavailable
+from settlement_worker.dlq import DlqUnavailable
 from settlement_worker.envelope import InvalidEvent
 from settlement_worker.settlement import EscrowShortfall, EventMismatch, MissingAccount, UnknownPayment
 
@@ -51,6 +52,9 @@ _FATAL_CLASSES = ("28", "23")
 def classify(exc: BaseException, connection_closed: bool = False) -> Failure:
     if isinstance(exc, (DbTimeout, DbUnavailable)):
         return Failure(ErrorClass.TRANSIENT, connection=True)
+    # The dead letter couldn't be produced (D-111): transient; the DB connection is left alone.
+    if isinstance(exc, DlqUnavailable):
+        return Failure(ErrorClass.TRANSIENT)
     if isinstance(exc, (InvalidEvent, UnknownPayment, EventMismatch)):
         return Failure(ErrorClass.POISON)
     if isinstance(exc, (EscrowShortfall, MissingAccount)):

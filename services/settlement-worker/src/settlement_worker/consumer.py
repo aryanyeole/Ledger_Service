@@ -1,5 +1,5 @@
 """The consume loop: offsets after the DB commit, retry in place, reconnect, pending offset commits,
-fault points (D-014, D-081, D-085, D-107, D-108, D-109, D-125, D-129).
+dead letters, fault points (D-014, D-081, D-085, D-107, D-108, D-109, D-111, D-125, D-129).
 
 Records are processed one at a time, in partition order. For each record:
   0. if the DB connection was lost, reconnect first (the role check runs again; a refusal exits 2);
@@ -15,8 +15,11 @@ to WORKER_MAX_ATTEMPTS) are retried in place (D-108): a redelivery to self that 
 partition back to the record, pauses it, drops the rest of its fetched records and resumes it after
 the backoff, while other partitions keep moving. A lost DB connection is terminated first, and
 each re-run reconnects (D-109); a timeout or loss during COMMIT leaves the outcome unknown, and the
-re-run's dedup decides. Poison, Fatal and an exhausted Unclassified -> processing_failed and exit 1
-without committing (the DLQ replaces it in T7). A failed offset commit is not a record failure (the
+re-run's dedup decides. Poison (on its first failure) and an exhausted Unclassified are dead-lettered
+(D-111): after the transaction has rolled back, the original record goes to the DLQ topic, the ack is
+awaited, and only then is offset+1 committed; a DLQ produce that fails is DlqUnavailable, transient,
+and the record is re-run with its attempt count kept. Fatal -> processing_failed and exit 1 without
+committing. A failed offset commit is not a record failure (the
 effect committed): never classified, never re-run; the offset stays pending, every assigned
 partition is paused, and the worker keeps polling while it recommits on the D-108 schedule.
 Records fetched but not processed stay uncommitted and are redelivered. A stop request is honoured
@@ -36,13 +39,15 @@ import random
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 
 import asyncpg
 import structlog
 from aiokafka import AIOKafkaConsumer, ConsumerRebalanceListener, TopicPartition
 from aiokafka.errors import KafkaError
 
-from settlement_worker import db, envelope, events, failures, metrics, processor, settlement
+from settlement_worker import dead_letter, db, envelope, events, failures, metrics, processor, settlement
+from settlement_worker import dlq as dlq_module
 from settlement_worker.config import (
     AFTER_DB_BEFORE_OFFSET,
     AFTER_PROCESSOR_BEFORE_DB,
@@ -67,6 +72,8 @@ FAILED_COMMITS = 2
 
 def classify(record) -> AuthorizedEvent | OwnResultEvent:
     """Parse a record and check its key, touching neither the DB nor the broker."""
+    if record.value is None:
+        raise InvalidEvent("record has no value")
     event = envelope.parse(record.value)
     if isinstance(event, AuthorizedEvent):
         try:
@@ -219,15 +226,24 @@ async def process_record(record, *, session: db.DbSession, consumer, config: Con
 class Step(enum.Enum):
     OK = "ok"
     RETRY = "retry"
-    FAILED = "failed"
+    FATAL = "fatal"
     REFUSED = "refused"
 
 
 async def _step(
-    record, tp: TopicPartition, *, session: db.DbSession, consumer, config: Config, state: RetryState, commits, rng
+    record,
+    tp: TopicPartition,
+    *,
+    session: db.DbSession,
+    consumer,
+    config: Config,
+    state: RetryState,
+    commits,
+    dlq,
+    rng,
 ) -> Step:
     """One record: reconnect if the connection was lost, process it; on failure, classify it and
-    either schedule a retry in place or fail."""
+    dead-letter it, schedule a retry in place, or fail."""
     log = structlog.get_logger()
     try:
         if session.broken:
@@ -250,35 +266,102 @@ async def _step(
         if failure.connection:
             session.drop()
         attempt = state.failed(tp, record.offset)
-        exhausted = failure.error_class is ErrorClass.UNCLASSIFIED and attempt >= config.max_attempts
-        if failure.error_class in (ErrorClass.POISON, ErrorClass.FATAL) or exhausted:
+        if failure.error_class is ErrorClass.FATAL:
             _processing_failed(log, record, ex)
-            return Step.FAILED
-        delay = backoff_ms(
-            attempt, base_ms=config.retry_base_ms, max_ms=config.retry_max_ms, jitter=config.retry_jitter, rng=rng
-        )
-        events.emit(
-            log,
-            events.RETRY_SCHEDULED,
-            level="error" if failure.sqlstate == "40P01" else "warning",
-            topic=record.topic,
-            partition=record.partition,
-            offset=record.offset,
-            attempt=attempt,
-            delay_ms=delay,
-            error_class=failure.error_class.value,
-            sqlstate=failure.sqlstate,
-            error=f"{type(ex).__name__}: {ex}",
-            correlation_id=_correlation_id(record),
-        )
-        metrics.RETRIES.labels(error_class=failure.error_class.value, sqlstate=failure.sqlstate or "").inc()
-        # Redelivery to self: back to this record, paused until the backoff ends.
-        consumer.seek(tp, record.offset)
-        consumer.pause(tp)
-        state.schedule(tp, time.monotonic_ns() + delay * 1_000_000)
-        return Step.RETRY
+            return Step.FATAL
+        exhausted = failure.error_class is ErrorClass.UNCLASSIFIED and attempt >= config.max_attempts
+        if failure.error_class is ErrorClass.POISON or exhausted:
+            try:
+                await _dead_letter(record, tp, ex, attempt, failure=failure, config=config, commits=commits, dlq=dlq)
+            except dlq_module.DlqUnavailable as unavailable:
+                # Transient (D-111): re-run the record later, its attempt count kept; no offset commit.
+                return _schedule_retry(
+                    record, tp, unavailable, failures.classify(unavailable), attempt,
+                    consumer=consumer, config=config, state=state, rng=rng,
+                )
+            state.succeeded(tp, record.offset)
+            return Step.OK
+        return _schedule_retry(record, tp, ex, failure, attempt, consumer=consumer, config=config, state=state, rng=rng)
     state.succeeded(tp, record.offset)
     return Step.OK
+
+
+def _schedule_retry(record, tp, ex, failure, attempt, *, consumer, config: Config, state: RetryState, rng) -> Step:
+    """D-108: retry_scheduled, the counter, then seek back to the record and pause its partition."""
+    delay = backoff_ms(
+        attempt, base_ms=config.retry_base_ms, max_ms=config.retry_max_ms, jitter=config.retry_jitter, rng=rng
+    )
+    events.emit(
+        structlog.get_logger(),
+        events.RETRY_SCHEDULED,
+        level="error" if failure.sqlstate == "40P01" else "warning",
+        topic=record.topic,
+        partition=record.partition,
+        offset=record.offset,
+        attempt=attempt,
+        delay_ms=delay,
+        error_class=failure.error_class.value,
+        sqlstate=failure.sqlstate,
+        error=f"{type(ex).__name__}: {ex}",
+        correlation_id=_correlation_id(record),
+    )
+    metrics.RETRIES.labels(error_class=failure.error_class.value, sqlstate=failure.sqlstate or "").inc()
+    # Redelivery to self: back to this record, paused until the backoff ends.
+    consumer.seek(tp, record.offset)
+    consumer.pause(tp)
+    state.schedule(tp, time.monotonic_ns() + delay * 1_000_000)
+    return Step.RETRY
+
+
+def _dead_letter_class(ex: BaseException) -> str:
+    """dlq.error_class: the poison's own type, or Unclassified."""
+    if isinstance(ex, (InvalidEvent, settlement.UnknownPayment, settlement.EventMismatch)):
+        return type(ex).__name__
+    return "Unclassified"
+
+
+async def _dead_letter(record, tp: TopicPartition, ex: BaseException, attempts: int, *, failure, config: Config,
+                       commits, dlq) -> None:
+    """D-111, in this order, after the settle transaction has rolled back: produce the original
+    record to the DLQ and await its ack (DlqUnavailable if it fails or runs out of time), then
+    message_dead_lettered and the counter, then commit offset+1 through the normal commit path (a
+    failed commit becomes a pending commit, D-109). Never inside a DB transaction."""
+    try:
+        event = classify(record)
+    except InvalidEvent:
+        event = None
+    error_class = _dead_letter_class(ex)
+    error = f"{type(ex).__name__}: {ex}"
+    letter = dead_letter.build(
+        record,
+        consumer_group=config.consumer_group,
+        error_class=error_class,
+        error=error,
+        attempts=attempts,
+        event_id=event.event_id if event is not None else None,
+        failed_at=datetime.now(timezone.utc),
+    )
+    dlq_partition, dlq_offset = await dlq.produce(letter)
+    events.emit(
+        structlog.get_logger(),
+        events.MESSAGE_DEAD_LETTERED,
+        level="error",
+        topic=record.topic,
+        partition=record.partition,
+        offset=record.offset,
+        error_class=error_class,
+        attempts=attempts,
+        event_id=str(event.event_id) if event is not None else None,
+        error=dead_letter.one_line(error),
+        dlq_partition=dlq_partition,
+        dlq_offset=dlq_offset,
+        correlation_id=event.correlation_id if event is not None else None,
+    )
+    metrics.DEAD_LETTERS.labels(error_class=error_class).inc()
+    try:
+        await commits.commit(tp, record.offset)
+    except OffsetCommitFailed as commit_failed:
+        commits.failed(tp, record.offset, commit_failed)
 
 
 def _processing_failed(log, record, ex: BaseException) -> None:
@@ -397,9 +480,15 @@ async def _consume(config: Config, stop: asyncio.Event, session: db.DbSession) -
         heartbeat_interval_ms=config.heartbeat_interval_ms,
         max_poll_interval_ms=config.max_poll_interval_ms,
     )
+    # Dead letters (D-111): started after the metrics server and before the consumer.
+    dlq = dlq_module.DlqProducer(
+        bootstrap_servers=config.bootstrap_servers, topic=config.dlq_topic, timeout_ms=config.dlq_timeout_ms
+    )
     try:
+        await dlq.start()
         await consumer.start()
     except KafkaError as ex:
+        await dlq.stop()
         await session.close()
         return EXIT_PROCESSING_ERROR, f"broker_unavailable: {ex}"
 
@@ -443,9 +532,9 @@ async def _consume(config: Config, stop: asyncio.Event, session: db.DbSession) -
                         break
                     result = await _step(
                         record, tp, session=session, consumer=consumer, config=config, state=state, commits=commits,
-                        rng=rng,
+                        dlq=dlq, rng=rng,
                     )
-                    if result is Step.FAILED:
+                    if result is Step.FATAL:
                         code, reason = EXIT_PROCESSING_ERROR, "processing_failed"
                         break
                     if result is Step.REFUSED:
@@ -459,5 +548,6 @@ async def _consume(config: Config, stop: asyncio.Event, session: db.DbSession) -
     finally:
         # With auto-commit off, stop() commits nothing; it leaves the group so others take over fast.
         await consumer.stop()
+        await dlq.stop()
         await session.close()
     return code, reason

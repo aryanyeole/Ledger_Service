@@ -1,5 +1,6 @@
 """Shared helpers for the failure_modes tests (D-123): DB reads as the runtime roles, a held escrow
-lock, worker launches, waits, and the container-level outages (D-129).
+lock, a row-lock probe, fresh consumer groups, worker launches, waits, DLQ topics and their records
+(D-111), and the container-level outages (D-129).
 
 DB outages use the real container: docker pause for the hang path, pg_terminate_backend through
 docker exec as the container's superuser for the reset path. Both are admin actions on the server;
@@ -11,10 +12,14 @@ import subprocess
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from aiokafka.errors import GroupCoordinatorNotAvailableError
+import asyncpg
+from aiokafka import AIOKafkaConsumer, TopicPartition
+from aiokafka.errors import CoordinatorNotAvailableError, GroupCoordinatorNotAvailableError, NotCoordinatorError
 
+from support.stack import DLQ_TOPIC, TOPIC, create_topics, topic_partitions
 from support.worker_process import committed_offsets, group_lag, start_worker
 
 CLOCK_ALLOWANCE = timedelta(milliseconds=5)
@@ -114,6 +119,39 @@ def worker(fm, group, *, command=None, **env):
     )
 
 
+def fresh_group(fm, group: str) -> str:
+    """D-123: commits the case's new consumer group at the topic's current end offset on every
+    partition, before its worker starts, so the case sees only the records it publishes itself:
+    records earlier cases left (dead-lettered poison included) never reach it, and case order
+    doesn't matter. A short-lived consumer in that group commits explicitly and closes."""
+    run(_seed_group(fm.kafka.bootstrap_servers, group))
+    return group
+
+
+async def _seed_group(bootstrap: str, group: str) -> None:
+    partitions = sorted(await topic_partitions(bootstrap, TOPIC) or [])
+    assert partitions, f"{TOPIC} has no partitions"
+    seeder = AIOKafkaConsumer(bootstrap_servers=bootstrap, group_id=group, enable_auto_commit=False)
+    await seeder.start()
+    try:
+        tps = [TopicPartition(TOPIC, p) for p in partitions]
+        seeder.assign(tps)
+        ends = await seeder.end_offsets(tps)
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                await seeder.commit(ends)
+                break
+            except (GroupCoordinatorNotAvailableError, CoordinatorNotAvailableError, NotCoordinatorError):
+                # A fresh broker creates the group coordinator on first use.
+                assert time.monotonic() < deadline, f"could not commit group {group}"
+                await asyncio.sleep(0.25)
+    finally:
+        await seeder.stop()
+    committed = await committed_offsets(bootstrap, group)
+    assert committed == {tp.partition: end for tp, end in ends.items()}, (committed, ends)
+
+
 def wait(process_worker, predicate, timeout: float, what: str):
     """Polls predicate until it holds; fails at once if the worker exits first."""
     deadline = time.monotonic() + timeout
@@ -188,6 +226,121 @@ class EscrowHolder:
 
     def __exit__(self, *exc) -> None:
         self.release()
+
+
+@dataclass(frozen=True)
+class DlqRecord:
+    partition: int
+    offset: int
+    key: bytes | None
+    value: bytes | None
+    headers: list[tuple[str, bytes]]
+
+    def header(self, name: str) -> str | None:
+        values = [v for k, v in self.headers if k == name]
+        assert len(values) <= 1, (name, self.headers)
+        return values[0].decode("utf-8") if values else None
+
+    def original(self) -> tuple[str | None, int, int]:
+        return (
+            self.header("dlq.original_topic"),
+            int(self.header("dlq.original_partition")),
+            int(self.header("dlq.original_offset")),
+        )
+
+
+def dlq_records(fm, topic: str = DLQ_TOPIC) -> list[DlqRecord]:
+    """Every record on the DLQ topic, from offset 0, read without a group."""
+    return run(_read_all(fm.kafka.bootstrap_servers, topic))
+
+
+def dead_letters_of(fm, partition: int, offset: int, topic: str = DLQ_TOPIC) -> list[DlqRecord]:
+    """The DLQ records whose dlq.original_* headers name this record of ledger.payments.v1."""
+    return [r for r in dlq_records(fm, topic) if r.original() == (TOPIC, partition, offset)]
+
+
+async def _read_all(bootstrap: str, topic: str) -> list[DlqRecord]:
+    partitions = sorted(await topic_partitions(bootstrap, topic) or [])
+    assert partitions, f"{topic} does not exist"
+    reader = AIOKafkaConsumer(bootstrap_servers=bootstrap, enable_auto_commit=False)
+    await reader.start()
+    found: list[DlqRecord] = []
+    try:
+        tps = [TopicPartition(topic, p) for p in partitions]
+        reader.assign(tps)
+        ends = await reader.end_offsets(tps)
+        for tp in tps:
+            reader.seek(tp, 0)
+        remaining = {tp for tp in tps if ends[tp] > 0}
+        deadline = time.monotonic() + 30
+        while remaining:
+            assert time.monotonic() < deadline, f"could not read {topic} up to {ends}"
+            for tp, records in (await reader.getmany(timeout_ms=500)).items():
+                for r in records:
+                    if r.offset < ends[tp]:
+                        found.append(DlqRecord(r.partition, r.offset, r.key, r.value, list(r.headers)))
+            remaining = {tp for tp in remaining if await reader.position(tp) < ends[tp]}
+    finally:
+        await reader.stop()
+    return found
+
+
+def create_dlq_topic(fm, name: str) -> None:
+    """Creates a DLQ topic as its owner would: 1 partition, retention.ms=-1 (DlqTopicGuard, D-110)."""
+    run(create_topics(fm.kafka.bootstrap_servers, {name: (1, {"retention.ms": "-1"})}))
+
+
+class RowLockProbe:
+    """Tries SELECT ... FOR UPDATE NOWAIT on one payments row as settlement_worker every interval,
+    on its own thread and event loop, until stopped. Each try is its own statement (autocommit), so
+    the probe holds the lock for no longer than that statement. Records (monotonic_s, locked)."""
+
+    def __init__(self, fm, payment_id, interval_s: float = 0.1) -> None:
+        self._fm = fm
+        self._payment_id = payment_id
+        self._interval_s = interval_s
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._error: BaseException | None = None
+        self.samples: list[tuple[float, bool]] = []
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        async def probe():
+            conn = await self._fm.worker_db.connect()
+            try:
+                self._ready.set()
+                while not self._stop.is_set():
+                    try:
+                        await conn.fetch("SELECT id FROM payments WHERE id = $1 FOR UPDATE NOWAIT", self._payment_id)
+                        locked = False
+                    except asyncpg.LockNotAvailableError:
+                        locked = True
+                    self.samples.append((time.monotonic(), locked))
+                    await asyncio.sleep(self._interval_s)
+            finally:
+                await conn.close()
+
+        try:
+            asyncio.run(probe())
+        except BaseException as ex:  # noqa: BLE001 - surfaced by stop()
+            self._error = ex
+            self._ready.set()
+
+    def __enter__(self) -> "RowLockProbe":
+        self._thread.start()
+        assert self._ready.wait(30), "the probe did not connect"
+        assert self._error is None, self._error
+        return self
+
+    def stop(self) -> list[tuple[float, bool]]:
+        self._stop.set()
+        self._thread.join(30)
+        assert self._error is None, self._error
+        return self.samples
+
+    def __exit__(self, *exc) -> None:
+        self.stop()
 
 
 def docker(*args: str) -> str:

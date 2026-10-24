@@ -1,4 +1,11 @@
-"""The per-record step rejects a bad record before touching the DB or the broker (D-081)."""
+"""The per-record step (D-081, D-107, D-108, D-109, D-111).
+
+It rejects a bad record before touching the DB or the broker. The _step tests below drive the
+retry / dead-letter / pending-commit state machine with fake Kafka objects (consumer and DLQ
+producer) and a raising stand-in for the processing step. Ledger, dedup and idempotency logic are
+never faked here (CLAUDE.md): those run against real Postgres in the integration and failure_modes
+tests.
+"""
 
 import asyncio
 import json
@@ -13,6 +20,7 @@ from structlog.testing import capture_logs
 from settlement_worker import consumer
 from settlement_worker.config import Config
 from settlement_worker.envelope import InvalidEvent
+from settlement_worker.dlq import DlqUnavailable
 from settlement_worker.retry import RetryState
 
 PAYMENT = "5b01a9e5-32ce-4c82-90b0-ac8c5143460c"
@@ -25,7 +33,9 @@ class Record:
     partition: int
     offset: int
     key: bytes | None
-    value: bytes
+    value: bytes | None
+    timestamp: int = 1_792_000_000_000
+    headers: tuple = ()
 
 
 class Untouchable:
@@ -146,7 +156,7 @@ def test_failed_offset_commit_is_pending_not_a_retry():
         result = asyncio.run(
             consumer._step(
                 record, tp, session=LiveSession(), consumer=fake, config=config, state=state, commits=commits,
-                rng=random.Random(0),
+                dlq=Untouchable("dlq"), rng=random.Random(0),
             )
         )
     assert result is consumer.Step.OK
@@ -174,7 +184,7 @@ def test_timeout_outside_a_db_call_is_not_db_timeout(monkeypatch):
         result = asyncio.run(
             consumer._step(
                 record, tp, session=session, consumer=fake, config=config, state=RetryState(),
-                commits=Untouchable("commits"), rng=random.Random(0),
+                commits=Untouchable("commits"), dlq=Untouchable("dlq"), rng=random.Random(0),
             )
         )
     assert result is consumer.Step.RETRY
@@ -190,3 +200,126 @@ def test_timeout_outside_a_db_call_is_not_db_timeout(monkeypatch):
 def test_matching_key_is_accepted_case_insensitively():
     event = consumer.classify(Record("t", 0, 0, PAYMENT.upper().encode(), _value()))
     assert str(event.payment_id) == PAYMENT
+
+
+def test_a_null_value_is_invalid():
+    with pytest.raises(InvalidEvent, match="record has no value"):
+        consumer.classify(Record("ledger.payments.v1", 0, 1, PAYMENT.encode(), None))
+
+
+NOT_JSON = bytes([0xFF]) + b" not json"  # not UTF-8 either
+
+
+class Sequence:
+    """One ordered log shared by the fake consumer and the fake DLQ producer."""
+
+    def __init__(self):
+        self.calls = []
+
+
+class FakeConsumer:
+    """Commits succeed; seeks and pauses are recorded."""
+
+    def __init__(self, seq):
+        self.seq = seq
+
+    async def commit(self, offsets):
+        self.seq.calls.append(("commit", {tp.partition: off for tp, off in offsets.items()}))
+
+    def seek(self, tp, offset):
+        self.seq.calls.append(("seek", tp.partition, offset))
+
+    def pause(self, *tps):
+        self.seq.calls.append(("pause", *[tp.partition for tp in tps]))
+
+
+class FakeDlq:
+    """A DLQ producer that fails the first `failures` produces with DlqUnavailable."""
+
+    def __init__(self, seq, failures=0):
+        self.seq = seq
+        self.failures = failures
+        self.letters = []
+
+    async def produce(self, letter):
+        if self.failures > 0:
+            self.failures -= 1
+            self.seq.calls.append(("produce-failed",))
+            raise DlqUnavailable("dead letter to ledger.payments.dlq.v1 not acknowledged: KafkaTimeoutError")
+        self.letters.append(letter)
+        self.seq.calls.append(("produce", len(self.letters) - 1))
+        return 0, len(self.letters) - 1
+
+
+def _run_step(record, *, config, state, commits, dlq, fake):
+    return asyncio.run(
+        consumer._step(
+            record, TopicPartition(record.topic, record.partition), session=LiveSession(), consumer=fake,
+            config=config, state=state, commits=commits, dlq=dlq, rng=random.Random(0),
+        )
+    )
+
+
+def _config(**extra):
+    return Config.from_env({"SETTLEMENT_WORKER_PASSWORD": "x", "WORKER_RETRY_JITTER": "0", **extra})
+
+
+# D-111: poison is dead-lettered on its first failure: produce (ack) -> message_dead_lettered ->
+# commit offset+1, in that order; attempts=1; the original bytes go out unchanged.
+def test_poison_is_dead_lettered_on_its_first_failure_then_committed():
+    seq = Sequence()
+    fake, dlq = FakeConsumer(seq), FakeDlq(seq)
+    record = Record("ledger.payments.v1", 1, 12, b"some-key", NOT_JSON)
+    config, state = _config(), RetryState()
+    commits = consumer.Commits(fake, config, random.Random(0))
+    with capture_logs() as logs:
+        result = _run_step(record, config=config, state=state, commits=commits, dlq=dlq, fake=fake)
+    assert result is consumer.Step.OK
+    assert seq.calls == [("produce", 0), ("commit", {1: 13})]
+    letter = dlq.letters[0]
+    assert (letter.key, letter.value) == (b"some-key", NOT_JSON)
+    headers = dict(letter.headers)
+    assert (headers["dlq.error_class"], headers["dlq.attempts"]) == (b"InvalidEvent", b"1")
+    assert "dlq.event_id" not in headers
+    assert [entry["event"] for entry in logs] == ["message_dead_lettered"]
+    assert logs[0]["log_level"] == "error"
+    assert (logs[0]["error_class"], logs[0]["attempts"], logs[0]["dlq_offset"]) == ("InvalidEvent", 1, 0)
+    assert state.attempts(TopicPartition(record.topic, record.partition), 12) == 0
+
+
+# D-111: a DLQ produce that fails is transient: the record is re-run on the D-108 schedule, nothing
+# is committed, and no message_dead_lettered is emitted.
+def test_a_failed_dlq_produce_is_retried_and_nothing_is_committed():
+    seq = Sequence()
+    fake, dlq = FakeConsumer(seq), FakeDlq(seq, failures=1)
+    record = Record("ledger.payments.v1", 1, 12, None, b"not json")
+    config, state = _config(), RetryState()
+    commits = consumer.Commits(fake, config, random.Random(0))
+    with capture_logs() as logs:
+        result = _run_step(record, config=config, state=state, commits=commits, dlq=dlq, fake=fake)
+    assert result is consumer.Step.RETRY
+    assert seq.calls == [("produce-failed",), ("seek", 1, 12), ("pause", 1)]
+    assert [entry["event"] for entry in logs] == ["retry_scheduled"]
+    assert logs[0]["error"].startswith("DlqUnavailable: ")
+    assert (logs[0]["error_class"], logs[0]["attempt"]) == ("Transient", 1)
+
+
+# D-111: the attempt count survives DlqUnavailable. An Unclassified record exhausted at attempt 5
+# whose dead letter fails once is dead-lettered on its 6th run (dlq.attempts=6), not given 5 more.
+def test_an_exhausted_record_hit_by_dlq_unavailable_is_dead_lettered_on_its_next_run(monkeypatch):
+    def broken_processor(*args, **kwargs):
+        raise RuntimeError("bug in the processing step")
+
+    monkeypatch.setattr(consumer.processor, "decide", broken_processor)
+    seq = Sequence()
+    fake, dlq = FakeConsumer(seq), FakeDlq(seq, failures=1)
+    record = Record("ledger.payments.v1", 0, 3, PAYMENT.encode(), _value())
+    config, state = _config(), RetryState()
+    commits = consumer.Commits(fake, config, random.Random(0))
+    results = [_run_step(record, config=config, state=state, commits=commits, dlq=dlq, fake=fake) for _ in range(6)]
+    assert results == [consumer.Step.RETRY] * 5 + [consumer.Step.OK]
+    assert [c[0] for c in seq.calls if c[0].startswith("produce")] == ["produce-failed", "produce"]
+    headers = dict(dlq.letters[0].headers)
+    assert (headers["dlq.error_class"], headers["dlq.attempts"]) == (b"Unclassified", b"6")
+    assert headers["dlq.event_id"] == OTHER.encode()
+    assert seq.calls[-1] == ("commit", {0: 4})

@@ -23,6 +23,7 @@ METRICS_LISTENING = "metrics_listening"
 RETRY_SCHEDULED = "retry_scheduled"
 DB_RECONNECTED = "db_reconnected"
 OFFSET_COMMIT_FAILED = "offset_commit_failed"
+MESSAGE_DEAD_LETTERED = "message_dead_lettered"
 
 EVENT_KEYS: dict[str, frozenset[str]] = {
     FAULT_INJECTED: frozenset({"point", "payment_id", "correlation_id"}),
@@ -42,6 +43,10 @@ EVENT_KEYS: dict[str, frozenset[str]] = {
     ),
     DB_RECONNECTED: frozenset({"attempt", "current_user", "correlation_id"}),
     OFFSET_COMMIT_FAILED: frozenset({"topic", "partition", "offset", "attempt", "delay_ms", "error", "correlation_id"}),
+    MESSAGE_DEAD_LETTERED: frozenset(
+        {"topic", "partition", "offset", "error_class", "attempts", "event_id", "error", "dlq_partition",
+         "dlq_offset", "correlation_id"}
+    ),
 }
 
 LEVELS = frozenset({"info", "warning", "error"})
