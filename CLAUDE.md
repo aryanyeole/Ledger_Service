@@ -40,5 +40,6 @@ Exception (D-017): negative-control tests may deliberately violate invariants 6�
 - Never commit or push directly to `main`. Never merge, force-push, or rewrite pushed history — I merge.
 - Never rewrite main's history. Bring a PR branch up to date by merging main into it, not by rebasing a pushed branch.
 - Before pushing: run the tests for every service touched and paste the summary.
-- PR description: Task (M<n> T<k>) · What changed · Invariants touched (1–7 or none) · Tests run + result · Decision Log rows needed (or none) · Bug log entries (or none).
+- Before pushing, list every test removed or renamed relative to main: git diff main...HEAD -U0 -- services | Select-String -Pattern '^-\s*(@Test|@ParameterizedTest|(async\s+)?def test_\w+|class \w+Test\b)'. A green suite or a higher test count doesn't show that nothing was lost.
+- PR description: Task (M<n> T<k>) · What changed · Invariants touched (1–7 or none) · Tests run + result · Tests removed or renamed (from the check below, each with its reason; or none) · Decision Log rows needed (or none) · Bug log entries (or none).
 - Open the PR with `gh pr create` if the GitHub CLI is installed and authenticated; otherwise push the branch and give me the compare URL.
