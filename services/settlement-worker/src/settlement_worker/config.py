@@ -1,4 +1,4 @@
-"""The worker's configuration, from the environment (D-081, D-085, D-091, D-108, D-109, D-113, D-125, D-129).
+"""The worker's configuration, from the environment (D-081, D-085, D-091, D-108, D-109, D-111, D-113, D-125, D-129).
 
 Names follow .env.example where it has them. Anything invalid is a ConfigError, and the worker
 refuses to start (exit 2). The password is never part of an error message or the repr.
@@ -19,6 +19,7 @@ RAISE_BEFORE_COMMIT = "RAISE_BEFORE_COMMIT"
 FAIL_OFFSET_COMMIT = "FAIL_OFFSET_COMMIT"
 FAULT_POINTS = (AFTER_PROCESSOR_BEFORE_DB, AFTER_DB_BEFORE_OFFSET, RAISE_BEFORE_COMMIT, FAIL_OFFSET_COMMIT)
 
+_TOPIC_NAME = re.compile(r"[a-zA-Z0-9._-]{1,249}")
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
@@ -49,6 +50,8 @@ class Config:
     retry_jitter: bool
     db_command_timeout_ms: int
     max_poll_interval_ms: int
+    dlq_topic: str
+    dlq_timeout_ms: int
 
     @property
     def fault_armed(self) -> bool:
@@ -119,6 +122,15 @@ class Config:
                 f"WORKER_LOCK_TIMEOUT_MS ({lock_timeout_ms})"
             )
         jitter = env.get("WORKER_RETRY_JITTER", "1")
+        # Dead letters (D-111): Kafka's topic naming rule, and never the topic being consumed.
+        topic = text("LEDGER_PAYMENTS_TOPIC", "ledger.payments.v1")
+        dlq_topic = text("WORKER_DLQ_TOPIC", "ledger.payments.dlq.v1")
+        if not _TOPIC_NAME.fullmatch(dlq_topic) or dlq_topic in (".", ".."):
+            raise ConfigError(
+                f"WORKER_DLQ_TOPIC must be 1-249 characters of [a-zA-Z0-9._-], not '.' or '..', was {dlq_topic!r}"
+            )
+        if dlq_topic == topic:
+            raise ConfigError(f"WORKER_DLQ_TOPIC must differ from LEDGER_PAYMENTS_TOPIC, both were {topic!r}")
         if jitter not in ("0", "1"):
             raise ConfigError(f"WORKER_RETRY_JITTER must be 0 or 1, was {jitter!r}")
 
@@ -128,7 +140,7 @@ class Config:
             postgres_db=text("POSTGRES_DB", "ledger"),
             worker_password=password,
             bootstrap_servers=text("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
-            topic=text("LEDGER_PAYMENTS_TOPIC", "ledger.payments.v1"),
+            topic=topic,
             consumer_group=text("WORKER_CONSUMER_GROUP", "settlement-worker"),
             session_timeout_ms=session,
             heartbeat_interval_ms=heartbeat,
@@ -147,4 +159,6 @@ class Config:
             db_command_timeout_ms=command_timeout_ms,
             # aiokafka passes it to the broker as the int32 rebalance timeout; it doesn't validate it.
             max_poll_interval_ms=integer("WORKER_MAX_POLL_INTERVAL_MS", "300000", 1, 2_147_483_647),
+            dlq_topic=dlq_topic,
+            dlq_timeout_ms=integer("WORKER_DLQ_TIMEOUT_MS", "10000", 1, 600_000),
         )

@@ -36,6 +36,18 @@ def test_contract():
         ],
         "db_reconnected": ["attempt", "correlation_id", "current_user"],
         "offset_commit_failed": ["attempt", "correlation_id", "delay_ms", "error", "offset", "partition", "topic"],
+        "message_dead_lettered": [
+            "attempts",
+            "correlation_id",
+            "dlq_offset",
+            "dlq_partition",
+            "error",
+            "error_class",
+            "event_id",
+            "offset",
+            "partition",
+            "topic",
+        ],
     }
 
 

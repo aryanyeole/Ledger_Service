@@ -122,6 +122,28 @@ def test_invalid_db_and_poll_config(overrides, message):
         Config.from_env(_env(**overrides))
 
 
+def test_dlq_defaults():
+    config = Config.from_env(_env())
+    assert (config.dlq_topic, config.dlq_timeout_ms) == ("ledger.payments.dlq.v1", 10000)
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"WORKER_DLQ_TOPIC": "ledger.payments.v1"}, "must differ from LEDGER_PAYMENTS_TOPIC"),
+        ({"LEDGER_PAYMENTS_TOPIC": "t", "WORKER_DLQ_TOPIC": "t"}, "must differ"),
+        ({"WORKER_DLQ_TOPIC": "dead letters"}, "WORKER_DLQ_TOPIC must be 1-249 characters"),
+        ({"WORKER_DLQ_TOPIC": "d" * 250}, "WORKER_DLQ_TOPIC must be 1-249 characters"),
+        ({"WORKER_DLQ_TOPIC": ".."}, "WORKER_DLQ_TOPIC must be 1-249 characters"),
+        ({"WORKER_DLQ_TIMEOUT_MS": "0"}, "WORKER_DLQ_TIMEOUT_MS"),
+        ({"WORKER_DLQ_TIMEOUT_MS": "600001"}, "WORKER_DLQ_TIMEOUT_MS"),
+    ],
+)
+def test_invalid_dlq_config(overrides, message):
+    with pytest.raises(ConfigError, match=message):
+        Config.from_env(_env(**overrides))
+
+
 def test_fail_offset_commit_follows_the_arming_rules():
     armed = Config.from_env(_env(FAULT_POINT="FAIL_OFFSET_COMMIT", FAULT_PAYMENT_ID=PAYMENT))
     assert armed.fault_armed and armed.fault_point == "FAIL_OFFSET_COMMIT"

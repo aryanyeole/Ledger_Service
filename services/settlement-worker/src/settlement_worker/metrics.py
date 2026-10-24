@@ -1,7 +1,7 @@
 """The worker's /metrics endpoint (D-113).
 
 prometheus_client's own HTTP server, on its default registry, in a daemon thread. Application
-metrics are module-level collectors on that registry: RETRIES (D-108). The host and
+metrics are module-level collectors on that registry: RETRIES (D-108), DEAD_LETTERS (D-111). The host and
 port reported are the ones the server actually bound (server_address), so port 0 works. Any OSError
 while binding, an unresolvable host included, is a MetricsBindError: the worker treats it as
 invalid configuration (exit 2).
@@ -14,6 +14,8 @@ from prometheus_client import Counter, start_http_server
 
 # Exposed as settlement_retries_total; sqlstate is "" when the failure has none.
 RETRIES = Counter("settlement_retries", "Records scheduled for a retry in place (D-108)", ["error_class", "sqlstate"])
+# Exposed as settlement_dead_letters_total (D-111).
+DEAD_LETTERS = Counter("settlement_dead_letters", "Records dead-lettered to the DLQ topic (D-111)", ["error_class"])
 
 
 class MetricsBindError(RuntimeError):

@@ -1,5 +1,6 @@
 """DB connection loss and failed offset commits (D-109, D-129) on real worker processes, on its own
-failure_modes stack. Cases run in order; each restores the container before the next.
+failure_modes stack. Each case restores the container before the next, and starts its own consumer
+group at the topic's end offsets (fresh_group, D-123), so it sees only the records it publishes.
 
 (a) Hang: the Postgres container is paused (docker pause) while P is being settled. Every DB call
     and every reconnect ends at the command timeout as DbTimeout and is retried; the worker never
@@ -34,6 +35,7 @@ from support.failure_kit import (
     assert_not_past,
     committed,
     dedup_rows,
+    fresh_group,
     funded_pair,
     postings,
     results,
@@ -58,7 +60,7 @@ def _settled_once(fm, group, payment) -> None:
 
 # (a)
 def test_a_paused_database_times_out_retries_and_reconnects(fm):
-    group = "conn-hang"
+    group = fresh_group(fm, "conn-hang")
     customer, merchant = funded_pair(fm)
     payment = fm.api.authorize(customer, merchant, "10.00")
     values = fm.read_events(payment)  # before the pause
@@ -98,7 +100,7 @@ def test_a_paused_database_times_out_retries_and_reconnects(fm):
 
 # (b)
 def test_a_backend_killed_inside_the_transaction_reconnects(fm):
-    group = "conn-reset"
+    group = fresh_group(fm, "conn-reset")
     customer, merchant = funded_pair(fm)
     payment = fm.api.authorize(customer, merchant, "10.00")
 
@@ -124,7 +126,7 @@ def test_a_backend_killed_inside_the_transaction_reconnects(fm):
 
 # (c)
 def test_a_reconnect_with_the_wrong_role_exits_2(fm):
-    group = "conn-role-swap"
+    group = fresh_group(fm, "conn-role-swap")
     customer, merchant = funded_pair(fm)
     payment = fm.api.authorize(customer, merchant, "10.00")
 
@@ -163,14 +165,11 @@ def _publish_until(fm, customer, merchant, predicate, limit: int = 12):
 
 # (d)
 def test_a_failed_offset_commit_is_recommitted_not_rerun(fm):
-    group = "commit-fail"
+    group = fresh_group(fm, "commit-fail")
     backoff = {"WORKER_RETRY_BASE_MS": 1000, "WORKER_RETRY_MAX_MS": 4000}
     customer, merchant = funded_pair(fm)
     payment = fm.api.authorize(customer, merchant, "10.00")
 
-    with worker(fm, group, **backoff) as primer:
-        wait_idle(fm, primer, group)
-        assert primer.stop() == 0
     fm.publish(payment)
     partition, offset = fm.position(payment)
 
@@ -203,14 +202,11 @@ def test_a_failed_offset_commit_is_recommitted_not_rerun(fm):
 
 # (e)
 def test_a_stop_with_a_commit_pending_exits_0_and_dedup_absorbs_the_redelivery(fm):
-    group = "commit-fail-stop"
+    group = fresh_group(fm, "commit-fail-stop")
     backoff = {"WORKER_RETRY_BASE_MS": 2000, "WORKER_RETRY_MAX_MS": 2000}
     customer, merchant = funded_pair(fm)
     payment = fm.api.authorize(customer, merchant, "10.00")
 
-    with worker(fm, group) as primer:
-        wait_idle(fm, primer, group)
-        assert primer.stop() == 0
     fm.publish(payment)
     partition, offset = fm.position(payment)
 
@@ -236,14 +232,11 @@ def test_a_stop_with_a_commit_pending_exits_0_and_dedup_absorbs_the_redelivery(f
 
 # (f)
 def test_a_long_pending_commit_keeps_polling_and_stays_in_the_group(fm):
-    group = "commit-fail-poll"
+    group = fresh_group(fm, "commit-fail-poll")
     settings = {"WORKER_MAX_POLL_INTERVAL_MS": 2000, "WORKER_RETRY_BASE_MS": 1500, "WORKER_RETRY_MAX_MS": 3000}
     customer, merchant = funded_pair(fm)
     payment = fm.api.authorize(customer, merchant, "10.00")
 
-    with worker(fm, group) as primer:
-        wait_idle(fm, primer, group)
-        assert primer.stop() == 0
     fm.publish(payment)
     partition, offset = fm.position(payment)
 
@@ -264,7 +257,7 @@ def test_a_long_pending_commit_keeps_polling_and_stays_in_the_group(fm):
 
 # (g)
 def test_a_stop_while_the_database_is_paused_exits_0_within_the_bound(fm):
-    group = "conn-stop-paused"
+    group = fresh_group(fm, "conn-stop-paused")
     command_timeout_ms = 1000
     bound_s = command_timeout_ms / 1000 + 2
 

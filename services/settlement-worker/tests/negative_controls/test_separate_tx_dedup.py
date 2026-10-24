@@ -208,6 +208,7 @@ def ballast(control, tally):
     assert primer.events("retry_scheduled") == [], primer.diagnostics()  # tripwire: nothing in this proof retries in place (D-108, D-123)
     assert primer.events("db_reconnected") == [], primer.diagnostics()  # tripwire (D-109)
     assert primer.events("offset_commit_failed") == [], primer.diagnostics()  # tripwire (D-109)
+    assert primer.events("message_dead_lettered") == [], primer.diagnostics()  # tripwire (D-111)
     assert _status(control, payment) == "AUTHORIZED"
     return payment
 
@@ -233,6 +234,7 @@ def test_separate_transaction_dedup_double_applies(control, ballast, tally, iter
     assert w1.events("retry_scheduled") == [], w1.diagnostics()  # tripwire: nothing in this proof retries in place (D-108, D-123)
     assert w1.events("db_reconnected") == [], w1.diagnostics()  # tripwire (D-109)
     assert w1.events("offset_commit_failed") == [], w1.diagnostics()  # tripwire (D-109)
+    assert w1.events("message_dead_lettered") == [], w1.diagnostics()  # tripwire (D-111)
     assert len(w1.events("fault_injected", point=FAULT_POINT, payment_id=str(target))) == 1, w1.diagnostics()
     w1_calls = w1.events("processor_called", payment_id=str(target))
     assert len(w1_calls) == 1, w1.diagnostics()
@@ -253,6 +255,7 @@ def test_separate_transaction_dedup_double_applies(control, ballast, tally, iter
     assert w2.events("retry_scheduled") == [], w2.diagnostics()  # tripwire: nothing in this proof retries in place (D-108, D-123)
     assert w2.events("db_reconnected") == [], w2.diagnostics()  # tripwire (D-109)
     assert w2.events("offset_commit_failed") == [], w2.diagnostics()  # tripwire (D-109)
+    assert w2.events("message_dead_lettered") == [], w2.diagnostics()  # tripwire (D-111)
 
     # 5. The naive variant FAILS: two balanced postings, two result events, one dedup row.
     postings = _postings(control, target, kind)
