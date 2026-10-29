@@ -254,6 +254,44 @@ def dlq_records(fm, topic: str = DLQ_TOPIC) -> list[DlqRecord]:
     return run(_read_all(fm.kafka.bootstrap_servers, topic))
 
 
+def topic_records(fm, topic: str = TOPIC) -> list[DlqRecord]:
+    """Every record on a topic (ledger.payments.v1 by default), from offset 0, read without a group."""
+    return run(_read_all(fm.kafka.bootstrap_servers, topic))
+
+
+def positions(fm, key: bytes) -> list[tuple[int, int]]:
+    """(partition, offset) of every record on ledger.payments.v1 with this key, in offset order."""
+    return sorted((r.partition, r.offset) for r in topic_records(fm) if r.key == key)
+
+
+def produce_null_record(fm) -> tuple[int, int]:
+    """Writes one record with neither key nor value to ledger.payments.v1 and returns its (partition,
+    offset). aiokafka refuses such a record (producer.send asserts a key or a value), so the broker
+    image's own console producer writes it, through docker exec: with parse.key=true and
+    null.marker=NULL, the line "NULL<TAB>NULL" is a record whose key and value are both null."""
+    assert fm.kafka.container_id, "the stack's Kafka carries no container id"
+    before = {(r.partition, r.offset) for r in topic_records(fm)}
+    result = subprocess.run(
+        [
+            "docker", "exec", "-i", fm.kafka.container_id,
+            "/opt/kafka/bin/kafka-console-producer.sh",
+            "--bootstrap-server", fm.kafka.bootstrap_servers,
+            "--topic", TOPIC,
+            "--reader-property", "parse.key=true",
+            "--reader-property", "null.marker=NULL",
+        ],
+        input="NULL\tNULL\n",
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, f"console producer failed: {result.stdout}{result.stderr}"
+    new = [r for r in topic_records(fm) if (r.partition, r.offset) not in before]
+    assert len(new) == 1 and new[0].key is None and new[0].value is None, new
+    return new[0].partition, new[0].offset
+
+
 def dead_letters_of(fm, partition: int, offset: int, topic: str = DLQ_TOPIC) -> list[DlqRecord]:
     """The DLQ records whose dlq.original_* headers name this record of ledger.payments.v1."""
     return [r for r in dlq_records(fm, topic) if r.original() == (TOPIC, partition, offset)]

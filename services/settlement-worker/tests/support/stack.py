@@ -100,6 +100,8 @@ class AppDb:
 @dataclass(frozen=True)
 class Kafka:
     bootstrap_servers: str
+    # The broker container, for tests that exec a Kafka CLI tool in it (T9).
+    container_id: str | None = None
 
 
 def free_port() -> int:
@@ -288,7 +290,7 @@ def kafka():
     try:
         bootstrap = f"127.0.0.1:{port}"
         asyncio.run(_wait_for_broker(bootstrap, time.monotonic() + 60))
-        yield Kafka(bootstrap_servers=bootstrap)
+        yield Kafka(bootstrap_servers=bootstrap, container_id=container.get_wrapped_container().id)
     finally:
         container.stop()
 

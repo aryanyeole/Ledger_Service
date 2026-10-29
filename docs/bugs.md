@@ -23,7 +23,7 @@
 | BUG-004 | 2026-10-19 19:45 | M3 | OutboxRedeliveryTest case 2 depends on an earlier test having opened the producer's leader connection | P3 proof evidence, D-099 (component: ledger-api tests) | fixed | e1aa6dc (PR #32) |
 | BUG-005 | 2026-10-19 23:25 | M3 | OppositeTransfersNoDeadlockTest misses the D-067 server-overlap floor on CI | P2 proof evidence, D-067 (component: ledger-api tests) | fixed | c54fae3 (PR #37) |
 | BUG-006 | 2026-10-20 00:18 | M3 | KafkaTopicReader finds no partitions for a topic created moments earlier | none (component: ledger-api tests) | fixed | 0eef4b2 (PR #38) |
-| BUG-007 | 2026-10-28 19:22 | M4 | A dead letter whose envelope parsed but failed a later check carries no dlq.event_id | D-111 (component: settlement-worker) | fixed | a03f730 (PR #52) |
+| BUG-007 | 2026-10-28 19:22 | M4 | A dead letter whose envelope parsed but failed a later check carries no dlq.event_id | D-111 (component: settlement-worker) | fixed | da44581 (PR #52) |
 
 ---
 
@@ -378,7 +378,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
   - T7's dead-letter unit tests covered only two shapes: a value that isn't JSON, which never parses, and correctly keyed events (the exhausted Unclassified record).
   - `dead_letter.build`'s own tests pass `event_id` in directly, so they can't see how the caller derives it.
   - No test dead-lettered a record whose envelope parses but whose key check fails. T9's plan was the first to list that shape against D-111's "if the envelope parsed".
-- **Fix:** `_dead_letter` now reads the event with `envelope.parse(record.value)` whenever the value is present and parses, independently of the checks after it (the record key, the payment row). If parsing fails, `dlq.event_id` stays absent and both log fields stay null. Nothing else changes: `classify`, the error class, `dlq.attempts`, the commit order, and `retry_scheduled`'s correlation id are as before. Commit `a03f730` · PR #52.
+- **Fix:** `_dead_letter` now reads the event with `envelope.parse(record.value)` whenever the value is present and parses, independently of the checks after it (the record key, the payment row). If parsing fails, `dlq.event_id` stays absent and both log fields stay null. Nothing else changes: `classify`, the error class, `dlq.attempts`, the commit order, and `retry_scheduled`'s correlation id are as before. Commit `a03f730` · PR #52, squash-merged to `main` as `da44581`.
 - **Regression test:** `services/settlement-worker/tests/unit/test_consumer_step.py::test_a_mis_keyed_record_is_dead_lettered_with_its_envelopes_event_id`. It sends a valid envelope under a different record key, with `correlation_id` `c-mis-keyed`, through `_step` with the T7 fakes. It expects one produce with `dlq.event_id` = the envelope's `event_id`, the commit after it, and `message_dead_lettered` with that `event_id` and `c-mis-keyed`.
   - **Red before:** commit `0357cce`, 2026-10-28 19:37:14:
     ```

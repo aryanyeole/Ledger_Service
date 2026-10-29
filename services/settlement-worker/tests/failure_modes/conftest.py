@@ -36,8 +36,9 @@ class FailureModesStack:
         """(payment_id, record value) from the outbox, read before anything that takes the DB away."""
         return asyncio.run(_read_events(self, payment_ids))
 
-    def produce(self, values: list[tuple]) -> None:
-        asyncio.run(_produce(self.kafka.bootstrap_servers, values))
+    def produce(self, values: list[tuple], headers: list[tuple[str, bytes]] | None = None) -> None:
+        """(payment_id, value) pairs, keyed by payment_id; headers, if given, go on every record."""
+        asyncio.run(_produce(self.kafka.bootstrap_servers, values, headers))
 
     def position(self, payment_id) -> tuple[int, int]:
         """(partition, offset) of the payment's payment.authorized record, read from the topic
@@ -79,12 +80,12 @@ async def _read_events(fm: FailureModesStack, payment_ids) -> list[tuple]:
         await conn.close()
 
 
-async def _produce(bootstrap: str, values: list[tuple]) -> None:
+async def _produce(bootstrap: str, values: list[tuple], headers: list[tuple[str, bytes]] | None = None) -> None:
     producer = AIOKafkaProducer(bootstrap_servers=bootstrap, acks="all", enable_idempotence=True)
     await producer.start()
     try:
         for pid, value in values:
-            await producer.send_and_wait(stack.TOPIC, value, key=str(pid).encode())
+            await producer.send_and_wait(stack.TOPIC, value, key=str(pid).encode(), headers=headers)
     finally:
         await producer.stop()
 
