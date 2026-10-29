@@ -1,17 +1,20 @@
 """The consume loop: offsets after the DB commit, retry in place, reconnect, pending offset commits,
-dead letters, fault points (D-014, D-081, D-085, D-107, D-108, D-109, D-111, D-125, D-129).
+dead letters, processor failures, fault points (D-014, D-081, D-085, D-107, D-108, D-109, D-111, D-112,
+D-125, D-129).
 
 Records are processed one at a time, in partition order. For each record:
   0. if the DB connection was lost, reconnect first (the role check runs again; a refusal exits 2);
   1. envelope.parse (D-102) and, for payment.authorized, the record key must equal
      data.payment_id. Both happen before the DB or the broker is touched;
   2. the worker's own payment.settled / payment.failed: commit offset+1, no DB write;
-  3. payment.authorized: processor.decide on every delivery, before the dedup check (its
-     idempotency stays visible to the crash test) -> settlement.handle, which commits its own
+  3. payment.authorized: processor.call on every delivery, before the dedup check (its
+     idempotency stays visible to the crash test), outside any DB transaction and under
+     WORKER_PROCESSOR_TIMEOUT_MS (D-112) -> settlement.handle, which commits its own
      transaction (D-082) -> commit offset+1. Committing the offset only after the DB commit means
      a crash between them redelivers the record, and the dedup row absorbs it (invariant 6).
 A failure is classified (failures.classify, D-107). Transient (indefinitely) and Unclassified (up
-to WORKER_MAX_ATTEMPTS) are retried in place (D-108): a redelivery to self that seeks the
+to WORKER_MAX_ATTEMPTS Unclassified failures; transient ones don't count, D-112) are retried in
+place (D-108): a redelivery to self that seeks the
 partition back to the record, pauses it, drops the rest of its fetched records and resumes it after
 the backoff, while other partitions keep moving. A lost DB connection is terminated first, and
 each re-run reconnects (D-109); a timeout or loss during COMMIT leaves the outcome unknown, and the
@@ -57,6 +60,7 @@ from settlement_worker.config import (
 )
 from settlement_worker.envelope import AuthorizedEvent, InvalidEvent, OwnResultEvent
 from settlement_worker.failures import ErrorClass
+from settlement_worker.processor import ProcessorTimeout
 from settlement_worker.retry import PendingCommits, RetryState, backoff_ms
 
 EXIT_STOPPED = 0
@@ -195,13 +199,46 @@ def _raise_before_commit(config: Config, event: AuthorizedEvent):
     return fault
 
 
-async def process_record(record, *, session: db.DbSession, consumer, config: Config, commits: Commits) -> None:
+async def _call_processor(event: AuthorizedEvent, attempt: int, config: Config) -> processor.Decision:
+    """D-112: the processor call, outside any DB transaction, under WORKER_PROCESSOR_TIMEOUT_MS. Only
+    this deadline's expiry becomes ProcessorTimeout (after processor_timeout); a TimeoutError the
+    call raises itself stays what it is (wait_for couldn't tell the two apart)."""
+    timeout_ms = config.processor_timeout_ms
+    try:
+        async with asyncio.timeout(timeout_ms / 1000) as deadline:
+            return await processor.call(
+                event.payment_id,
+                event.amount,
+                attempt,
+                timeout_ms=timeout_ms,
+                outage=config.processor_outage,
+                correlation_id=event.correlation_id,
+            )
+    except TimeoutError as ex:
+        if not deadline.expired():
+            raise
+        events.emit(
+            structlog.get_logger(),
+            events.PROCESSOR_TIMEOUT,
+            level="warning",
+            payment_id=str(event.payment_id),
+            attempt=attempt,
+            timeout_ms=timeout_ms,
+            correlation_id=event.correlation_id,
+        )
+        raise ProcessorTimeout(f"processor did not answer within {timeout_ms} ms (attempt {attempt})") from ex
+
+
+async def process_record(
+    record, *, session: db.DbSession, consumer, config: Config, commits: Commits, attempt: int
+) -> None:
+    """attempt: this run's number (D-108, D-112), passed to the processor."""
     event = classify(record)
     tp = TopicPartition(record.topic, record.partition)
     if isinstance(event, OwnResultEvent):
         await commits.commit(tp, record.offset)
         return
-    decision = processor.decide(event.payment_id, event.amount, correlation_id=event.correlation_id)
+    decision = await _call_processor(event, attempt, config)
     _fault(config, AFTER_PROCESSOR_BEFORE_DB, event)
     try:
         await settlement.handle(
@@ -248,7 +285,10 @@ async def _step(
     try:
         if session.broken:
             await session.reconnect()
-        await process_record(record, session=session, consumer=consumer, config=config, commits=commits)
+        await process_record(
+            record, session=session, consumer=consumer, config=config, commits=commits,
+            attempt=state.attempts(tp, record.offset) + 1,
+        )
     except db.WorkerRoleError as ex:
         events.emit(log, events.CONFIG_INVALID, level="error", error=str(ex), correlation_id=None)
         return Step.REFUSED
@@ -269,7 +309,12 @@ async def _step(
         if failure.error_class is ErrorClass.FATAL:
             _processing_failed(log, record, ex)
             return Step.FATAL
-        exhausted = failure.error_class is ErrorClass.UNCLASSIFIED and attempt >= config.max_attempts
+        # Exhaustion counts Unclassified failures only (D-112): a long outage or lock storm doesn't
+        # leave the record one unclassified error away from the DLQ. attempt counts every run.
+        exhausted = (
+            failure.error_class is ErrorClass.UNCLASSIFIED
+            and state.failed_unclassified(tp, record.offset) >= config.max_attempts
+        )
         if failure.error_class is ErrorClass.POISON or exhausted:
             try:
                 await _dead_letter(record, tp, ex, attempt, failure=failure, config=config, commits=commits, dlq=dlq)
@@ -394,13 +439,14 @@ def _wait_ms(now_ns: int, *deadlines: int | None) -> int:
 
 
 def announce_start(log, config: Config) -> None:
-    """worker_started; WARNING when a fault is armed (D-085)."""
+    """worker_started; WARNING when a fault is armed (D-085) or the processor outage is on (D-112)."""
     events.emit(
         log,
         events.WORKER_STARTED,
-        level="warning" if config.fault_armed else "info",
+        level="warning" if config.fault_armed or config.processor_outage else "info",
         consumer_group=config.consumer_group,
         fault_point=config.fault_point,
+        processor_outage=config.processor_outage,
         correlation_id=None,
     )
 

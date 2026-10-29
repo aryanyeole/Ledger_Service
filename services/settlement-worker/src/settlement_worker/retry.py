@@ -2,8 +2,12 @@
 offset commits (D-109). Pure: no Kafka.
 
 delay(attempt) = min(cap, base * 2^(attempt - 1)) milliseconds; with jitter, a uniform integer in
-[0, delay]. Integers throughout (D-093). Attempts are counted per (topic, partition, offset) and
-forgotten on success and on revoke; a revoke also cancels the partition's pending resume.
+[0, delay]. Integers throughout (D-093). Two counts per (topic, partition, offset), both forgotten
+on success and on revoke (a revoke also cancels the partition's pending resume), and both in memory,
+so a restart starts them again (D-108):
+  attempts      every failed run: the backoff, retry_scheduled.attempt, the attempt the processor
+                is called with (this run's number = attempts + 1) and dlq.attempts;
+  unclassified  Unclassified failures only: exhaustion at WORKER_MAX_ATTEMPTS (D-112).
 Deadlines are time.monotonic_ns() values.
 """
 
@@ -23,6 +27,7 @@ def backoff_ms(attempt: int, *, base_ms: int, max_ms: int, jitter: bool, rng: ra
 class RetryState:
     def __init__(self) -> None:
         self._attempts: dict[tuple[str, int, int], int] = {}
+        self._unclassified: dict[tuple[str, int, int], int] = {}
         self._resume_at: dict[TopicPartition, int] = {}
 
     def failed(self, tp: TopicPartition, offset: int) -> int:
@@ -31,8 +36,15 @@ class RetryState:
         self._attempts[key] = self._attempts.get(key, 0) + 1
         return self._attempts[key]
 
+    def failed_unclassified(self, tp: TopicPartition, offset: int) -> int:
+        """Counts an Unclassified failure of this record (besides failed()); returns how many it has had."""
+        key = (tp.topic, tp.partition, offset)
+        self._unclassified[key] = self._unclassified.get(key, 0) + 1
+        return self._unclassified[key]
+
     def succeeded(self, tp: TopicPartition, offset: int) -> None:
         self._attempts.pop((tp.topic, tp.partition, offset), None)
+        self._unclassified.pop((tp.topic, tp.partition, offset), None)
 
     def attempts(self, tp: TopicPartition, offset: int) -> int:
         return self._attempts.get((tp.topic, tp.partition, offset), 0)
@@ -40,6 +52,7 @@ class RetryState:
     def revoked(self, tps: Iterable[TopicPartition]) -> None:
         gone = set(tps)
         self._attempts = {k: v for k, v in self._attempts.items() if TopicPartition(k[0], k[1]) not in gone}
+        self._unclassified = {k: v for k, v in self._unclassified.items() if TopicPartition(k[0], k[1]) not in gone}
         for tp in gone:
             self._resume_at.pop(tp, None)
 

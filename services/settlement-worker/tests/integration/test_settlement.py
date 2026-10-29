@@ -106,7 +106,7 @@ def _authorize(api, amount, *, correlation_id=None):
 
 async def _handle(conn, raw):
     event = envelope.parse(raw)
-    decision = processor.decide(event.payment_id, event.amount, correlation_id=event.correlation_id)
+    decision = processor.decide(event.amount)  # the pure decision (D-112); these cases test settlement.handle
     return await settlement.handle(conn, event, decision, consumer_group=GROUP, topic=TOPIC, lock_timeout=LOCK_TIMEOUT)
 
 

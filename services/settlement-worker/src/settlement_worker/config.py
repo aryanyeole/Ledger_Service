@@ -1,4 +1,5 @@
-"""The worker's configuration, from the environment (D-081, D-085, D-091, D-108, D-109, D-111, D-113, D-125, D-129).
+"""The worker's configuration, from the environment (D-081, D-085, D-091, D-108, D-109, D-111, D-112, D-113,
+D-125, D-129).
 
 Names follow .env.example where it has them. Anything invalid is a ConfigError, and the worker
 refuses to start (exit 2). The password is never part of an error message or the repr.
@@ -52,6 +53,8 @@ class Config:
     max_poll_interval_ms: int
     dlq_topic: str
     dlq_timeout_ms: int
+    processor_timeout_ms: int
+    processor_outage: bool
 
     @property
     def fault_armed(self) -> bool:
@@ -133,6 +136,10 @@ class Config:
             raise ConfigError(f"WORKER_DLQ_TOPIC must differ from LEDGER_PAYMENTS_TOPIC, both were {topic!r}")
         if jitter not in ("0", "1"):
             raise ConfigError(f"WORKER_RETRY_JITTER must be 0 or 1, was {jitter!r}")
+        # The fake processor's outage (D-112): every call unavailable; announced like an armed fault.
+        outage = env.get("FAKE_PROCESSOR_OUTAGE", "")
+        if outage not in ("", "0", "1"):
+            raise ConfigError(f"FAKE_PROCESSOR_OUTAGE must be 0 or 1, was {outage!r}")
 
         return cls(
             postgres_host=text("POSTGRES_HOST", "localhost"),
@@ -161,4 +168,7 @@ class Config:
             max_poll_interval_ms=integer("WORKER_MAX_POLL_INTERVAL_MS", "300000", 1, 2_147_483_647),
             dlq_topic=dlq_topic,
             dlq_timeout_ms=integer("WORKER_DLQ_TIMEOUT_MS", "10000", 1, 600_000),
+            # The deadline on each processor call (D-112).
+            processor_timeout_ms=integer("WORKER_PROCESSOR_TIMEOUT_MS", "2000", 1, 60_000),
+            processor_outage=outage == "1",
         )

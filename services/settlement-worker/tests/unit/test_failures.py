@@ -7,6 +7,7 @@ from settlement_worker.db import DbTimeout, DbUnavailable
 from settlement_worker.dlq import DlqUnavailable
 from settlement_worker.envelope import InvalidEvent
 from settlement_worker.failures import ErrorClass, Failure, classify
+from settlement_worker.processor import ProcessorTimeout, ProcessorUnavailable
 from settlement_worker.settlement import EscrowShortfall, EventMismatch, MissingAccount, SettlementError, UnknownPayment
 
 T, P, U, F = ErrorClass.TRANSIENT, ErrorClass.POISON, ErrorClass.UNCLASSIFIED, ErrorClass.FATAL
@@ -34,6 +35,9 @@ T, P, U, F = ErrorClass.TRANSIENT, ErrorClass.POISON, ErrorClass.UNCLASSIFIED, E
         (TimeoutError("timeout"), Failure(T)),
         # The dead letter couldn't be produced (D-111): transient, the DB left alone.
         (DlqUnavailable("not acknowledged"), Failure(T)),
+        # The processor didn't answer (D-112): transient, the DB left alone; never poison, never Fatal.
+        (ProcessorUnavailable("unavailable"), Failure(T)),
+        (ProcessorTimeout("no answer within 2000 ms"), Failure(T)),
         # Fatal: the deployment or the ledger is broken.
         (asyncpg.InsufficientPrivilegeError("grant"), Failure(F, "42501")),
         (asyncpg.UndefinedTableError("table"), Failure(F, "42P01")),

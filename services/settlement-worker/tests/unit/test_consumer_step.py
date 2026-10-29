@@ -1,4 +1,4 @@
-"""The per-record step (D-081, D-107, D-108, D-109, D-111).
+"""The per-record step (D-081, D-107, D-108, D-109, D-111, D-112).
 
 It rejects a bad record before touching the DB or the broker. The _step tests below drive the
 retry / dead-letter / pending-commit state machine with fake Kafka objects (consumer and DLQ
@@ -21,6 +21,7 @@ from settlement_worker import consumer
 from settlement_worker.config import Config
 from settlement_worker.envelope import InvalidEvent
 from settlement_worker.dlq import DlqUnavailable
+from settlement_worker.processor import Decision, ProcessorUnavailable
 from settlement_worker.retry import RetryState
 
 PAYMENT = "5b01a9e5-32ce-4c82-90b0-ac8c5143460c"
@@ -79,6 +80,7 @@ def test_key_must_equal_the_payment_id(key):
                 consumer=Untouchable("consumer"),
                 config=config,
                 commits=Untouchable("commits"),
+                attempt=1,
             )
         )
 
@@ -169,12 +171,13 @@ def test_failed_offset_commit_is_pending_not_a_retry():
 
 
 # D-109: only DB call sites turn a timeout into DbTimeout. A TimeoutError raised outside a DB call
-# (here, by the processor) is a plain transient: retried in place, the DB connection left alone.
+# (here, by the processor itself) is a plain transient: retried in place, the DB connection left
+# alone. Nor is it ProcessorTimeout: the consumer's deadline didn't expire (D-112).
 def test_timeout_outside_a_db_call_is_not_db_timeout(monkeypatch):
-    def slow_processor(*args, **kwargs):
+    async def slow_processor(*args, **kwargs):
         raise TimeoutError("processor took too long")
 
-    monkeypatch.setattr(consumer.processor, "decide", slow_processor)
+    monkeypatch.setattr(consumer.processor, "call", slow_processor)
     record = Record("ledger.payments.v1", 2, 4, PAYMENT.encode(), _value())
     tp = TopicPartition(record.topic, record.partition)
     config = Config.from_env({"SETTLEMENT_WORKER_PASSWORD": "x", "WORKER_RETRY_JITTER": "0"})
@@ -191,7 +194,8 @@ def test_timeout_outside_a_db_call_is_not_db_timeout(monkeypatch):
     retries = [entry for entry in logs if entry["event"] == "retry_scheduled"]
     assert len(retries) == 1
     assert retries[0]["error"].startswith("TimeoutError: ")
-    assert "DbTimeout" not in retries[0]["error"]
+    assert "DbTimeout" not in retries[0]["error"] and "ProcessorTimeout" not in retries[0]["error"]
+    assert [entry["event"] for entry in logs] == ["retry_scheduled"], "no processor_timeout"
     assert (retries[0]["error_class"], retries[0]["sqlstate"]) == ("Transient", None)
     assert session.dropped == 0, "a non-DB timeout must not reconnect the DB"
     assert fake.calls == [("seek", 2, 4), ("pause", 2)]
@@ -307,10 +311,10 @@ def test_a_failed_dlq_produce_is_retried_and_nothing_is_committed():
 # D-111: the attempt count survives DlqUnavailable. An Unclassified record exhausted at attempt 5
 # whose dead letter fails once is dead-lettered on its 6th run (dlq.attempts=6), not given 5 more.
 def test_an_exhausted_record_hit_by_dlq_unavailable_is_dead_lettered_on_its_next_run(monkeypatch):
-    def broken_processor(*args, **kwargs):
+    async def broken_processor(*args, **kwargs):
         raise RuntimeError("bug in the processing step")
 
-    monkeypatch.setattr(consumer.processor, "decide", broken_processor)
+    monkeypatch.setattr(consumer.processor, "call", broken_processor)
     seq = Sequence()
     fake, dlq = FakeConsumer(seq), FakeDlq(seq, failures=1)
     record = Record("ledger.payments.v1", 0, 3, PAYMENT.encode(), _value())
@@ -323,3 +327,122 @@ def test_an_exhausted_record_hit_by_dlq_unavailable_is_dead_lettered_on_its_next
     assert (headers["dlq.error_class"], headers["dlq.attempts"]) == (b"Unclassified", b"6")
     assert headers["dlq.event_id"] == OTHER.encode()
     assert seq.calls[-1] == ("commit", {0: 4})
+
+
+class ScriptedProcessor:
+    """A stand-in for processor.call: raises the scripted exceptions in order, then answers; records
+    the attempt each call was made with."""
+
+    def __init__(self, failures):
+        self.failures = list(failures)
+        self.attempts = []
+
+    async def __call__(self, payment_id, amount, attempt, **kwargs):
+        self.attempts.append(attempt)
+        if self.failures:
+            raise self.failures.pop(0)
+        return Decision.APPROVED
+
+
+def _no_settle(calls):
+    """A stand-in for settlement.handle that records being reached (it must not be)."""
+
+    async def handle(*args, **kwargs):
+        calls.append(args)
+        raise RuntimeError("settlement.handle ran")
+
+    return handle
+
+
+# D-112: exhaustion counts Unclassified failures only. Four processor outages, then one bug: the
+# 5th run is the record's first Unclassified failure, so it is retried, not dead-lettered. The
+# processor got this run's number every time (1..5); nothing reached settlement.handle, so nothing
+# was mapped to FAILED.
+def test_four_transient_failures_then_one_unclassified_are_retried_not_dead_lettered(monkeypatch):
+    stand_in = ScriptedProcessor([ProcessorUnavailable("down")] * 4 + [RuntimeError("bug in the processing step")])
+    settled = []
+    monkeypatch.setattr(consumer.processor, "call", stand_in)
+    monkeypatch.setattr(consumer.settlement, "handle", _no_settle(settled))
+    seq = Sequence()
+    fake, dlq = FakeConsumer(seq), FakeDlq(seq)
+    record = Record("ledger.payments.v1", 0, 3, PAYMENT.encode(), _value())
+    config, state = _config(), RetryState()
+    commits = consumer.Commits(fake, config, random.Random(0))
+    with capture_logs() as logs:
+        results = [_run_step(record, config=config, state=state, commits=commits, dlq=dlq, fake=fake) for _ in range(5)]
+    assert results == [consumer.Step.RETRY] * 5
+    assert stand_in.attempts == [1, 2, 3, 4, 5]
+    retries = [e for e in logs if e["event"] == "retry_scheduled"]
+    assert [(r["attempt"], r["error_class"]) for r in retries] == [
+        (1, "Transient"), (2, "Transient"), (3, "Transient"), (4, "Transient"), (5, "Unclassified")
+    ]
+    assert [r["delay_ms"] for r in retries] == [200, 400, 800, 1600, 3200], "the backoff follows every run"
+    assert dlq.letters == [] and settled == []
+    assert [e for e in logs if e["event"] == "message_dead_lettered"] == []
+    assert all(call[0] != "commit" for call in seq.calls)
+
+
+# D-107/D-112: five Unclassified failures in a row are dead-lettered on the 5th, dlq.attempts=5.
+def test_five_unclassified_failures_are_dead_lettered_with_attempts_5(monkeypatch):
+    stand_in = ScriptedProcessor([RuntimeError("bug in the processing step")] * 5)
+    monkeypatch.setattr(consumer.processor, "call", stand_in)
+    seq = Sequence()
+    fake, dlq = FakeConsumer(seq), FakeDlq(seq)
+    record = Record("ledger.payments.v1", 0, 3, PAYMENT.encode(), _value())
+    config, state = _config(), RetryState()
+    commits = consumer.Commits(fake, config, random.Random(0))
+    results = [_run_step(record, config=config, state=state, commits=commits, dlq=dlq, fake=fake) for _ in range(5)]
+    assert results == [consumer.Step.RETRY] * 4 + [consumer.Step.OK]
+    headers = dict(dlq.letters[0].headers)
+    assert (headers["dlq.error_class"], headers["dlq.attempts"]) == (b"Unclassified", b"5")
+    assert seq.calls[-2:] == [("produce", 0), ("commit", {0: 4})]
+
+
+# D-112: a mix still dead-letters at the 5th Unclassified failure, and dlq.attempts counts every
+# run: 2 outages + 5 bugs = 7.
+def test_transient_failures_delay_exhaustion_but_count_in_dlq_attempts(monkeypatch):
+    bug = RuntimeError("bug in the processing step")
+    down = ProcessorUnavailable("down")
+    stand_in = ScriptedProcessor([bug, down, bug, bug, down, bug, bug])
+    monkeypatch.setattr(consumer.processor, "call", stand_in)
+    seq = Sequence()
+    fake, dlq = FakeConsumer(seq), FakeDlq(seq)
+    record = Record("ledger.payments.v1", 0, 3, PAYMENT.encode(), _value())
+    config, state = _config(), RetryState()
+    commits = consumer.Commits(fake, config, random.Random(0))
+    results = [_run_step(record, config=config, state=state, commits=commits, dlq=dlq, fake=fake) for _ in range(7)]
+    assert results == [consumer.Step.RETRY] * 6 + [consumer.Step.OK]
+    assert stand_in.attempts == [1, 2, 3, 4, 5, 6, 7]
+    assert dict(dlq.letters[0].headers)["dlq.attempts"] == b"7"
+
+
+# D-112: the consumer's own deadline expiring is ProcessorTimeout: processor_timeout (WARNING), then a
+# Transient retry_scheduled naming it; never DbTimeout, the DB connection left alone, nothing settled.
+def test_a_processor_deadline_expiry_is_processor_timeout(monkeypatch):
+    async def never_answers(*args, **kwargs):
+        await asyncio.sleep(10)
+
+    settled = []
+    monkeypatch.setattr(consumer.processor, "call", never_answers)
+    monkeypatch.setattr(consumer.settlement, "handle", _no_settle(settled))
+    record = Record("ledger.payments.v1", 2, 4, PAYMENT.encode(), _value())
+    tp = TopicPartition(record.topic, record.partition)
+    config = _config(WORKER_PROCESSOR_TIMEOUT_MS="50")
+    session, fake = LiveSession(), Recording()
+    with capture_logs() as logs:
+        result = asyncio.run(
+            consumer._step(
+                record, tp, session=session, consumer=fake, config=config, state=RetryState(),
+                commits=Untouchable("commits"), dlq=Untouchable("dlq"), rng=random.Random(0),
+            )
+        )
+    assert result is consumer.Step.RETRY
+    assert [e["event"] for e in logs] == ["processor_timeout", "retry_scheduled"]
+    timeout, retry = logs
+    assert (timeout["log_level"], timeout["payment_id"], timeout["attempt"], timeout["timeout_ms"]) == (
+        "warning", PAYMENT, 1, 50
+    )
+    assert retry["error"].startswith("ProcessorTimeout: processor did not answer within 50 ms")
+    assert (retry["error_class"], retry["sqlstate"], retry["attempt"]) == ("Transient", None, 1)
+    assert session.dropped == 0 and settled == []
+    assert fake.calls == [("seek", 2, 4), ("pause", 2)]

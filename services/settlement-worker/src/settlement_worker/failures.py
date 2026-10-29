@@ -8,12 +8,14 @@ Transient   the dependency or a lock, not the message: retried indefinitely, nev
             transient but not connection loss: DB call sites wrap theirs as DbTimeout or
             DbUnavailable (db.as_db_failure), so anything else never reconnects the DB.
 Poison      the message itself can never succeed: dead-lettered on its first failure (T7).
-Unclassified anything else: WORKER_MAX_ATTEMPTS attempts, then dead-lettered (T7).
+Unclassified anything else: dead-lettered at its WORKER_MAX_ATTEMPTS-th Unclassified failure (T7);
+            transient failures of the same record don't count towards it (D-112).
 Fatal       the deployment or the ledger is broken: processing_failed, exit 1, nothing committed.
 
 A failed offset commit is not a record failure and never comes here: the effect has already
-committed, so the commit path handles it (D-107, D-109). Each later task adds its own exception
-types here (processor errors in T8).
+committed, so the commit path handles it (D-107, D-109). The processor's ProcessorUnavailable and
+ProcessorTimeout are transient and never connection loss (D-112): never dead-lettered, never a
+decline, and the DB connection is left alone.
 """
 
 import enum
@@ -24,6 +26,7 @@ import asyncpg
 from settlement_worker.db import DbTimeout, DbUnavailable
 from settlement_worker.dlq import DlqUnavailable
 from settlement_worker.envelope import InvalidEvent
+from settlement_worker.processor import ProcessorTimeout, ProcessorUnavailable
 from settlement_worker.settlement import EscrowShortfall, EventMismatch, MissingAccount, UnknownPayment
 
 
@@ -54,6 +57,9 @@ def classify(exc: BaseException, connection_closed: bool = False) -> Failure:
         return Failure(ErrorClass.TRANSIENT, connection=True)
     # The dead letter couldn't be produced (D-111): transient; the DB connection is left alone.
     if isinstance(exc, DlqUnavailable):
+        return Failure(ErrorClass.TRANSIENT)
+    # The processor didn't answer (D-112): transient, the DB connection left alone.
+    if isinstance(exc, (ProcessorUnavailable, ProcessorTimeout)):
         return Failure(ErrorClass.TRANSIENT)
     if isinstance(exc, (InvalidEvent, UnknownPayment, EventMismatch)):
         return Failure(ErrorClass.POISON)
