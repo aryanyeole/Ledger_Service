@@ -370,9 +370,11 @@ async def _dead_letter(record, tp: TopicPartition, ex: BaseException, attempts: 
     """D-111, in this order, after the settle transaction has rolled back: produce the original
     record to the DLQ and await its ack (DlqUnavailable if it fails or runs out of time), then
     message_dead_lettered and the counter, then commit offset+1 through the normal commit path (a
-    failed commit becomes a pending commit, D-109). Never inside a DB transaction."""
+    failed commit becomes a pending commit, D-109). Never inside a DB transaction. dlq.event_id and
+    the event's correlation_id come from the envelope whenever it parses, independently of the
+    checks after it (the record key, the payment row); if it doesn't parse, both stay absent (BUG-007)."""
     try:
-        event = classify(record)
+        event = envelope.parse(record.value) if record.value is not None else None
     except InvalidEvent:
         event = None
     error_class = _dead_letter_class(ex)
