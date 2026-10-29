@@ -12,12 +12,12 @@ from settlement_worker import events
 def test_contract():
     assert {name: sorted(keys) for name, keys in events.EVENT_KEYS.items()} == {
         "fault_injected": ["correlation_id", "payment_id", "point"],
-        "processor_called": ["correlation_id", "decision", "payment_id"],
+        "processor_called": ["attempt", "correlation_id", "decision", "payment_id"],
         "duplicate_skipped": ["consumer_group", "correlation_id", "event_id", "payment_id"],
         "payment_not_authorized": ["correlation_id", "event_id", "payment_id", "status"],
         "payment_settled": ["correlation_id", "event_id", "lock_wait_ms", "payment_id", "transaction_id"],
         "payment_released": ["correlation_id", "event_id", "lock_wait_ms", "payment_id", "transaction_id"],
-        "worker_started": ["consumer_group", "correlation_id", "fault_point"],
+        "worker_started": ["consumer_group", "correlation_id", "fault_point", "processor_outage"],
         "partitions_assigned": ["correlation_id", "partitions"],
         "processing_failed": ["correlation_id", "error", "offset", "partition", "topic"],
         "worker_stopped": ["correlation_id", "reason"],
@@ -48,6 +48,7 @@ def test_contract():
             "partition",
             "topic",
         ],
+        "processor_timeout": ["attempt", "correlation_id", "payment_id", "timeout_ms"],
     }
 
 

@@ -61,6 +61,20 @@ def test_revoke_forgets_attempts_and_cancels_the_pending_resume():
     assert state.due(10_000) == [OTHER]
 
 
+# D-112: the Unclassified count is separate from the run count; success and revoke clear both.
+def test_unclassified_failures_are_counted_apart_and_cleared_with_the_attempts():
+    state = RetryState()
+    assert [state.failed(TP, 7) for _ in range(4)] == [1, 2, 3, 4]
+    assert state.failed_unclassified(TP, 7) == 1
+    assert state.failed(TP, 7) == 5
+    assert state.failed_unclassified(TP, 7) == 2
+    state.succeeded(TP, 7)
+    assert (state.attempts(TP, 7), state.failed_unclassified(TP, 7)) == (0, 1)
+    state.failed_unclassified(OTHER, 3)
+    state.revoked([TP, OTHER])
+    assert (state.failed_unclassified(TP, 7), state.failed_unclassified(OTHER, 3)) == (1, 1)
+
+
 def test_due_returns_only_ended_backoffs_once():
     state = RetryState()
     state.schedule(TP, 100)

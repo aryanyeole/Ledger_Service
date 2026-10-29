@@ -24,15 +24,16 @@ RETRY_SCHEDULED = "retry_scheduled"
 DB_RECONNECTED = "db_reconnected"
 OFFSET_COMMIT_FAILED = "offset_commit_failed"
 MESSAGE_DEAD_LETTERED = "message_dead_lettered"
+PROCESSOR_TIMEOUT = "processor_timeout"
 
 EVENT_KEYS: dict[str, frozenset[str]] = {
     FAULT_INJECTED: frozenset({"point", "payment_id", "correlation_id"}),
-    PROCESSOR_CALLED: frozenset({"payment_id", "decision", "correlation_id"}),
+    PROCESSOR_CALLED: frozenset({"payment_id", "decision", "attempt", "correlation_id"}),
     DUPLICATE_SKIPPED: frozenset({"event_id", "payment_id", "consumer_group", "correlation_id"}),
     PAYMENT_NOT_AUTHORIZED: frozenset({"event_id", "payment_id", "status", "correlation_id"}),
     PAYMENT_SETTLED: frozenset({"event_id", "payment_id", "transaction_id", "lock_wait_ms", "correlation_id"}),
     PAYMENT_RELEASED: frozenset({"event_id", "payment_id", "transaction_id", "lock_wait_ms", "correlation_id"}),
-    WORKER_STARTED: frozenset({"consumer_group", "fault_point", "correlation_id"}),
+    WORKER_STARTED: frozenset({"consumer_group", "fault_point", "processor_outage", "correlation_id"}),
     PARTITIONS_ASSIGNED: frozenset({"partitions", "correlation_id"}),
     PROCESSING_FAILED: frozenset({"topic", "partition", "offset", "error", "correlation_id"}),
     WORKER_STOPPED: frozenset({"reason", "correlation_id"}),
@@ -47,6 +48,7 @@ EVENT_KEYS: dict[str, frozenset[str]] = {
         {"topic", "partition", "offset", "error_class", "attempts", "event_id", "error", "dlq_partition",
          "dlq_offset", "correlation_id"}
     ),
+    PROCESSOR_TIMEOUT: frozenset({"payment_id", "attempt", "timeout_ms", "correlation_id"}),
 }
 
 LEVELS = frozenset({"info", "warning", "error"})

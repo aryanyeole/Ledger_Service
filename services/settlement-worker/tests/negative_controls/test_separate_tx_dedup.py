@@ -7,7 +7,8 @@ the naive variant FAILS: every iteration ends with two balanced postings, two re
 dedup row, and escrow short by exactly the duplicated amounts. The balance trigger can't see it (each
 posting balances); only escrow against the AUTHORIZED total can. One ballast payment, never settled
 by the naive worker, keeps escrow covering the duplicates, so they commit instead of tripping
-no_overdraft. It backs a "demonstrated" claim, never a "debugged" one (D-016).
+no_overdraft. The ballast is rounded up to whole units, so its cents are 00 for every N and never
+the processor's reserved 13, 91 or 92 (D-112). It backs a "demonstrated" claim, never a "debugged" one (D-016).
 """
 
 import asyncio
@@ -18,7 +19,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 
 import pytest
@@ -47,7 +48,10 @@ def _iterations() -> int:
 
 
 N = _iterations()
-BALLAST = Decimal(N) * max(Decimal(a) for a in AMOUNTS)
+# Rounded up to whole units (D-112): N x 113.13 would have cents 13N mod 100 (91 at N=7, 92 at N=84).
+BALLAST = (Decimal(N) * max(Decimal(a) for a in AMOUNTS)).quantize(Decimal("1"), rounding=ROUND_CEILING).quantize(
+    Decimal("0.01"), rounding=ROUND_HALF_EVEN
+)
 
 
 def run(coro):
@@ -196,6 +200,7 @@ def tally(request):
 def ballast(control, tally):
     """Authorized first and skipped by the naive worker, so escrow covers every duplicate (D-086)."""
     assert BALLAST >= N * max(Decimal(a) for a in AMOUNTS)
+    assert BALLAST % 1 == 0, f"the ballast {BALLAST} must have cents 00 (D-112)"
     customer = control.api.create_account("CUSTOMER")
     control.api.deposit(customer, str(BALLAST))
     merchant = control.api.create_account("MERCHANT")

@@ -2,7 +2,7 @@
 
 TEST SOURCE ONLY. It deliberately violates invariant 6 and lives only in tests/negative_controls/;
 src/settlement_worker never imports it (tests/unit/test_negative_control_isolation.py). It reuses
-main's pure helpers (config parsing, logging, classify, processor.decide, the leg builder, money,
+main's pure helpers (config parsing, logging, classify, processor.call, the leg builder, money,
 events) and main's role check, and keeps invariants 1-5: each posting balances (the deferred
 trigger checks it), entries are only inserted, money is Decimal, accounts are locked in ascending
 id order, and nothing but Postgres is awaited inside a transaction.
@@ -10,7 +10,7 @@ id order, and nothing but Postgres is awaited inside a transaction.
 Per payment.authorized record:
   1. pre-check payments.status: not AUTHORIZED -> commit offset+1;
   2. the ballast (NAIVE_SKIP_PAYMENT_ID) -> commit offset+1, so its escrow covers the duplicates;
-  3. processor.decide;
+  3. processor.call, as attempt 1 and without the consumer's deadline (D-112);
   4. transaction 1: lock the legs' accounts, post PAYMENT_SETTLE / PAYMENT_RELEASE, append the
      result outbox row. Commit;
   5. fault AFTER_EFFECT_BEFORE_MARK for NAIVE_FAULT_PAYMENT_ID: log, flush, os._exit(86);
@@ -164,7 +164,14 @@ async def _process(record, *, conn, kafka, config: Config, fault_id, skip_id) ->
     if row["status"] != "AUTHORIZED" or event.payment_id == skip_id:
         await kafka.commit({tp: record.offset + 1})
         return
-    decision = processor.decide(event.payment_id, event.amount, correlation_id=event.correlation_id)
+    decision = await processor.call(
+        event.payment_id,
+        event.amount,
+        1,
+        timeout_ms=config.processor_timeout_ms,
+        outage=config.processor_outage,
+        correlation_id=event.correlation_id,
+    )
     transaction_id, lock_wait_ms = await _effect(conn, config, event, decision, row)
     name = events.PAYMENT_SETTLED if decision is Decision.APPROVED else events.PAYMENT_RELEASED
     events.emit(
@@ -229,9 +236,10 @@ async def _run(config: Config, fault_id, skip_id) -> int:
         events.emit(
             log,
             events.WORKER_STARTED,
-            level="warning" if fault_id else "info",
+            level="warning" if fault_id or config.processor_outage else "info",
             consumer_group=config.consumer_group,
             fault_point=FAULT_POINT if fault_id else None,
+            processor_outage=config.processor_outage,
             correlation_id=None,
         )
         while not stop.is_set() and code == consumer.EXIT_STOPPED:

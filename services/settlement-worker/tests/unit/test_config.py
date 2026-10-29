@@ -199,6 +199,57 @@ def test_worker_started_warns_when_a_fault_is_armed(armed, level):
             "log_level": level,
             "consumer_group": "g",
             "fault_point": "AFTER_DB_BEFORE_OFFSET" if armed else None,
+            "processor_outage": False,
+            "correlation_id": None,
+        }
+    ]
+
+
+def test_processor_defaults():
+    config = Config.from_env(_env())
+    assert (config.processor_timeout_ms, config.processor_outage) == (2000, False)
+    tuned = Config.from_env(_env(WORKER_PROCESSOR_TIMEOUT_MS="60000", FAKE_PROCESSOR_OUTAGE="1"))
+    assert (tuned.processor_timeout_ms, tuned.processor_outage) == (60000, True)
+    assert Config.from_env(_env(WORKER_PROCESSOR_TIMEOUT_MS="1", FAKE_PROCESSOR_OUTAGE="0")).processor_outage is False
+
+
+# D-112: an invalid processor setting is refused (config_invalid, exit 2).
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"WORKER_PROCESSOR_TIMEOUT_MS": "0"}, "WORKER_PROCESSOR_TIMEOUT_MS"),
+        ({"WORKER_PROCESSOR_TIMEOUT_MS": "60001"}, "WORKER_PROCESSOR_TIMEOUT_MS"),
+        ({"WORKER_PROCESSOR_TIMEOUT_MS": "2s"}, "WORKER_PROCESSOR_TIMEOUT_MS"),
+        ({"FAKE_PROCESSOR_OUTAGE": "yes"}, "FAKE_PROCESSOR_OUTAGE"),
+        ({"FAKE_PROCESSOR_OUTAGE": "true"}, "FAKE_PROCESSOR_OUTAGE"),
+    ],
+)
+def test_invalid_processor_config(overrides, message):
+    with pytest.raises(ConfigError, match=message):
+        Config.from_env(_env(**overrides))
+
+
+def test_invalid_processor_timeout_exits_2():
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("FAULT_", "FAKE_", "WORKER_"))}
+    env.update(_env(WORKER_METRICS_PORT="0", WORKER_PROCESSOR_TIMEOUT_MS="0"))
+    result = subprocess.run([sys.executable, "-m", "settlement_worker"], capture_output=True, text=True, env=env, timeout=30)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert [json.loads(line)["event"] for line in result.stdout.splitlines()] == ["config_invalid"]
+
+
+# D-112: the outage is announced like an armed fault: WARNING, and worker_started reports it.
+@pytest.mark.parametrize("outage, level", [("1", "warning"), ("0", "info")])
+def test_worker_started_warns_when_the_processor_outage_is_on(outage, level):
+    config = Config.from_env(_env(WORKER_CONSUMER_GROUP="g", FAKE_PROCESSOR_OUTAGE=outage))
+    with capture_logs() as logs:
+        consumer.announce_start(structlog.get_logger(), config)
+    assert logs == [
+        {
+            "event": "worker_started",
+            "log_level": level,
+            "consumer_group": "g",
+            "fault_point": None,
+            "processor_outage": outage == "1",
             "correlation_id": None,
         }
     ]
