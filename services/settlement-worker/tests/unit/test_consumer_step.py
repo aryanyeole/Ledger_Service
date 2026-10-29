@@ -12,6 +12,7 @@ import json
 import random
 from dataclasses import dataclass
 
+import asyncpg
 import pytest
 from aiokafka import TopicPartition
 from aiokafka.errors import KafkaConnectionError
@@ -23,6 +24,7 @@ from settlement_worker.envelope import InvalidEvent
 from settlement_worker.dlq import DlqUnavailable
 from settlement_worker.processor import Decision, ProcessorUnavailable
 from settlement_worker.retry import RetryState
+from settlement_worker.settlement import EscrowShortfall
 
 PAYMENT = "5b01a9e5-32ce-4c82-90b0-ac8c5143460c"
 OTHER = "0f1e2d3c-4b5a-4987-8a6b-5c4d3e2f1a0b"
@@ -116,10 +118,12 @@ def _own_result() -> bytes:
 
 
 class LiveSession:
-    """A DB session that is connected; dropping it is recorded (D-109)."""
+    """A DB session that is connected; dropping it is recorded (D-109). Its conn is only ever handed
+    to a settlement.handle stand-in, so a stand-in that must not run is really reached if it runs."""
 
     def __init__(self):
         self.dropped = 0
+        self.conn = Untouchable("conn")
 
     broken = False
 
@@ -471,3 +475,37 @@ def test_a_processor_deadline_expiry_is_processor_timeout(monkeypatch):
     assert (retry["error_class"], retry["sqlstate"], retry["attempt"]) == ("Transient", None, 1)
     assert session.dropped == 0 and settled == []
     assert fake.calls == [("seek", 2, 4), ("pause", 2)]
+
+
+# D-107 (T9 case 6): Fatal means the deployment or the ledger is broken, so nothing is retried, dead-
+# lettered or committed: processing_failed and Step.FATAL, which the consume loop turns into exit 1
+# (EXIT_PROCESSING_ERROR). settlement.handle is a raising stand-in; the processor is the real fake.
+@pytest.mark.parametrize(
+    "failure",
+    [
+        asyncpg.InsufficientPrivilegeError("permission denied for table payments"),
+        asyncpg.CheckViolationError('new row for relation "accounts" violates check constraint "no_overdraft"'),
+        EscrowShortfall("escrow balance 0.0000 < 100.00"),
+    ],
+    ids=["42501", "23514", "EscrowShortfall"],
+)
+def test_a_fatal_failure_is_processing_failed_with_no_dlq_and_no_commit(monkeypatch, failure):
+    async def broken_ledger(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(consumer.settlement, "handle", broken_ledger)
+    seq = Sequence()
+    fake, dlq = FakeConsumer(seq), FakeDlq(seq)
+    record = Record("ledger.payments.v1", 1, 8, PAYMENT.encode(), _value())
+    config, state = _config(), RetryState()
+    commits = consumer.Commits(fake, config, random.Random(0))
+    with capture_logs() as logs:
+        result = _run_step(record, config=config, state=state, commits=commits, dlq=dlq, fake=fake)
+    assert result is consumer.Step.FATAL
+    assert consumer.EXIT_PROCESSING_ERROR == 1
+    assert [e["event"] for e in logs] == ["processor_called", "processing_failed"]
+    failed = logs[1]
+    assert (failed["log_level"], failed["partition"], failed["offset"]) == ("error", 1, 8)
+    assert failed["error"].startswith(f"{type(failure).__name__}: ")
+    assert seq.calls == [], "no DLQ produce, no offset commit, no seek or pause"
+    assert dlq.letters == []

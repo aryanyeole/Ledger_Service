@@ -119,6 +119,7 @@ def test_lock_timeout_retries_in_place_then_applies_once(fm):
     assert _status(fm, payment) == "SETTLED"
     assert (_committed(fm, group, partition) or 0) > offset
     assert worker.events("processing_failed") == []
+    assert worker.events("message_dead_lettered") == []  # tripwire: a transient is never dead-lettered (D-123)
 
 
 def _publish_until(fm, group, customer, merchant, predicate, limit: int = 12):
