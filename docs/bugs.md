@@ -23,6 +23,7 @@
 | BUG-004 | 2026-10-19 19:45 | M3 | OutboxRedeliveryTest case 2 depends on an earlier test having opened the producer's leader connection | P3 proof evidence, D-099 (component: ledger-api tests) | fixed | e1aa6dc (PR #32) |
 | BUG-005 | 2026-10-19 23:25 | M3 | OppositeTransfersNoDeadlockTest misses the D-067 server-overlap floor on CI | P2 proof evidence, D-067 (component: ledger-api tests) | fixed | c54fae3 (PR #37) |
 | BUG-006 | 2026-10-20 00:18 | M3 | KafkaTopicReader finds no partitions for a topic created moments earlier | none (component: ledger-api tests) | fixed | 0eef4b2 (PR #38) |
+| BUG-007 | 2026-10-28 19:22 | M4 | A dead letter whose envelope parsed but failed a later check carries no dlq.event_id | D-111 (component: settlement-worker) | fixed | a03f730 (PR #52) |
 
 ---
 
@@ -353,3 +354,41 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 - **Notes:**
   - **Correction to Property / invariant touched** (rule 3): the relay assertions that "passed before the failing line" (both ticks returning 0) passed with the guard UNCHECKED, not STOPPED. They were not evidence that the relay had stopped.
   - **What green runs can show:** the lag can't be induced on demand, so green runs show the fix causes no regression, not that the race is gone. The case for the fix is the mechanism: the test can no longer start the relay ticks before the topic is visible.
+
+---
+
+### BUG-007 — A dead letter whose envelope parsed but failed a later check carries no dlq.event_id
+
+- **Found:** 2026-10-28 19:22 · M4 · Task T9 (planning) · branch `main` at `784bb7e`; fixed on `m4/t9a-dlq-event-id`
+- **Status:** fixed
+- **Component:** settlement-worker (`consumer._dead_letter`)
+- **Property / invariant touched:** D-111 (the dead-letter record's headers and `message_dead_lettered`). CLAUDE.md invariants 1–7 are not affected: no DB write is involved, and the record, its key and value bytes, and the offset commit after the DLQ ack are all as specified.
+- **Symptom:** a record whose envelope parses but which fails a later check is dead-lettered without `dlq.event_id`, and its `message_dead_lettered` has `event_id: null` and `correlation_id: null`. D-111 says `dlq.event_id` is present "if the envelope parsed". The case found: a valid `payment.authorized` envelope under a record key that isn't its `data.payment_id`. `consumer.classify` raises `InvalidEvent("record key ... does not equal data.payment_id ...")` after `envelope.parse` has succeeded. Expected: `dlq.event_id` = the envelope's `event_id`, and `message_dead_lettered` carrying that `event_id` and the envelope's `correlation_id`. Actual: the header is absent and both fields are null.
+- **How detected:** manual check, reading `_dead_letter` against D-111 while planning T9's InvalidEvent case for a mis-keyed record, 2026-10-28. The time above is when the T9 plan reporting it was written (session transcript, 02:22 UTC on 2026-10-29). No test had exercised the mis-keyed case through `_dead_letter`, so no failing run preceded the finding; the regression test below is its first reproduction.
+- **Reproduction:**
+  ```powershell
+  cd services\settlement-worker; .\.venv\Scripts\Activate.ps1
+  pytest tests/unit/test_consumer_step.py -k "mis_keyed"
+  ```
+- **Time to diagnose:** none beyond the finding. The root cause was what the reading found at 19:22. The regression test's red run at 19:37 confirmed it.
+- **Root cause:** `_dead_letter` ([consumer.py](../services/settlement-worker/src/settlement_worker/consumer.py), before the fix) took the event for `dlq.event_id` and the log's `event_id`/`correlation_id` from `consumer.classify(record)`, falling back to none on `InvalidEvent`. `classify` does two things: `envelope.parse(record.value)`, then, for `payment.authorized`, the check that the record key equals `data.payment_id`. A record that passed the first and failed the second therefore lost its envelope's identity in the dead letter.
+  - **Affected:** a valid `payment.authorized` envelope whose record key is missing, not UTF-8, not a canonical UUID, or a different UUID.
+  - **Not affected:** UnknownPayment, EventMismatch and an exhausted Unclassified record pass `classify`, so they always carried `dlq.event_id`. Records whose envelope doesn't parse correctly carry none.
+- **Why it wasn't caught earlier:**
+  - T7's dead-letter unit tests covered only two shapes: a value that isn't JSON, which never parses, and correctly keyed events (the exhausted Unclassified record).
+  - `dead_letter.build`'s own tests pass `event_id` in directly, so they can't see how the caller derives it.
+  - No test dead-lettered a record whose envelope parses but whose key check fails. T9's plan was the first to list that shape against D-111's "if the envelope parsed".
+- **Fix:** `_dead_letter` now reads the event with `envelope.parse(record.value)` whenever the value is present and parses, independently of the checks after it (the record key, the payment row). If parsing fails, `dlq.event_id` stays absent and both log fields stay null. Nothing else changes: `classify`, the error class, `dlq.attempts`, the commit order, and `retry_scheduled`'s correlation id are as before. Commit `a03f730` · PR #52.
+- **Regression test:** `services/settlement-worker/tests/unit/test_consumer_step.py::test_a_mis_keyed_record_is_dead_lettered_with_its_envelopes_event_id`. It sends a valid envelope under a different record key, with `correlation_id` `c-mis-keyed`, through `_step` with the T7 fakes. It expects one produce with `dlq.event_id` = the envelope's `event_id`, the commit after it, and `message_dead_lettered` with that `event_id` and `c-mis-keyed`.
+  - **Red before:** commit `0357cce`, 2026-10-28 19:37:14:
+    ```
+    >       assert headers.get("dlq.event_id") == OTHER.encode()
+    E       AssertionError: assert None == b'0f1e2d3c-4b5a-4987-8a6b-5c4d3e2f1a0b'
+    FAILED tests/unit/test_consumer_step.py::test_a_mis_keyed_record_is_dead_lettered_with_its_envelopes_event_id
+    1 failed, 15 deselected in 0.34s
+    ```
+  - **Green after:** commit `a03f730`, 19:37:50: `1 passed, 15 deselected`; unit tests `238 passed`.
+  - **Full worker suite** (local, i5-1240P, jar rebuilt per D-083): `290 passed in 426.22s`, finished 19:45.
+- **Decision Log impact:** none. The code now matches D-111.
+- **Summary (one sentence):** `_dead_letter` took the event's identity from `classify`, which also checks the record key, so a mis-keyed record with a valid envelope was dead-lettered without `dlq.event_id` or a correlation id. It now reads them from `envelope.parse` whenever the envelope parses.
+- **Notes:**

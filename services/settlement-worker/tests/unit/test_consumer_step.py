@@ -291,6 +291,31 @@ def test_poison_is_dead_lettered_on_its_first_failure_then_committed():
     assert state.attempts(TopicPartition(record.topic, record.partition), 12) == 0
 
 
+# BUG-007, D-111: dlq.event_id is set whenever the envelope parsed, even if a later check rejects the
+# record. A valid envelope under a record key that isn't its data.payment_id is InvalidEvent, dead-
+# lettered on its first failure with the envelope's event_id, and message_dead_lettered carries the
+# envelope's event_id and correlation_id.
+def test_a_mis_keyed_record_is_dead_lettered_with_its_envelopes_event_id():
+    seq = Sequence()
+    fake, dlq = FakeConsumer(seq), FakeDlq(seq)
+    document = json.loads(_value())
+    document["correlation_id"] = "c-mis-keyed"
+    record = Record("ledger.payments.v1", 2, 5, OTHER.encode(), json.dumps(document).encode())
+    config, state = _config(), RetryState()
+    commits = consumer.Commits(fake, config, random.Random(0))
+    with capture_logs() as logs:
+        result = _run_step(record, config=config, state=state, commits=commits, dlq=dlq, fake=fake)
+    assert result is consumer.Step.OK
+    assert seq.calls == [("produce", 0), ("commit", {2: 6})]
+    headers = dict(dlq.letters[0].headers)
+    assert (headers["dlq.error_class"], headers["dlq.attempts"]) == (b"InvalidEvent", b"1")
+    assert headers.get("dlq.event_id") == OTHER.encode()
+    [dead] = logs
+    assert dead["event"] == "message_dead_lettered"
+    assert (dead["event_id"], dead["correlation_id"]) == (OTHER, "c-mis-keyed")
+    assert "does not equal data.payment_id" in dead["error"]
+
+
 # D-111: a DLQ produce that fails is transient: the record is re-run on the D-108 schedule, nothing
 # is committed, and no message_dead_lettered is emitted.
 def test_a_failed_dlq_produce_is_retried_and_nothing_is_committed():
