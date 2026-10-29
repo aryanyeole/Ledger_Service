@@ -122,5 +122,5 @@ def test_the_scan_sees_reserved_and_declining_cents():
 
 def test_the_allowlisted_files_exist():
     names = set(_sources())
-    assert "unit/test_processor.py" in names
+    assert set(RESERVED_ALLOWED) <= names
     assert {name for name, _ in CENTS_13} <= names
