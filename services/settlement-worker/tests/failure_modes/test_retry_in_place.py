@@ -56,6 +56,11 @@ from support.stack import TOPIC
 
 NOT_JSON = b"\xff\xfe not json\n"
 DLQ_TIMEOUT = {"WORKER_DLQ_TIMEOUT_MS": 1000}
+# (b)-(d): of P's four retry checks, how many must have their full snapshot (offset and the payments
+# behind P) taken before P's dead letter is in the log (BUG-008). D-106's rule: floor(0.6 x min) over
+# this scenario's own runs, local i5-1240P: n = 20 (2026-11-02, the 20-run repeat in BUG-008), every
+# run 4 of 4, minimum 4, so 2.
+FULL_CHECKS_FLOOR = 2
 
 
 def _sample(port: int, prefix: str) -> Decimal:
@@ -156,23 +161,31 @@ def test_unclassified_retries_in_place_without_blocking_other_partitions(fm):
     with _worker(fm, group, FAULT_POINT="RAISE_BEFORE_COMMIT", FAULT_PAYMENT_ID=payment, **backoff) as worker:
         mine = {"partition": p_partition, "offset": p_offset}
         checked = 0
-        while not worker.events("message_dead_lettered", **mine):
-            assert worker.process.poll() is None, worker.diagnostics()
+        while True:
+            # Everything the checks assert is read first, then the log (BUG-008). The worker flushes
+            # message_dead_lettered before it commits P's offset and before anything behind P settles,
+            # so when this log read shows no dead letter, the snapshot was taken before it.
+            committed_now = _committed(fm, group, p_partition)
+            own = (_dedup_rows(fm, group, payment), _postings(fm, payment), _status(fm, payment))
+            behind = tuple(_status(fm, w) for w in witnesses)
+            dead = worker.events("message_dead_lettered", **mine)
             retries = worker.events("retry_scheduled", **mine)
             for retry in retries[checked:]:
-                checks.append(
-                    (_dedup_rows(fm, group, payment), _postings(fm, payment), _status(fm, payment))
-                    + tuple(_status(fm, w) for w in witnesses)
-                )
-                _assert_not_past(
-                    _committed(fm, group, p_partition), p_offset, f"after P's retry_scheduled attempt {retry['attempt']}"
-                )
+                if dead:
+                    # The snapshot may postdate the dead letter: only P's own state still holds.
+                    checks.append((retry["attempt"], own, None))
+                    continue
+                checks.append((retry["attempt"], own, behind))
+                _assert_not_past(committed_now, p_offset, f"after P's retry_scheduled attempt {retry['attempt']}")
             checked = len(retries)
+            if dead:
+                break
+            assert worker.process.poll() is None, worker.diagnostics()
             if retries and q is None:
                 # (c): published after P's first retry, so it can only settle if P's backoff lets
                 # the loop keep fetching other partitions.
-                q, behind = _publish_until(fm, group, customer, merchant, lambda pos: pos[0] != p_partition)
-                witnesses += [w for w, pos in behind.items() if pos[0] == p_partition]
+                q, others = _publish_until(fm, group, customer, merchant, lambda pos: pos[0] != p_partition)
+                witnesses += [w for w, pos in others.items() if pos[0] == p_partition]
             time.sleep(0.05)
 
         def past() -> bool:
@@ -202,8 +215,11 @@ def test_unclassified_retries_in_place_without_blocking_other_partitions(fm):
             retry,
             next_call,
         )
-    assert len(checks) == 4, checks
-    assert all(c[:3] == (0, 0, "AUTHORIZED") for c in checks), checks
+    assert [c[0] for c in checks] == [1, 2, 3, 4], checks
+    assert all(c[1] == (0, 0, "AUTHORIZED") for c in checks), checks
+    full = [c for c in checks if c[2] is not None]
+    print(f"RETRY_FULL_CHECKS full={len(full)} of {len(checks)}")
+    assert len(full) >= FULL_CHECKS_FLOOR, checks
     assert worker.events("processing_failed") == []
 
     [dead] = worker.events("message_dead_lettered", **mine)
@@ -229,9 +245,9 @@ def test_unclassified_retries_in_place_without_blocking_other_partitions(fm):
     assert len(q_settled) == 1, worker.diagnostics()
     assert _ts(q_settled[0]) < _ts(retries[-1]), (q_settled, retries[-1])
 
-    # (d): AUTHORIZED in every check; nothing behind P was applied before P's dead letter, and each
+    # (d): AUTHORIZED in every full check; nothing behind P was applied before P's dead letter, and each
     # settled once, in this worker, after it (by log order).
-    assert all(c[3:] == tuple("AUTHORIZED" for _ in c[3:]) for c in checks), checks
+    assert all(c[2] == tuple("AUTHORIZED" for _ in c[2]) for c in full), checks
     lines = worker.lines()
     dead_at = next(
         i for i, e in enumerate(lines)
