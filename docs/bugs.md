@@ -24,6 +24,7 @@
 | BUG-005 | 2026-10-19 23:25 | M3 | OppositeTransfersNoDeadlockTest misses the D-067 server-overlap floor on CI | P2 proof evidence, D-067 (component: ledger-api tests) | fixed | c54fae3 (PR #37) |
 | BUG-006 | 2026-10-20 00:18 | M3 | KafkaTopicReader finds no partitions for a topic created moments earlier | none (component: ledger-api tests) | fixed | 0eef4b2 (PR #38) |
 | BUG-007 | 2026-10-28 19:22 | M4 | A dead letter whose envelope parsed but failed a later check carries no dlq.event_id | D-111 (component: settlement-worker) | fixed | da44581 (PR #52) |
+| BUG-008 | 2026-11-02 11:53 | M4 | Retry-in-place scenario (b)–(d) reads the log before the committed offset, so a correct dead letter can fail its not-past check | none (component: settlement-worker tests; the test's evidence for invariant 6) | fixed | 93698e0 (PR #55; squash SHA to follow) |
 
 ---
 
@@ -392,3 +393,74 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 - **Decision Log impact:** none. The code now matches D-111.
 - **Summary (one sentence):** `_dead_letter` took the event's identity from `classify`, which also checks the record key, so a mis-keyed record with a valid envelope was dead-lettered without `dlq.event_id` or a correlation id. It now reads them from `envelope.parse` whenever the envelope parses.
 - **Notes:**
+
+---
+
+### BUG-008 — Retry-in-place scenario (b)–(d) reads the log before the committed offset, so a correct dead letter can fail its not-past check
+
+- **Found:** 2026-11-02 11:53 · M4 · Task T10 (audit) · branch `main` at `7293e7a`; to be fixed on `m4/t10a-fix-bug-008`
+- **Status:** fixed
+- **Component:** settlement-worker tests (`tests/failure_modes/test_retry_in_place.py`, `test_unclassified_retries_in_place_without_blocking_other_partitions`)
+- **Property / invariant touched:** none in the worker. The check that can be fooled is the test's evidence for CLAUDE.md invariant 6 (the offset is committed only after the DLQ ack, D-111): it can fail when the worker behaved correctly.
+- **Symptom:** no failing run of this test has been observed. What was found is a read order that can fail a correct worker:
+  - **The loop** ([test_retry_in_place.py:159-170](../services/settlement-worker/tests/failure_modes/test_retry_in_place.py#L159-L170)) reads the log first: `message_dead_lettered` for P (line 159), then P's `retry_scheduled` lines (161).
+  - **Then the offset:** for each retry it hasn't checked yet, it reads the group's committed offset (168) and asserts it is not past P.
+  - **The possible false failure:** `AssertionError: after P's retry_scheduled attempt 4: committed offset <P+1> > P's offset <P>`.
+  - **The same order failed for real** in an unmerged test. T10's case 5 (`test_processor_failures.py::test_transient_failures_do_not_count_toward_unclassified_exhaustion`, branch `m4/t10-processor-failures-proof` at `eaeae1b`) failed once in a full-suite run on 2026-11-02 (`1 failed, 302 passed in 682.84s`). It read the log first and the offset second:
+    ```
+    offset_committed = 4, offset = 3, when = "before P's dead letter"
+    E       AssertionError: before P's dead letter: committed offset 4 > P's offset 3
+    ```
+    That race is fixed on the T10 branch (`7aeca2c`) and is not part of this entry (D-131 proposed). This entry covers the loop on `main` with the same order.
+- **How detected:** a manual audit, which the owner asked for after the T10 case-5 failure. It covered every loop on `main` that asserts "the committed offset never passes P before its DLQ ack or event" and asked of each: does it read the log before the committed offset? Only this loop does.
+  - **T7 (f)** (`test_retry_in_place.py:311`) also reads the log first. It is safe: the DLQ topic doesn't exist until line 313 creates it, so nothing can be committed in between.
+  - **T9 case 4** (`test_dead_letter.py:236-241`) reads the committed offset first.
+  - **The rest** (T7 (g), T9 cases 1–3 and 5, `support/failure_kit.py`) make no not-past assertion in a loop.
+- **Reproduction:** deterministic, with a pause (local only, never committed). Insert `time.sleep(2.5)` in the loop iteration that first sees P's retry 4, right after the retries are read, then run:
+  ```powershell
+  cd services\settlement-worker; .\.venv\Scripts\Activate.ps1
+  pytest tests/failure_modes/test_retry_in_place.py -k test_unclassified_retries_in_place_without_blocking_other_partitions
+  ```
+  On main's loop it fails at the committed-offset check (evidence (a) under Regression test).
+- **Time to diagnose:** none beyond the finding. The audit at 11:53 found the offset read. The witness reads (below) were found while writing the fix plan, and evidence (a) and (b) confirmed both at 12:58 and 13:00.
+- **Root cause:** the worker's order is fixed. In `_dead_letter` it awaits the DLQ ack ([consumer.py:391](../services/settlement-worker/src/settlement_worker/consumer.py#L391)), then writes and flushes `message_dead_lettered` (392; `LineWriter` flushes every line, [logging_setup.py:18-21](../services/settlement-worker/src/settlement_worker/logging_setup.py#L18-L21)), and only then commits offset+1 (409). After that, the records behind P on its partition (R) are processed and settle.
+  - **Two reads came after the log.** The loop read the log first (the dead letter, then the retries), and only afterwards two pieces of the state its checks assert:
+    - **the committed offset** (asserted not past P);
+    - **the statuses of the payments behind P** (asserted still AUTHORIZED, scenario (d)).
+
+    Either read could see the effects of a dead letter the log read had missed.
+  - **The witness read was masked.** Before the fix it was taken before the offset read in the same iteration, so whenever R had settled, the offset check had already failed first. It shows up on its own once only the offset read is moved (evidence (b)).
+  - **Why log-first fails:** the loop reads the log before the offset. If P's dead letter and its commit both happen between the two reads, the loop has seen "no dead letter yet" and then reads an offset past P.
+  - **When it can happen:** only the check for retry 4 can hit this, because after retries 1–3 the next run is another retry and commits nothing. With (b)'s backoff (500, 1000, 2000, 2000 ms), P's 5th run starts 2000 ms after retry 4 is logged.
+  - **How the window narrows:** the loop records checks when it *sees* a retry, not when the retry happened. The iteration that first sees retry 1 then calls `_publish_until` to publish Q, which authorizes, publishes and reads back positions, one candidate at a time. If that call takes long enough, retries 2–4 are first seen together in a later iteration, and part of retry 4's 2000 ms backoff has already gone by. Each check also opens several DB connections (dedup, postings, P's status, each witness's status) before its offset read. How long these steps take has not been measured.
+  - **This is reasoning, not a measurement.** No run of (b)–(d) has failed this way.
+- **Why it wasn't caught earlier:** T7 (b) was written before T9 case 4 established "committed offset first, then the evidence" for this kind of check. T9's audit of (b)–(d) (inventory row 4) looked at what the scenario asserts, not at the order of its reads. The window needs a stall of most of a 2000 ms backoff, and no run has hit it.
+- **Fix (test code only):** each loop iteration now takes a snapshot of everything its checks assert before it reads the log: the committed offset, P's dedup row, postings and status, and every witness's status. Then it reads the log: the dead letter, then the retries.
+  - **Why the snapshot is sound.** The worker flushes `message_dead_lettered` before it commits and before anything behind P settles. So when the log read shows no dead letter, the snapshot predates it.
+  - **Retries seen with the dead letter** get P's own checks only (no dedup row, no posting, AUTHORIZED), which still hold after a dead letter. Their not-past and witness parts are skipped.
+  - **Every retry still gets an entry:** `[c[0] for c in checks] == [1, 2, 3, 4]`.
+  - **Floor:** at least `FULL_CHECKS_FLOOR` = 2 full checks are required (D-106's rule, n = 20, minimum 4; see below). `first_past` is unchanged.
+  - **Commits:** `93698e0` (the reordered loop) and the floor commit, on `m4/t10a-fix-bug-008` · PR #55. The squash commit on `main` is filled in by the next PR that touches this file, as with BUG-007.
+- **Regression test:** `services/settlement-worker/tests/failure_modes/test_retry_in_place.py::test_unclassified_retries_in_place_without_blocking_other_partitions`, with the reordered loop.
+  - **The evidence.** Each variant was local only, staged first, then restored with `git restore`, and `git diff --quiet` gave exit 0. Each has the 2.5 s pause above; the backoff after retry 4 is 2000 ms, so run 5, the DLQ ack, the event, the commit and R's settle land inside it.
+    - **(a) Red, main's order** (12:58:55):
+      ```
+      E       AssertionError: after P's retry_scheduled attempt 4: committed offset 2 > P's offset 0
+      1 failed, 4 deselected in 49.01s
+      ```
+    - **(b) Red, only the offset read moved before the log** (13:00:03). The witness check fails, with R read after it settled:
+      ```
+      >       assert all(c[3:] == tuple("AUTHORIZED" for _ in c[3:]) for c in checks), checks
+      E       AssertionError: [(0, 0, 'AUTHORIZED', 'AUTHORIZED'), (0, 0, 'AUTHORIZED', 'AUTHORIZED'), (0, 0, 'AUTHORIZED', 'AUTHORIZED'), (0, 0, 'AUTHORIZED', 'SETTLED')]
+      1 failed, 4 deselected in 64.53s (0:01:04)
+      ```
+    - **(c) Green, the full fix** (13:07:05): `RETRY_FULL_CHECKS full=4 of 4`, `1 passed, 4 deselected in 46.07s`. A first attempt at 13:05:23 errored in stack setup (BUG-009) and was re-run.
+  - **20 runs of the scenario alone, without the pause,** one stack per run:
+    - **Results:** 20 passed and 0 failed. Every run had `RETRY_FULL_CHECKS full=4 of 4` (distribution: 4 → 20 runs; minimum 4).
+    - **When:** runs 1–15 from 13:08 to 13:20:35, runs 16–20 from 15:25 to 15:29:43.
+    - **The interruption:** one attempt errored in stack setup with BUG-009's symptom (13:35:51, 912.55 s). It reached no scenario code, so it wasn't counted as a scenario run and was replaced (run 16 of 20 is the replacement). It is recorded in BUG-009's entry.
+- **Decision Log impact:** none.
+- **Summary (one sentence):** Scenario (b)–(d) read the log before the committed offset and the statuses of the payments behind P, so a dead letter, its commit and R's settle landing between those reads could fail its checks on a correct worker. Each iteration now snapshots the asserted state before reading the log, and retries first seen with the dead letter get only the checks that still hold.
+- **Notes:**
+  - **A related consequence of the same "checks when seen" timing (reasoning, for the fix plan):** if retries 2–4 *and* the dead letter all land while `_publish_until` runs, the next iteration's log read finds the dead letter and leaves the loop with those retries unchecked. `assert len(checks) == 4` would then fail, also on a correct worker. The fix plan should say whether it covers this too.
+  - **Resolved by the fix:** retries are now read after the dead letter in the same iteration, so all four always get an entry. Only their full checks depend on timing, and the floor covers those.
