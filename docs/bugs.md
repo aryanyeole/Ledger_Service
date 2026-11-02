@@ -25,9 +25,9 @@
 | BUG-006 | 2026-10-20 00:18 | M3 | KafkaTopicReader finds no partitions for a topic created moments earlier | none (component: ledger-api tests) | fixed | 0eef4b2 (PR #38) |
 | BUG-007 | 2026-10-28 19:22 | M4 | A dead letter whose envelope parsed but failed a later check carries no dlq.event_id | D-111 (component: settlement-worker) | fixed | da44581 (PR #52) |
 | BUG-008 | 2026-11-02 11:53 | M4 | Retry-in-place scenario (b)–(d) reads the log before the committed offset, so a correct dead letter can fail its not-past check | none (component: settlement-worker tests; the test's evidence for invariant 6) | fixed | 3ed04ce (PR #55) |
-| BUG-009 | 2026-11-02 13:37 | M4 | The worker stacks' Kafka startup wait reports a started broker as not started, long after its 90 s timeout | none (component: settlement-worker tests, `support/stack.py`) | fixed | 7469457 (PR #56; squash SHA to follow) |
-| BUG-010 | 2026-11-02 13:37 | M4 | A Kafka container whose startup wait fails is never stopped | none (component: settlement-worker tests, `support/stack.py`) | fixed | 7469457 (PR #56; squash SHA to follow) |
-| BUG-011 | 2026-11-02 16:12 | M4 | Failure-mode setups that publish until a payment lands on a chosen partition give up after a fixed 12 or 15 tries, so a correct run fails about 0.7% of the time | none (component: settlement-worker tests) | open | — |
+| BUG-009 | 2026-11-02 13:37 | M4 | The worker stacks' Kafka startup wait reports a started broker as not started, long after its 90 s timeout | none (component: settlement-worker tests, `support/stack.py`) | fixed | 7562fc0 (PR #56) |
+| BUG-010 | 2026-11-02 13:37 | M4 | A Kafka container whose startup wait fails is never stopped | none (component: settlement-worker tests, `support/stack.py`) | fixed | 7562fc0 (PR #56) |
+| BUG-011 | 2026-11-02 16:12 | M4 | Failure-mode setups that publish until a payment lands on a chosen partition give up after a fixed 12 or 15 tries, so a correct run fails about 0.7% of the time | none (component: settlement-worker tests) | fixed | 0252caf (PR #57; squash SHA to follow) |
 
 ---
 
@@ -506,7 +506,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 - **Fix (test code only):** `kafka()` no longer uses a log-message wait. `_wait_for_broker` is its only readiness gate:
   - **Bounds:** one overall deadline (`BROKER_READY_TIMEOUT_SECONDS` = 90). Each attempt (admin start + `describe_cluster`) is bounded by `asyncio.timeout(min(5 s, the time left))`, and each attempt's client close by 1 s.
   - **On timeout:** `TimeoutError` names the last attempt's error. The message carries the container's last log lines, fetched on a daemon thread bounded by 10 s (`DIAGNOSTIC_LOGS_TIMEOUT_SECONDS`). If Docker doesn't answer in time, the message says "container logs not fetched" instead.
-  - **Commits:** `7469457` · PR #56 (squash SHA to follow).
+  - **Commits:** `7469457` · PR #56, squash-merged to `main` as `7562fc0`.
 - **Regression test:** `services/settlement-worker/tests/integration/test_stack_startup.py`. Real containers throughout.
   - **`test_kafka_is_ready_while_the_logs_api_is_slow_and_stale`:** with `get_logs` slow and stale, `kafka()` yields a working broker (`describe_cluster` answers), never calls `get_logs`, and is ready within the 90 s deadline.
   - **`test_the_readiness_gate_gives_up_by_its_deadline_naming_the_last_error`:** against an address nothing listens on, with a 5 s deadline, the gate raises within 5 s plus at most one attempt's bound plus 1 s, naming the last error.
@@ -554,7 +554,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
   - **`postgres()` has the same shape** (start at 154, `try` at 155). No Postgres start has failed so far, but it would leak the same way.
   - **testcontainers doesn't clean up either:** a failed `start()` re-raises without stopping the container it created.
 - **Why it wasn't caught earlier:** no Kafka start had failed before BUG-009.
-- **Fix (test code only):** `kafka()` and `postgres()` call `container.start()` inside the `try`, so `finally: container.stop()` runs whenever the start or the readiness wait fails. `stop()` is a no-op if the container was never created. Commit `7469457` · PR #56 (squash SHA to follow).
+- **Fix (test code only):** `kafka()` and `postgres()` call `container.start()` inside the `try`, so `finally: container.stop()` runs whenever the start or the readiness wait fails. `stop()` is a no-op if the container was never created. Commit `7469457` · PR #56, squash-merged to `main` as `7562fc0`.
 - **Regression test:** `services/settlement-worker/tests/integration/test_stack_startup.py::test_a_container_whose_start_fails_is_stopped`, parametrized `[kafka]` and `[postgres]`. It forces a failure right after the container is up and asserts the container isn't running afterwards. In the red run, its cleanup removed the containers left behind.
   - **Red before the fix** (main's `stack.py` in the working tree, staged first, restored with `git restore`, `git diff --quiet` exit 0; finished 15:55:25):
     ```
@@ -585,7 +585,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 ### BUG-011 — Failure-mode setups that publish until a payment lands on a chosen partition give up after a fixed 12 or 15 tries, so a correct run fails about 0.7% of the time
 
 - **Found:** 2026-11-02 16:12 · M4 · Task T10b (BUG-009/010's full-suite run) · branch `m4/t10b-fix-bug-009-010` at `50d2105`, test code as on `main` at `3ed04ce`; entry on `m4/t10c-fix-bug-011`
-- **Status:** open
+- **Status:** fixed
 - **Component:** settlement-worker tests (`tests/failure_modes/`: `test_retry_in_place.py::_publish_until`, `test_connection_loss.py::_publish_until`, `test_processor_failures.py::_one_per_partition`)
 - **Property / invariant touched:** none. A scenario errors in its setup before the worker processes anything.
 - **Symptom:** in the full worker suite on `m4/t10b-fix-bug-009-010` at `50d2105` (jar rebuilt; finished 16:09:29), scenario (b)–(d) failed in its setup:
@@ -599,7 +599,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
   - **The positions:** the 12 candidates' (partition, offset) were (2, 0), (2, 1), (0, 0), (0, 1), (0, 2), (2, 2), (0, 3), (2, 3), (0, 4), (2, 4), (2, 5), (2, 6). That's six on each of partitions 0 and 2 and none on P's partition (1).
   - **The rest of the run was unaffected.** The run's one warning came from a different cause in that branch's own new code; it is fixed there and is not part of this entry.
 - **How detected:** that full-suite run, local i5-1240P.
-- **Reproduction:** not on demand, since the partition of a random payment id can't be chosen. A deterministic reproduction for the fix PR: make every candidate land off P's partition, for example by stubbing the position read-back.
+- **Reproduction:** not on demand with real payments, since the partition of a random payment id can't be chosen. The draw loop's limit is reproduced deterministically instead, with scripted partition sequences in place of the broker (`tests/unit/test_draw_until.py`, below).
 - **Time to diagnose:** none beyond reading the failure. The helper's fixed limit and the candidates' partitions are both in the output.
 - **Root cause:** each candidate is a new payment with a random UUID, published keyed by its id with the real partitioner. Its partition is effectively random over the topic's 3 partitions. The helpers give up after a fixed number of tries.
   - **The odds, assuming a uniform partitioner (reasoning, not measured):**
@@ -608,9 +608,28 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
     - **Q in (b)–(d)** (`test_retry_in_place.py:187`): needs any other partition, so a miss in 12 has probability (1/3)^12 ≈ 2×10⁻⁶. Negligible.
   - **The limits:** 12 (since #46, `bd32c37`) and 15 (#54).
 - **Why it wasn't caught earlier:** each run has a sub-1% chance to fail. Passing runs don't show the limit is too tight, and no earlier run hit it.
-- **Fix:** pending (its own PR; plan first).
-- **Regression test:** pending.
-- **Decision Log impact:** none expected.
-- **Summary (one sentence):** written when fixed.
+- **Fix (test code only; the real partitioner kept, D-103/D-105):** one shared helper in `tests/support/failure_kit.py` replaces all three call sites.
+  - **`draw_until(draw, done, cap=PUBLISH_CAP)`:** draws until `done(drawn)` holds and returns `{key: (partition, offset)}` in draw order. After `cap` draws it fails with the partition tally and every position drawn.
+  - **`PUBLISH_CAP = 64`,** with the odds in a comment (reasoning, uniform partitioner assumed):
+    - one target partition (2/3)^64 ≈ 5×10⁻¹²;
+    - all three partitions ≈ 3·(2/3)^64 ≈ 2×10⁻¹¹;
+    - any other partition (1/3)^64.
+  - **`publish_until(fm, customer, merchant, done, *, amount="10.00")`** draws real payments: authorize `amount` (a decimal string, D-047), publish from the outbox row, read the position back. `newest_position(drawn)` gives the latest draw's position.
+  - **The call sites keep their own conditions and return shapes:**
+    - R in (b)–(d), Q in (b)–(d) (the other candidates on P's partition still become witnesses), and R in `test_connection_loss.py` (d);
+    - `_one_per_partition` in T10 case 3, now a thin wrapper.
+  - **Commit:** `0252caf` · PR #57 (squash SHA to follow).
+- **Regression test:** `services/settlement-worker/tests/unit/test_draw_until.py`. No broker; scripted partition sequences:
+  - **Draw 13:** a target partition first drawn on draw 13 is found.
+  - **Draw 16:** all three partitions, first covered on draw 16, are found.
+  - **Never met:** the loop fails after exactly 64 draws, with the message `no draw satisfied the condition within 64 draws; partition tally {0: 32, 2: 32}; drawn: {...}`.
+  - **Red** (`PUBLISH_CAP` mutated; staged first, restored with `git restore`, `git diff --quiet` exit 0 after each):
+    - **Cap 12 (the old limit):** `3 failed`. Draw 13 is never reached (`within 12 draws; partition tally {0: 6, 2: 6}`), and likewise the draw-16 case and the never-met case (`assert 12 == 64`).
+    - **Cap 15 (`_one_per_partition`'s old limit):** `2 failed, 1 passed`. The draw-16 case fails (`within 15 draws; partition tally {0: 8, 2: 7}`) and the never-met case fails (`assert 15 == 64`); the draw-13 case passes.
+  - **Green** (cap 64, `0252caf`): `3 passed`.
+  - **The call sites themselves** run in the full suite. `test_retry_in_place.py` (b)–(d), `test_connection_loss.py` (d) and `test_processor_failures.py` case 3 all pass there.
+- **Decision Log impact:** none.
+- **Summary (one sentence):** Setups that needed a payment on a particular partition, or one on every partition, gave up after a fixed 12 or 15 random draws, so a correct run failed about 0.7% of the time. One shared helper now draws until the condition holds, up to 64 draws (a miss ≈ 10⁻¹¹), and reports the partition tally if it ever misses.
 - **Notes:**
   - **Numbering:** BUG-009 and BUG-010 are on `m4/t10b-fix-bug-009-010`, not yet on `main`, which is why they aren't in this file on this branch.
+  - **Update:** BUG-009 and BUG-010 merged in #56 and now appear above this entry. The note above applied to the branch before that merge.
