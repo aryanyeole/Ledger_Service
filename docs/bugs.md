@@ -434,6 +434,10 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 - **Summary (one sentence):** written when fixed.
 - **Notes:**
   - **BUG-008's numbering:** BUG-008 is open on `m4/t10a-fix-bug-008`, not yet on `main`, which is why it isn't in this file on this branch.
+  - **Occurrences in BUG-008's 20-run repeat loop** (counted by the owner's rule: a setup error with this symptom is not a scenario result; it is recorded here, its leaked container's `docker logs -t` and `docker inspect` saved, the container removed, and the run replaced):
+    - **13:35:51:** Run 1 above (912.55 s). It was attempt 16 of the first pass, which stopped there. Container `dcc313e321a4` was removed just before the 15:25 runs; its evidence had been saved at 13:37.
+    - **15:25–15:29:** five more attempts, no occurrence. They gave scenario runs 16–20.
+    - **Total in the loop:** 1 occurrence in 21 stack starts.
 
 ---
 
