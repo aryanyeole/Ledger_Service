@@ -57,8 +57,10 @@ from support.stack import TOPIC
 NOT_JSON = b"\xff\xfe not json\n"
 DLQ_TIMEOUT = {"WORKER_DLQ_TIMEOUT_MS": 1000}
 # (b)-(d): of P's four retry checks, how many must have their full snapshot (offset and the payments
-# behind P) taken before P's dead letter is in the log (BUG-008).
-FULL_CHECKS_FLOOR = 1
+# behind P) taken before P's dead letter is in the log (BUG-008). D-106's rule: floor(0.6 x min) over
+# this scenario's own runs, local i5-1240P: n = 20 (2026-11-02, the 20-run repeat in BUG-008), every
+# run 4 of 4, minimum 4, so 2.
+FULL_CHECKS_FLOOR = 2
 
 
 def _sample(port: int, prefix: str) -> Decimal:
