@@ -24,6 +24,8 @@
 | BUG-005 | 2026-10-19 23:25 | M3 | OppositeTransfersNoDeadlockTest misses the D-067 server-overlap floor on CI | P2 proof evidence, D-067 (component: ledger-api tests) | fixed | c54fae3 (PR #37) |
 | BUG-006 | 2026-10-20 00:18 | M3 | KafkaTopicReader finds no partitions for a topic created moments earlier | none (component: ledger-api tests) | fixed | 0eef4b2 (PR #38) |
 | BUG-007 | 2026-10-28 19:22 | M4 | A dead letter whose envelope parsed but failed a later check carries no dlq.event_id | D-111 (component: settlement-worker) | fixed | da44581 (PR #52) |
+| BUG-009 | 2026-11-02 13:37 | M4 | The worker stacks' Kafka startup wait reports a started broker as not started, long after its 90 s timeout | none (component: settlement-worker tests, `support/stack.py`) | open | — |
+| BUG-010 | 2026-11-02 13:37 | M4 | A Kafka container whose startup wait fails is never stopped | none (component: settlement-worker tests, `support/stack.py`) | open | — |
 
 ---
 
@@ -391,4 +393,68 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
   - **Full worker suite** (local, i5-1240P, jar rebuilt per D-083): `290 passed in 426.22s`, finished 19:45.
 - **Decision Log impact:** none. The code now matches D-111.
 - **Summary (one sentence):** `_dead_letter` took the event's identity from `classify`, which also checks the record key, so a mis-keyed record with a valid envelope was dead-lettered without `dlq.event_id` or a correlation id. It now reads them from `envelope.parse` whenever the envelope parses.
+- **Notes:**
+
+---
+
+### BUG-009 — The worker stacks' Kafka startup wait reports a started broker as not started, long after its 90 s timeout
+
+- **Found:** 2026-11-02 13:37 · M4 · Task T10a (BUG-008's evidence runs) · branch `m4/t10a-fix-bug-008` at `93698e0`, harness code as on `main` at `020c3f8`; entry on `m4/t10b-fix-bug-009-010`
+- **Status:** open
+- **Component:** settlement-worker tests (`tests/support/stack.py`, `kafka()`)
+- **Property / invariant touched:** none. A test errors at setup before the system under test runs.
+- **Symptom:** a module's stack setup errors in `stack.kafka()`. Neither run reached its test.
+  - **Run 1:** `pytest tests/failure_modes/test_retry_in_place.py -k test_unclassified_retries_in_place_without_blocking_other_partitions`, finished 13:35:51 →
+    ```
+    E               TimeoutError: Container did not emit logs containing 'Kafka Server started' within 90.000 seconds. Container status: running, health: no health check. Recent stdout: ...tenerType=CONTROLLER, nodeId=1] Enabling request processing. (kafka.network.SocketServer)
+    E               [2026-11-02 20:21:01,000] INFO Awaiting socket connections on 0.0.0.0:9093. (kafka.network.DataPlaneAcceptor)
+    4 deselected, 1 error in 912.55s (0:15:12)
+    ```
+  - **The container had started.** It was `dcc313e321a4`, created 20:20:51 UTC (13:20:51). Its own log (`docker logs -t`, read at 13:37) has the line the wait looks for 11 s after creation: `2026-11-02T20:21:02.025521120Z [2026-11-02 20:21:02,025] INFO [KafkaRaftServer nodeId=1] Kafka Server started`.
+  - **The logs the wait saw were stale.** The "Recent stdout" in the error was fetched after the timeout, more than a minute after that line was written, yet it ends at 20:21:01,000.
+  - **It ran far past its timeout:** the run took 912.55 s against a 90 s startup timeout.
+  - **Run 2:** the same error once before, at 13:05:23, in BUG-008's evidence run (c), `4 deselected, 1 error in 314.31s (0:05:14)`. Its container `04c9d3b0ab63` was removed (13:06) before its logs were read, so for that run it isn't known whether the line had been written.
+- **How detected:** the errors above, in local runs on the i5-1240P, Docker client/server 29.7.2, json-file log driver. Run 1 was BUG-008's 20× repeat loop (run 16, after 15 passes). Run 2 was BUG-008's evidence run (c), which was then re-run and passed.
+  - **Handling at the time:** I took the first error for an environment hiccup. I removed the leaked container and re-ran without opening an entry. The second error, and the stale "Recent stdout" next to the container's own log, made it a harness defect.
+- **Reproduction:** not reproduced on demand. Two in roughly 20 stack starts on 2026-11-02 afternoon (BUG-008's evidence runs and repeat loop), none in the many earlier runs of these stacks.
+  ```powershell
+  # the saved evidence for run 1, in the session scratchpad:
+  # bug009-dcc313-logs.txt (docker logs -t), bug009-dcc313-inspect.json, bug008-repeat-16.txt (pytest output)
+  ```
+- **Time to diagnose:** in progress. What is known at 13:37 is listed below.
+- **Root cause:** not established yet. Known so far:
+  - **How the wait works.** `kafka()` waits with testcontainers 4.15.0's `LogMessageWaitStrategy("Kafka Server started").with_startup_timeout(90)` ([stack.py:288](../services/settlement-worker/tests/support/stack.py#L288)). It polls `container.get_logs()`, the Docker API's whole log, and checks the timeout only between polls.
+  - **What that implies.** Both the 912 s duration and the stale log text are consistent with Docker's logs API returning stale output and taking long to answer.
+  - **Not confirmed:** whether Docker or the client library is at fault.
+  - **The readiness probe is already there.** `_wait_for_broker` ([stack.py:292](../services/settlement-worker/tests/support/stack.py#L292)) checks the broker with an admin client after the log wait. It doesn't depend on the logs API.
+- **Why it wasn't caught earlier:** it hadn't happened before on these stacks, as far as the retained outputs show.
+- **Fix:** pending (its own PR; plan first).
+- **Regression test:** pending.
+- **Decision Log impact:** none expected.
+- **Summary (one sentence):** written when fixed.
+- **Notes:**
+  - **BUG-008's numbering:** BUG-008 is open on `m4/t10a-fix-bug-008`, not yet on `main`, which is why it isn't in this file on this branch.
+
+---
+
+### BUG-010 — A Kafka container whose startup wait fails is never stopped
+
+- **Found:** 2026-11-02 13:37 · M4 · Task T10a (BUG-008's evidence runs) · harness code as on `main` at `020c3f8`; entry on `m4/t10b-fix-bug-009-010`
+- **Status:** open
+- **Component:** settlement-worker tests (`tests/support/stack.py`, `kafka()`)
+- **Property / invariant touched:** none. Leaked containers keep running on the developer's Docker host.
+- **Symptom:** after each BUG-009 error the Kafka container was still running.
+  - **At 13:06:** `docker ps` showed `04c9d3b0ab63 apache/kafka:4.3.1 Up 5 minutes`, labelled `org.testcontainers=true` / `org.testcontainers.lang=python`, 5 minutes after the pytest run that started it had exited. I removed it with `docker rm -f`.
+  - **At 13:37:** `docker ps` showed `dcc313e321a4 apache/kafka:4.3.1 Up 15 minutes`, using 293.5 MiB, after run 1's pytest had exited at 13:35:51.
+  - **Not reaped:** neither container had been removed by testcontainers' Ryuk reaper when it was found.
+- **How detected:** `docker ps -a` and `docker inspect` while investigating BUG-009.
+- **Reproduction:** follows from any BUG-009 occurrence; not reproduced on demand.
+- **Time to diagnose:** the leak's mechanism below was found at 13:37 by reading `kafka()`. Why Ryuk didn't reap the containers hasn't been looked at.
+- **Root cause (leak):** `kafka()` calls `container.start()`, which runs the startup wait, at [stack.py:289](../services/settlement-worker/tests/support/stack.py#L289), before its `try:`/`finally: container.stop()` (290-295). When the wait raises, the container is running but `stop()` is never called.
+  - **`postgres()` has the same shape** (start at 154, `try` at 155). No Postgres start has failed so far, but it would leak the same way.
+- **Why it wasn't caught earlier:** no Kafka start had failed before BUG-009.
+- **Fix:** pending (with BUG-009's PR; plan first).
+- **Regression test:** pending.
+- **Decision Log impact:** none expected.
+- **Summary (one sentence):** written when fixed.
 - **Notes:**
