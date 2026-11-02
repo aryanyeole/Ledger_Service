@@ -15,6 +15,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -27,7 +28,6 @@ import pytest
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
 from testcontainers.community.postgres import PostgresContainer
 from testcontainers.core.container import DockerContainer
-from testcontainers.core.wait_strategies import LogMessageWaitStrategy
 
 from support.api import ApiClient
 
@@ -50,6 +50,13 @@ PASSWORDS = {"settlement_worker": WORKER_PASSWORD, "ledger_api_app": APP_PASSWOR
 
 PACKAGE_HINT = r"run .\mvnw.cmd -q -DskipTests package in services\ledger-api"
 MIGRATE_TIMEOUT_SECONDS = 120
+
+# The broker's readiness gate (BUG-009): the whole wait, one attempt (admin start + describe_cluster),
+# closing an attempt's client, and the container-log fetch for a failed wait's message.
+BROKER_READY_TIMEOUT_SECONDS = 90
+BROKER_ATTEMPT_TIMEOUT_SECONDS = 5
+BROKER_CLOSE_TIMEOUT_SECONDS = 1
+DIAGNOSTIC_LOGS_TIMEOUT_SECONDS = 10
 
 
 @dataclass(frozen=True)
@@ -151,8 +158,9 @@ def postgres():
         .with_env("SETTLEMENT_WORKER_PASSWORD", WORKER_PASSWORD)
         .with_volume_mapping(str(ROLES_SCRIPT), "/docker-entrypoint-initdb.d/01-roles.sh", "ro")
     )
-    container.start()
+    # start() inside the try: a start whose readiness wait fails still stops the container (BUG-010).
     try:
+        container.start()
         yield Database(
             host=_host(container),
             port=int(container.get_exposed_port(5432)),
@@ -204,19 +212,55 @@ def migrate(database: Database, jar: Path) -> None:
 
 
 async def _wait_for_broker(bootstrap: str, deadline: float) -> None:
-    last_error: Exception | None = None
-    while time.monotonic() < deadline:
-        admin = AIOKafkaAdminClient(bootstrap_servers=bootstrap, request_timeout_ms=5000)
+    """The broker's only readiness gate (BUG-009): an admin client's describe_cluster at the advertised
+    address, retried until deadline (a time.monotonic() value). Each attempt is bounded by
+    min(BROKER_ATTEMPT_TIMEOUT_SECONDS, the time left) and its client's close by
+    BROKER_CLOSE_TIMEOUT_SECONDS, so the wait ends by the deadline plus at most that close. It never
+    reads container logs. TimeoutError names the last attempt's error."""
+    last_error = "no attempt made"
+    while (remaining := deadline - time.monotonic()) > 0:
+        bound = min(BROKER_ATTEMPT_TIMEOUT_SECONDS, remaining)
+        admin = AIOKafkaAdminClient(bootstrap_servers=bootstrap, request_timeout_ms=BROKER_ATTEMPT_TIMEOUT_SECONDS * 1000)
         try:
-            await admin.start()
-            await admin.describe_cluster()
+            async with asyncio.timeout(bound) as attempt:
+                await admin.start()
+                await admin.describe_cluster()
             return
         except Exception as ex:  # noqa: BLE001 - retried until the deadline
-            last_error = ex
-            await asyncio.sleep(0.5)
+            expired = isinstance(ex, TimeoutError) and attempt.expired()
+            last_error = f"attempt not answered within {bound:.1f} s" if expired else repr(ex)
         finally:
-            await admin.close()
-    raise TimeoutError(f"Kafka at {bootstrap} not ready: {last_error!r}")
+            try:
+                async with asyncio.timeout(BROKER_CLOSE_TIMEOUT_SECONDS):
+                    await admin.close()
+            except Exception:  # noqa: BLE001 - a client that never connected; the wait goes on
+                pass
+        await asyncio.sleep(max(0.0, min(0.5, deadline - time.monotonic())))
+    raise TimeoutError(f"Kafka at {bootstrap} not ready by the deadline; last error: {last_error}")
+
+
+def _with_container_logs(message: str, container: DockerContainer) -> str:
+    """message plus the container's last log lines, fetched on a daemon thread bounded by
+    DIAGNOSTIC_LOGS_TIMEOUT_SECONDS: a Docker logs call can block (BUG-009). If it doesn't answer in
+    time, or fails, message is returned without the logs, saying why. The thread never raises: it may
+    outlive this call."""
+    result: dict[str, str] = {}
+
+    def fetch() -> None:
+        try:
+            stdout, stderr = container.get_logs()
+            result["logs"] = (stdout + stderr).decode("utf-8", errors="replace")[-4000:]
+        except Exception as ex:  # noqa: BLE001 - reported in the message; the wait's error is what matters
+            result["error"] = repr(ex)
+
+    reader = threading.Thread(target=fetch, daemon=True)
+    reader.start()
+    reader.join(DIAGNOSTIC_LOGS_TIMEOUT_SECONDS)
+    if "logs" in result:
+        return f"{message}\n--- container logs (last 4000 characters) ---\n{result['logs']}"
+    if "error" in result:
+        return f"{message} (container logs not fetched: {result['error']})"
+    return f"{message} (container logs not fetched: no answer from Docker within {DIAGNOSTIC_LOGS_TIMEOUT_SECONDS} s)"
 
 
 async def topic_partitions(bootstrap: str, topic: str) -> set[int] | None:
@@ -285,11 +329,16 @@ def kafka():
         container.with_env(key, value)
     # with_bind_ports only takes a host port (binding 0.0.0.0); docker-py accepts (ip, port).
     container.ports[f"{port}/tcp"] = ("127.0.0.1", port)
-    container.waiting_for(LogMessageWaitStrategy("Kafka Server started").with_startup_timeout(90))
-    container.start()
+    # No log-message wait: its Docker logs calls can block past its timeout and return stale logs
+    # (BUG-009). _wait_for_broker is the only readiness gate. start() is inside the try, so a failed
+    # start or wait still stops the container (BUG-010).
     try:
+        container.start()
         bootstrap = f"127.0.0.1:{port}"
-        asyncio.run(_wait_for_broker(bootstrap, time.monotonic() + 60))
+        try:
+            asyncio.run(_wait_for_broker(bootstrap, time.monotonic() + BROKER_READY_TIMEOUT_SECONDS))
+        except TimeoutError as ex:
+            raise TimeoutError(_with_container_logs(str(ex), container)) from ex
         yield Kafka(bootstrap_servers=bootstrap, container_id=container.get_wrapped_container().id)
     finally:
         container.stop()
