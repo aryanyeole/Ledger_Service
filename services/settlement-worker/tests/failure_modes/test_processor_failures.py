@@ -287,9 +287,14 @@ def test_transient_failures_do_not_count_toward_unclassified_exhaustion(fm):
 
     env = {"FAULT_POINT": "RAISE_BEFORE_COMMIT", "FAULT_PAYMENT_ID": payment, "WORKER_MAX_ATTEMPTS": 2}
     with _worker(fm, group, **env) as worker:
-        while not worker.events("message_dead_lettered", **mine):
+        while True:
+            # The committed offset first, then the log: the worker flushes message_dead_lettered before
+            # it commits, so an offset past P read here means the event is in the log read below.
+            committed_now = _committed(fm, group, partition)
+            if worker.events("message_dead_lettered", **mine):
+                break
             assert worker.process.poll() is None, worker.diagnostics()
-            _assert_not_past(_committed(fm, group, partition), offset, "before P's dead letter")
+            _assert_not_past(committed_now, offset, "before P's dead letter")
             time.sleep(0.05)
 
         def past() -> bool:
