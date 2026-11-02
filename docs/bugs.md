@@ -25,6 +25,7 @@
 | BUG-006 | 2026-10-20 00:18 | M3 | KafkaTopicReader finds no partitions for a topic created moments earlier | none (component: ledger-api tests) | fixed | 0eef4b2 (PR #38) |
 | BUG-007 | 2026-10-28 19:22 | M4 | A dead letter whose envelope parsed but failed a later check carries no dlq.event_id | D-111 (component: settlement-worker) | fixed | da44581 (PR #52) |
 | BUG-008 | 2026-11-02 11:53 | M4 | Retry-in-place scenario (b)–(d) reads the log before the committed offset, so a correct dead letter can fail its not-past check | none (component: settlement-worker tests; the test's evidence for invariant 6) | fixed | 93698e0 (PR #55; squash SHA to follow) |
+| BUG-011 | 2026-11-02 16:12 | M4 | Failure-mode setups that publish until a payment lands on a chosen partition give up after a fixed 12 or 15 tries, so a correct run fails about 0.7% of the time | none (component: settlement-worker tests) | open | — |
 
 ---
 
@@ -464,3 +465,38 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 - **Notes:**
   - **A related consequence of the same "checks when seen" timing (reasoning, for the fix plan):** if retries 2–4 *and* the dead letter all land while `_publish_until` runs, the next iteration's log read finds the dead letter and leaves the loop with those retries unchecked. `assert len(checks) == 4` would then fail, also on a correct worker. The fix plan should say whether it covers this too.
   - **Resolved by the fix:** retries are now read after the dead letter in the same iteration, so all four always get an entry. Only their full checks depend on timing, and the floor covers those.
+
+---
+
+### BUG-011 — Failure-mode setups that publish until a payment lands on a chosen partition give up after a fixed 12 or 15 tries, so a correct run fails about 0.7% of the time
+
+- **Found:** 2026-11-02 16:12 · M4 · Task T10b (BUG-009/010's full-suite run) · branch `m4/t10b-fix-bug-009-010` at `50d2105`, test code as on `main` at `3ed04ce`; entry on `m4/t10c-fix-bug-011`
+- **Status:** open
+- **Component:** settlement-worker tests (`tests/failure_modes/`: `test_retry_in_place.py::_publish_until`, `test_connection_loss.py::_publish_until`, `test_processor_failures.py::_one_per_partition`)
+- **Property / invariant touched:** none. A scenario errors in its setup before the worker processes anything.
+- **Symptom:** in the full worker suite on `m4/t10b-fix-bug-009-010` at `50d2105` (jar rebuilt; finished 16:09:29), scenario (b)–(d) failed in its setup:
+  ```
+  >       r, _ = _publish_until(fm, group, customer, merchant, lambda pos: pos[0] == p_partition and pos[1] > p_offset)
+  >       raise AssertionError(f"no candidate matched within {limit} publishes: {others}")
+  E       AssertionError: no candidate matched within 12 publishes: {UUID('ea84aefe-2b6e-4c2f-90c4-138f262748ad'): (2, 0), UUID('86dbe4e6-ae07-4e43-aa66-1ffce89b101d'): (2, 1), UUID('4d25641d-458e-4d49-ab0b-bbfc2d45cd84'): (0, 0), UUID('f419c204-d557-4443-8d91-c2b2d3e18750'): (0, 1), ...
+  FAILED tests/failure_modes/test_retry_in_place.py::test_unclassified_retries_in_place_without_blocking_other_partitions
+  1 failed, 308 passed, 1 warning in 592.61s (0:09:52)
+  ```
+  - **The positions:** the 12 candidates' (partition, offset) were (2, 0), (2, 1), (0, 0), (0, 1), (0, 2), (2, 2), (0, 3), (2, 3), (0, 4), (2, 4), (2, 5), (2, 6). That's six on each of partitions 0 and 2 and none on P's partition (1).
+  - **The rest of the run was unaffected.** The run's one warning came from a different cause in that branch's own new code; it is fixed there and is not part of this entry.
+- **How detected:** that full-suite run, local i5-1240P.
+- **Reproduction:** not on demand, since the partition of a random payment id can't be chosen. A deterministic reproduction for the fix PR: make every candidate land off P's partition, for example by stubbing the position read-back.
+- **Time to diagnose:** none beyond reading the failure. The helper's fixed limit and the candidates' partitions are both in the output.
+- **Root cause:** each candidate is a new payment with a random UUID, published keyed by its id with the real partitioner. Its partition is effectively random over the topic's 3 partitions. The helpers give up after a fixed number of tries.
+  - **The odds, assuming a uniform partitioner (reasoning, not measured):**
+    - **`_publish_until` for a payment on P's partition** (p = 1/3 each try), used by `test_retry_in_place.py:155` ((b)–(d), R) and `test_connection_loss.py:180` (R): a miss in 12 tries has probability (2/3)^12 ≈ 0.77% per run of each.
+    - **`_one_per_partition`** (`test_processor_failures.py:161`, T10 case 3): one payment on each of the 3 partitions within 15 tries. A miss has probability 3·(2/3)^15 − 3·(1/3)^15 ≈ 0.69% per run.
+    - **Q in (b)–(d)** (`test_retry_in_place.py:187`): needs any other partition, so a miss in 12 has probability (1/3)^12 ≈ 2×10⁻⁶. Negligible.
+  - **The limits:** 12 (since #46, `bd32c37`) and 15 (#54).
+- **Why it wasn't caught earlier:** each run has a sub-1% chance to fail. Passing runs don't show the limit is too tight, and no earlier run hit it.
+- **Fix:** pending (its own PR; plan first).
+- **Regression test:** pending.
+- **Decision Log impact:** none expected.
+- **Summary (one sentence):** written when fixed.
+- **Notes:**
+  - **Numbering:** BUG-009 and BUG-010 are on `m4/t10b-fix-bug-009-010`, not yet on `main`, which is why they aren't in this file on this branch.
