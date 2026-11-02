@@ -143,11 +143,24 @@ def test_a_failed_wait_carries_the_container_logs(monkeypatch):
     assert message.startswith("forced: Kafka at ") and "--- container logs" in message, message[:500]
 
 
+def test_a_logs_fetch_that_fails_is_named_in_the_message_not_raised():
+    class FailingLogs:
+        def get_logs(self):
+            raise RuntimeError("docker said no")
+
+    message = stack._with_container_logs("forced: not ready", FailingLogs())
+    assert message == "forced: not ready (container logs not fetched: RuntimeError('docker said no'))"
+
+
 def test_a_failed_wait_whose_logs_call_blocks_raises_without_the_logs(monkeypatch):
     started = _track_starts(monkeypatch, stack.KAFKA_IMAGE, fail=False)
     failed_at: list[float] = []
     monkeypatch.setattr(stack, "_wait_for_broker", _failing_gate(failed_at))
-    monkeypatch.setattr(DockerContainer, "get_logs", lambda self: time.sleep(BLOCKED_LOGS_SECONDS))
+    def blocked_logs(self):
+        time.sleep(BLOCKED_LOGS_SECONDS)
+        return b"", b""  # a well-formed answer, after the bound has given up on it
+
+    monkeypatch.setattr(DockerContainer, "get_logs", blocked_logs)
     try:
         with pytest.raises(TimeoutError) as raised:
             with stack.kafka():

@@ -242,19 +242,25 @@ async def _wait_for_broker(bootstrap: str, deadline: float) -> None:
 def _with_container_logs(message: str, container: DockerContainer) -> str:
     """message plus the container's last log lines, fetched on a daemon thread bounded by
     DIAGNOSTIC_LOGS_TIMEOUT_SECONDS: a Docker logs call can block (BUG-009). If it doesn't answer in
-    time, message is returned without the logs, saying so."""
-    fetched: list[str] = []
+    time, or fails, message is returned without the logs, saying why. The thread never raises: it may
+    outlive this call."""
+    result: dict[str, str] = {}
 
     def fetch() -> None:
-        stdout, stderr = container.get_logs()
-        fetched.append((stdout + stderr).decode("utf-8", errors="replace")[-4000:])
+        try:
+            stdout, stderr = container.get_logs()
+            result["logs"] = (stdout + stderr).decode("utf-8", errors="replace")[-4000:]
+        except Exception as ex:  # noqa: BLE001 - reported in the message; the wait's error is what matters
+            result["error"] = repr(ex)
 
     reader = threading.Thread(target=fetch, daemon=True)
     reader.start()
     reader.join(DIAGNOSTIC_LOGS_TIMEOUT_SECONDS)
-    if not fetched:
-        return f"{message} (container logs not fetched: no answer from Docker within {DIAGNOSTIC_LOGS_TIMEOUT_SECONDS} s)"
-    return f"{message}\n--- container logs (last 4000 characters) ---\n{fetched[0]}"
+    if "logs" in result:
+        return f"{message}\n--- container logs (last 4000 characters) ---\n{result['logs']}"
+    if "error" in result:
+        return f"{message} (container logs not fetched: {result['error']})"
+    return f"{message} (container logs not fetched: no answer from Docker within {DIAGNOSTIC_LOGS_TIMEOUT_SECONDS} s)"
 
 
 async def topic_partitions(bootstrap: str, topic: str) -> set[int] | None:
