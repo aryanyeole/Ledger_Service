@@ -28,6 +28,7 @@ from support.failure_kit import dedup_rows as _dedup_rows
 from support.failure_kit import event_id as _event_id
 from support.failure_kit import funded_pair as _funded_pair
 from support.failure_kit import postings as _postings
+from support.failure_kit import publish_until as _publish_until
 from support.failure_kit import results as _results
 from support.failure_kit import status as _status
 from support.failure_kit import ts as _ts
@@ -158,19 +159,12 @@ def test_a_processor_timeout_is_retried_never_a_decline(fm):
     _at_most_one_locked_in_a_row(samples)
 
 
-def _one_per_partition(fm, customer, merchant, limit: int = 15) -> dict:
-    """Authorizes and publishes payments of 10.00 one at a time until every partition has one, reading
-    each one's position back from the topic (D-105). Returns {payment_id: (partition, offset)}."""
+def _one_per_partition(fm, customer, merchant) -> dict:
+    """Payments of 10.00, drawn until every partition has one (BUG-011's publish_until). Returns
+    {payment_id: (partition, offset)}."""
     partitions = set(run(topic_partitions(fm.kafka.bootstrap_servers, TOPIC)) or [])
     assert partitions, f"{TOPIC} has no partitions"
-    published = {}
-    for _ in range(limit):
-        payment = fm.api.authorize(customer, merchant, "10.00")
-        fm.publish(payment)
-        published[payment] = fm.position(payment)
-        if {p for p, _ in published.values()} == partitions:
-            return published
-    raise AssertionError(f"not every partition of {sorted(partitions)} got a payment in {limit}: {published}")
+    return _publish_until(fm, customer, merchant, lambda drawn: {p for p, _ in drawn.values()} == partitions)
 
 
 # (3)

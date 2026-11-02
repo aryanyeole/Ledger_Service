@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -150,6 +151,46 @@ async def _seed_group(bootstrap: str, group: str) -> None:
         await seeder.stop()
     committed = await committed_offsets(bootstrap, group)
     assert committed == {tp.partition: end for tp, end in ends.items()}, (committed, ends)
+
+
+# Partition-targeted setups (BUG-011) draw new payments until their condition holds. A payment's
+# partition comes from the real partitioner on its random UUID key (D-103, D-105), effectively uniform
+# over the topic's 3 partitions, so it can only be drawn, never chosen. With 64 draws a correct run
+# misses (reasoning, uniform partitioner assumed): one target partition (2/3)^64 ~ 5e-12; all three
+# partitions ~ 3 x (2/3)^64 ~ 2e-11; any other partition (1/3)^64 ~ 3e-31.
+PUBLISH_CAP = 64
+
+
+def draw_until(draw, done, cap: int = PUBLISH_CAP) -> dict:
+    """Calls draw() for the next (key, (partition, offset)) until done(drawn) holds, where drawn maps
+    each key drawn so far to its position, in draw order; returns drawn. After cap draws without
+    done, fails with the partition tally and every position drawn."""
+    drawn: dict = {}
+    for _ in range(cap):
+        key, position = draw()
+        drawn[key] = position
+        if done(drawn):
+            return drawn
+    tally = dict(sorted(Counter(partition for partition, _ in drawn.values()).items()))
+    raise AssertionError(f"no draw satisfied the condition within {cap} draws; partition tally {tally}; drawn: {drawn}")
+
+
+def newest_position(drawn: dict) -> tuple[int, int]:
+    """The (partition, offset) of the latest draw."""
+    return next(reversed(drawn.values()))
+
+
+def publish_until(fm, customer, merchant, done, *, amount: str = "10.00") -> dict:
+    """draw_until over real payments: each draw authorizes amount (a decimal string, D-047) from
+    customer to merchant, publishes the payment.authorized from its outbox row and reads its position
+    back from the topic (D-105). Returns {payment_id: (partition, offset)} in draw order."""
+
+    def draw():
+        payment = fm.api.authorize(customer, merchant, amount)
+        fm.publish(payment)
+        return payment, fm.position(payment)
+
+    return draw_until(draw, done)
 
 
 def wait(process_worker, predicate, timeout: float, what: str):

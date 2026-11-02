@@ -45,7 +45,9 @@ from support.failure_kit import dedup_rows as _dedup_rows
 from support.failure_kit import dlq_records as _dlq_records
 from support.failure_kit import event_id as _event_id
 from support.failure_kit import funded_pair as _funded_pair
+from support.failure_kit import newest_position as _newest_position
 from support.failure_kit import postings as _postings
+from support.failure_kit import publish_until as _publish_until
 from support.failure_kit import results as _results
 from support.failure_kit import status as _status
 from support.failure_kit import ts as _ts
@@ -127,21 +129,6 @@ def test_lock_timeout_retries_in_place_then_applies_once(fm):
     assert worker.events("message_dead_lettered") == []  # tripwire: a transient is never dead-lettered (D-123)
 
 
-def _publish_until(fm, group, customer, merchant, predicate, limit: int = 12):
-    """Authorizes and publishes candidates one at a time, reading each one's partition back from
-    the topic (D-105), until predicate((partition, offset)) holds. Returns (chosen, others), where
-    others maps each other candidate to its position."""
-    others = {}
-    for _ in range(limit):
-        candidate = fm.api.authorize(customer, merchant, "10.00")
-        fm.publish(candidate)
-        position = fm.position(candidate)
-        if predicate(position):
-            return candidate, others
-        others[candidate] = position
-    raise AssertionError(f"no candidate matched within {limit} publishes: {others}")
-
-
 # (b), (c), (d)
 def test_unclassified_retries_in_place_without_blocking_other_partitions(fm):
     group = fresh_group(fm, "retry-unclassified")
@@ -152,7 +139,11 @@ def test_unclassified_retries_in_place_without_blocking_other_partitions(fm):
     fm.publish(payment)
     p_partition, p_offset = fm.position(payment)
     # R: behind P on P's partition, published before the worker starts (same fetch as P).
-    r, _ = _publish_until(fm, group, customer, merchant, lambda pos: pos[0] == p_partition and pos[1] > p_offset)
+    def behind_p(drawn) -> bool:
+        partition, offset = _newest_position(drawn)
+        return partition == p_partition and offset > p_offset
+
+    r = next(reversed(_publish_until(fm, customer, merchant, behind_p)))
     witnesses = [r]
     q = None
     checks = []
@@ -184,8 +175,9 @@ def test_unclassified_retries_in_place_without_blocking_other_partitions(fm):
             if retries and q is None:
                 # (c): published after P's first retry, so it can only settle if P's backoff lets
                 # the loop keep fetching other partitions.
-                q, others = _publish_until(fm, group, customer, merchant, lambda pos: pos[0] != p_partition)
-                witnesses += [w for w, pos in others.items() if pos[0] == p_partition]
+                drawn = _publish_until(fm, customer, merchant, lambda d: _newest_position(d)[0] != p_partition)
+                *others, q = drawn
+                witnesses += [w for w in others if drawn[w][0] == p_partition]
             time.sleep(0.05)
 
         def past() -> bool:
