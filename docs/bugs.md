@@ -28,6 +28,7 @@
 | BUG-009 | 2026-11-02 13:37 | M4 | The worker stacks' Kafka startup wait reports a started broker as not started, long after its 90 s timeout | none (component: settlement-worker tests, `support/stack.py`) | fixed | 7562fc0 (PR #56) |
 | BUG-010 | 2026-11-02 13:37 | M4 | A Kafka container whose startup wait fails is never stopped | none (component: settlement-worker tests, `support/stack.py`) | fixed | 7562fc0 (PR #56) |
 | BUG-011 | 2026-11-02 16:12 | M4 | Failure-mode setups that publish until a payment lands on a chosen partition give up after a fixed 12 or 15 tries, so a correct run fails about 0.7% of the time | none (component: settlement-worker tests) | fixed | 0252caf (PR #57; squash SHA to follow) |
+| BUG-012 | 2026-11-02 18:51 | M4 | ledger-api's startup hung after "Root WebApplicationContext: initialization completed", before Flyway's first database line, through a 120 s health wait | none observed (component: ledger-api startup; seen through the settlement-worker test stack) | open | — |
 
 ---
 
@@ -633,3 +634,45 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 - **Notes:**
   - **Numbering:** BUG-009 and BUG-010 are on `m4/t10b-fix-bug-009-010`, not yet on `main`, which is why they aren't in this file on this branch.
   - **Update:** BUG-009 and BUG-010 merged in #56 and now appear above this entry. The note above applied to the branch before that merge.
+
+---
+
+### BUG-012 — ledger-api's startup hung after "Root WebApplicationContext: initialization completed", before Flyway's first database line, through a 120 s health wait
+
+- **Found:** 2026-11-02 18:51 (entry opened; the failing run finished 18:22:03) · M4 · Task T11 (its third full-suite run) · branch `m4/t11-reconciliation` at `6e925de`, ledger-api and the stack builders as on `main` at `873c84e`; entry on `m4/t11a-fix-bug-012`
+- **Status:** open
+- **Component:** ledger-api startup (the jar in server mode), seen through the settlement-worker test stack (`tests/support/stack.py`, `ledger_api()`)
+- **Property / invariant touched:** none observed. ledger-api never finished starting, so it served no request.
+- **Symptom:** in the full worker suite on `6e925de` (jar rebuilt per D-083; `346 passed, 5 errors in 768.67s`), all five tests of `tests/failure_modes/test_processor_failures.py` errored in setup. That module's `fm` fixture builds the failure_modes stack, and the ledger-api jar never became healthy:
+  ```
+  >           with stack.ledger_api(database, jar, log_dir) as api:
+  >       pytest.fail(f"ledger-api not healthy at {base_url}:\n{log_path.read_text(errors='replace')[-4000:]}")
+  E       Failed: ledger-api not healthy at http://127.0.0.1:52564:
+  ERROR tests/failure_modes/test_processor_failures.py::test_an_unavailable_processor_is_retried_then_called_once
+  (and the module's four other tests, the same way)
+  ```
+  - **The stuck jar's log** (`failure-modes2/ledger-api.log` in that run's pytest temp dir, 16 lines, saved at 18:22:54). After Spring Boot's banner it ends here, with nothing more for the rest of the 120 s health wait:
+    ```
+    2026-11-02T18:14:07.628-07:00  INFO 25428 --- [ledger-api] [           main] d.a.ledgerapi.LedgerApiApplication       : Starting LedgerApiApplication v0.0.1-SNAPSHOT using Java 21.0.4 with PID 25428 (C:\Users\Aryan\Projects\Ledger_Service\services\ledger-api\target\ledger-api-0.0.1-SNAPSHOT.jar started by Aryan in C:\Users\Aryan\Projects\Ledger_Service\services\settlement-worker)
+    2026-11-02T18:14:07.640-07:00  INFO 25428 --- [ledger-api] [           main] d.a.ledgerapi.LedgerApiApplication       : No active profile set, falling back to 1 default profile: "default"
+    2026-11-02T18:14:14.720-07:00  INFO 25428 --- [ledger-api] [           main] o.s.boot.tomcat.TomcatWebServer          : Tomcat initialized with port 52564 (http)
+    2026-11-02T18:14:14.778-07:00  INFO 25428 --- [ledger-api] [           main] o.apache.catalina.core.StandardService   : Starting service [Tomcat]
+    2026-11-02T18:14:14.778-07:00  INFO 25428 --- [ledger-api] [           main] o.apache.catalina.core.StandardEngine    : Starting Servlet engine: [Apache Tomcat/11.0.24]
+    2026-11-02T18:14:14.910-07:00  INFO 25428 --- [ledger-api] [           main] b.w.c.s.WebApplicationContextInitializer : Root WebApplicationContext: initialization completed in 6945 ms
+    ```
+  - **A healthy start in the same run** (the e2e stack's `ledger-api.log`) logs, right after that line: `org.flywaydb.core.FlywayExecutor : Database: jdbc:postgresql://127.0.0.1:58277/ledger (PostgreSQL 17.11)`, then Flyway's validation, Tomcat started, and `Started LedgerApiApplication in 10.851 seconds`. Its context initialization took 3588 ms, against 6945 ms in the stuck one.
+  - **Where it stopped:** the stuck jar stopped between those two lines, so on or before its first Postgres connection. This was right after the stack's migrate-only run of the same jar had succeeded against the same database, a few seconds earlier.
+  - **The machine:** about 2.8 GB of 15.7 GB physical memory was free when it was checked after the run (not at 18:14).
+  - **Nothing left behind:** the harness bounded the wait and cleaned up. PID 25428 was gone afterwards, and no Testcontainers container was left.
+- **How detected:** the full-suite run above, local i5-1240P, the first time in many runs of these stacks. The other four failure_modes stacks and the e2e, negative-control and integration stacks in the same run started normally.
+- **Reproduction:** not reproduced yet. The fix plan is to show the stall deterministically against a Postgres container that is `docker pause`d.
+- **Time to diagnose:** in progress.
+- **Root cause:** not established.
+  - **Hypothesis (reasoning, not verified):** ledger-api's first connections have no pgjdbc login or socket timeout. A database that accepts the TCP connection but stalls the handshake or the first query would then hang startup indefinitely, with nothing logged.
+  - **Not checked yet:** the timeouts that actually apply (pgjdbc `connectTimeout`/`loginTimeout`/`socketTimeout` defaults, Hikari `connectionTimeout`), and which DataSource Flyway uses.
+- **Why it wasn't caught earlier:** not known yet. It needs a database that stalls on the first connection, which no earlier run produced.
+- **Fix:** pending (its own PR, plan first, after T11's PR).
+- **Regression test:** pending.
+- **Decision Log impact:** not known yet.
+- **Summary (one sentence):** written when fixed.
+- **Notes:**
