@@ -200,6 +200,7 @@ def test_worker_started_warns_when_a_fault_is_armed(armed, level):
             "consumer_group": "g",
             "fault_point": "AFTER_DB_BEFORE_OFFSET" if armed else None,
             "processor_outage": False,
+            "reconcile_interval_ms": None,
             "correlation_id": None,
         }
     ]
@@ -250,6 +251,54 @@ def test_worker_started_warns_when_the_processor_outage_is_on(outage, level):
             "consumer_group": "g",
             "fault_point": None,
             "processor_outage": outage == "1",
+            "reconcile_interval_ms": None,
             "correlation_id": None,
         }
     ]
+
+
+def test_reconcile_defaults():
+    config = Config.from_env(_env())
+    assert (config.reconcile_interval_ms, config.reconcile_statement_timeout_ms) == (None, 30000)
+    assert Config.from_env(_env(RECONCILE_INTERVAL_MS="")).reconcile_interval_ms is None
+    assert Config.from_env(_env(RECONCILE_INTERVAL_MS="  ")).reconcile_interval_ms is None
+    tuned = Config.from_env(_env(RECONCILE_INTERVAL_MS="100", RECONCILE_STATEMENT_TIMEOUT_MS="1"))
+    assert (tuned.reconcile_interval_ms, tuned.reconcile_statement_timeout_ms) == (100, 1)
+    top = Config.from_env(_env(RECONCILE_INTERVAL_MS="86400000", RECONCILE_STATEMENT_TIMEOUT_MS="600000"))
+    assert (top.reconcile_interval_ms, top.reconcile_statement_timeout_ms) == (86_400_000, 600_000)
+
+
+# D-114: an invalid reconciliation setting is refused (config_invalid, exit 2); integer ms only (D-093).
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"RECONCILE_INTERVAL_MS": "99"}, "RECONCILE_INTERVAL_MS"),
+        ({"RECONCILE_INTERVAL_MS": "86400001"}, "RECONCILE_INTERVAL_MS"),
+        ({"RECONCILE_INTERVAL_MS": "1.5"}, "RECONCILE_INTERVAL_MS"),
+        ({"RECONCILE_INTERVAL_MS": "60s"}, "RECONCILE_INTERVAL_MS"),
+        ({"RECONCILE_INTERVAL_MS": "-1000"}, "RECONCILE_INTERVAL_MS"),
+        ({"RECONCILE_STATEMENT_TIMEOUT_MS": "0"}, "RECONCILE_STATEMENT_TIMEOUT_MS"),
+        ({"RECONCILE_STATEMENT_TIMEOUT_MS": "600001"}, "RECONCILE_STATEMENT_TIMEOUT_MS"),
+        ({"RECONCILE_STATEMENT_TIMEOUT_MS": ""}, "RECONCILE_STATEMENT_TIMEOUT_MS"),
+    ],
+)
+def test_invalid_reconcile_config(overrides, message):
+    with pytest.raises(ConfigError, match=message):
+        Config.from_env(_env(**overrides))
+
+
+def test_invalid_reconcile_interval_exits_2():
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("FAULT_", "FAKE_", "WORKER_", "RECONCILE_"))}
+    env.update(_env(WORKER_METRICS_PORT="0", RECONCILE_INTERVAL_MS="99"))
+    result = subprocess.run([sys.executable, "-m", "settlement_worker"], capture_output=True, text=True, env=env, timeout=30)
+    assert result.returncode == 2, result.stdout + result.stderr
+    lines = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [line["event"] for line in lines] == ["config_invalid"], lines
+    assert "RECONCILE_INTERVAL_MS" in lines[0]["error"]
+
+
+def test_worker_started_reports_the_reconcile_interval():
+    config = Config.from_env(_env(WORKER_CONSUMER_GROUP="g", RECONCILE_INTERVAL_MS="60000"))
+    with capture_logs() as logs:
+        consumer.announce_start(structlog.get_logger(), config)
+    assert [(log["reconcile_interval_ms"], log["log_level"]) for log in logs] == [(60000, "info")]

@@ -25,6 +25,9 @@ DB_RECONNECTED = "db_reconnected"
 OFFSET_COMMIT_FAILED = "offset_commit_failed"
 MESSAGE_DEAD_LETTERED = "message_dead_lettered"
 PROCESSOR_TIMEOUT = "processor_timeout"
+RECONCILIATION_COMPLETED = "reconciliation_completed"
+DRIFT_DETECTED = "drift_detected"
+RECONCILIATION_FAILED = "reconciliation_failed"
 
 EVENT_KEYS: dict[str, frozenset[str]] = {
     FAULT_INJECTED: frozenset({"point", "payment_id", "correlation_id"}),
@@ -33,7 +36,9 @@ EVENT_KEYS: dict[str, frozenset[str]] = {
     PAYMENT_NOT_AUTHORIZED: frozenset({"event_id", "payment_id", "status", "correlation_id"}),
     PAYMENT_SETTLED: frozenset({"event_id", "payment_id", "transaction_id", "lock_wait_ms", "correlation_id"}),
     PAYMENT_RELEASED: frozenset({"event_id", "payment_id", "transaction_id", "lock_wait_ms", "correlation_id"}),
-    WORKER_STARTED: frozenset({"consumer_group", "fault_point", "processor_outage", "correlation_id"}),
+    WORKER_STARTED: frozenset(
+        {"consumer_group", "fault_point", "processor_outage", "reconcile_interval_ms", "correlation_id"}
+    ),
     PARTITIONS_ASSIGNED: frozenset({"partitions", "correlation_id"}),
     PROCESSING_FAILED: frozenset({"topic", "partition", "offset", "error", "correlation_id"}),
     WORKER_STOPPED: frozenset({"reason", "correlation_id"}),
@@ -49,6 +54,16 @@ EVENT_KEYS: dict[str, frozenset[str]] = {
          "dlq_offset", "correlation_id"}
     ),
     PROCESSOR_TIMEOUT: frozenset({"payment_id", "attempt", "timeout_ms", "correlation_id"}),
+    # Reconciliation (D-114): money as scale-4 strings, times in D-097's format.
+    RECONCILIATION_COMPLETED: frozenset(
+        {"run_id", "as_of", "accounts", "drifted_accounts", "global_sum", "escrow_drift", "max_transaction_id",
+         "duration_ms", "correlation_id"}
+    ),
+    DRIFT_DETECTED: frozenset(
+        {"account_id", "account_type", "balance", "entry_sum", "drift", "last_entry_id", "last_clean_as_of",
+         "first_drift_as_of", "correlation_id"}
+    ),
+    RECONCILIATION_FAILED: frozenset({"run_id", "error_class", "error", "correlation_id"}),
 }
 
 LEVELS = frozenset({"info", "warning", "error"})

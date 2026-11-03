@@ -49,7 +49,7 @@ import structlog
 from aiokafka import AIOKafkaConsumer, ConsumerRebalanceListener, TopicPartition
 from aiokafka.errors import KafkaError
 
-from settlement_worker import dead_letter, db, envelope, events, failures, metrics, processor, settlement
+from settlement_worker import dead_letter, db, envelope, events, failures, metrics, processor, reconcile, settlement
 from settlement_worker import dlq as dlq_module
 from settlement_worker.config import (
     AFTER_DB_BEFORE_OFFSET,
@@ -449,6 +449,7 @@ def announce_start(log, config: Config) -> None:
         consumer_group=config.consumer_group,
         fault_point=config.fault_point,
         processor_outage=config.processor_outage,
+        reconcile_interval_ms=config.reconcile_interval_ms,
         correlation_id=None,
     )
 
@@ -477,9 +478,10 @@ class _AssignmentLogger(ConsumerRebalanceListener):
 
 
 async def run(config: Config, stop: asyncio.Event, stop_reason: dict) -> int:
-    """Startup order (D-113): the role check, then /metrics, then the consumer. A worker that
-    refuses its role opens no port; a port it can't bind is invalid configuration (exit 2). The
-    metrics server is closed before worker_stopped, so a stop still exits 0. An unreachable DB at
+    """Startup order (D-113, D-114): the role check, then /metrics, then the reconciler (if
+    RECONCILE_INTERVAL_MS is set), then the consumer. A worker that refuses its role opens no port; a
+    port it can't bind is invalid configuration (exit 2). The reconciler is stopped (bounded) and the
+    metrics server closed before worker_stopped, so a stop still exits 0. An unreachable DB at
     startup still exits 1 (D-109)."""
     log = structlog.get_logger()
     session = db.DbSession(config)
@@ -501,9 +503,13 @@ async def run(config: Config, stop: asyncio.Event, stop_reason: dict) -> int:
         return EXIT_CONFIG
     events.emit(log, events.METRICS_LISTENING, host=server.host, port=server.port, correlation_id=None)
 
+    reconciler = reconcile.Reconciler(config) if config.reconcile_interval_ms is not None else None
+    task = asyncio.create_task(reconciler.run_forever()) if reconciler is not None else None
     try:
-        code, reason = await _consume(config, stop, session)
+        code, reason = await _consume(config, stop, session, reconciler)
     finally:
+        if task is not None:
+            await reconcile.stop(task)
         await asyncio.to_thread(server.close)
     events.emit(
         log,
@@ -515,9 +521,12 @@ async def run(config: Config, stop: asyncio.Event, stop_reason: dict) -> int:
     return code
 
 
-async def _consume(config: Config, stop: asyncio.Event, session: db.DbSession) -> tuple[int, str | None]:
-    """Runs the consumer until a stop request, a processing error or a role refusal; closes the DB
-    connection (bounded). Returns the exit code and the reason (None for a requested stop)."""
+async def _consume(
+    config: Config, stop: asyncio.Event, session: db.DbSession, reconciler: reconcile.Reconciler | None = None
+) -> tuple[int, str | None]:
+    """Runs the consumer until a stop request, a processing error or a role refusal (its own, or the
+    reconciler's, D-114); closes the DB connection (bounded). Returns the exit code and the reason
+    (None for a requested stop)."""
     log = structlog.get_logger()
     consumer = AIOKafkaConsumer(
         bootstrap_servers=config.bootstrap_servers,
@@ -549,6 +558,10 @@ async def _consume(config: Config, stop: asyncio.Event, session: db.DbSession) -
         consumer.subscribe([config.topic], listener=_AssignmentLogger(state, commits.pending))
         announce_start(log, config)
         while not stop.is_set() and reason is None:
+            if reconciler is not None and reconciler.refusal is not None:
+                # The reconciler's connection was refused the role: configuration, as on ours (D-109).
+                code, reason = EXIT_CONFIG, "config_invalid"
+                break
             now = time.monotonic_ns()
             if commits.pending:
                 await commits.recommit_due(now)

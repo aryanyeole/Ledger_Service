@@ -58,9 +58,12 @@ def as_db_failure(exc: BaseException) -> BaseException:
     return exc
 
 
-async def connect(*, timeout_ms: int | None = None, **params) -> asyncpg.Connection:
+async def connect(*, timeout_ms: int | None = None, command_timeout_ms: int | None = None, **params) -> asyncpg.Connection:
+    """timeout_ms bounds connecting and, unless command_timeout_ms is given, every call; the reconciler
+    gives a longer command timeout so its server-side statement_timeout fires first (D-114)."""
     if timeout_ms is not None:
-        params = {**params, "timeout": timeout_ms / 1000, "command_timeout": timeout_ms / 1000}
+        commands_ms = command_timeout_ms if command_timeout_ms is not None else timeout_ms
+        params = {**params, "timeout": timeout_ms / 1000, "command_timeout": commands_ms / 1000}
     conn = await asyncpg.connect(**params)
     try:
         await _check_role(conn)
