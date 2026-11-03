@@ -36,9 +36,9 @@ jobs:
     name: settlement-worker
     # Pinned image (D-070): concurrency proofs are timing-sensitive; upgrades are explicit PRs.
     runs-on: ubuntu-24.04
-    # 2m12s and 2m31s measured on PR #36 with warm caches;
-    # 8 min leaves room for a cold Maven/pip cache (D-089).
-    timeout-minutes: 8
+    # Provisional, calibrated in this PR (M4 T16a): the calibration runs must not be cut off by the
+    # old 8 min limit, which M4's suite has nearly reached (7.8 min on PR #62).
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: services/settlement-worker
