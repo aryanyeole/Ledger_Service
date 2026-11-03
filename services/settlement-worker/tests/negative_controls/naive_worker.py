@@ -240,6 +240,7 @@ async def _run(config: Config, fault_id, skip_id) -> int:
             consumer_group=config.consumer_group,
             fault_point=FAULT_POINT if fault_id else None,
             processor_outage=config.processor_outage,
+            reconcile_interval_ms=None,  # the naive worker never reconciles (D-114)
             correlation_id=None,
         )
         while not stop.is_set() and code == consumer.EXIT_STOPPED:

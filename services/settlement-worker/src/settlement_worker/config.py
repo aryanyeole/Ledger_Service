@@ -1,5 +1,5 @@
 """The worker's configuration, from the environment (D-081, D-085, D-091, D-108, D-109, D-111, D-112, D-113,
-D-125, D-129).
+D-114, D-125, D-129).
 
 Names follow .env.example where it has them. Anything invalid is a ConfigError, and the worker
 refuses to start (exit 2). The password is never part of an error message or the repr.
@@ -55,6 +55,8 @@ class Config:
     dlq_timeout_ms: int
     processor_timeout_ms: int
     processor_outage: bool
+    reconcile_interval_ms: int | None
+    reconcile_statement_timeout_ms: int
 
     @property
     def fault_armed(self) -> bool:
@@ -140,6 +142,10 @@ class Config:
         outage = env.get("FAKE_PROCESSOR_OUTAGE", "")
         if outage not in ("", "0", "1"):
             raise ConfigError(f"FAKE_PROCESSOR_OUTAGE must be 0 or 1, was {outage!r}")
+        # Reconciliation (D-114): unset or empty disables it; integer ms, never a float (D-093).
+        reconcile_interval = None
+        if (env.get("RECONCILE_INTERVAL_MS") or "").strip():
+            reconcile_interval = integer("RECONCILE_INTERVAL_MS", "", 100, 86_400_000)
 
         return cls(
             postgres_host=text("POSTGRES_HOST", "localhost"),
@@ -171,4 +177,6 @@ class Config:
             # The deadline on each processor call (D-112).
             processor_timeout_ms=integer("WORKER_PROCESSOR_TIMEOUT_MS", "2000", 1, 60_000),
             processor_outage=outage == "1",
+            reconcile_interval_ms=reconcile_interval,
+            reconcile_statement_timeout_ms=integer("RECONCILE_STATEMENT_TIMEOUT_MS", "30000", 1, 600_000),
         )
