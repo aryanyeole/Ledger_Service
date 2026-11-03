@@ -194,7 +194,9 @@ def test_a_a_balance_changed_without_an_entry_is_a_drift(rs, scene):
     t_before, t_after = _inject(rs, _add_balance(c, Decimal("0.01")))
     seen = _run_after(w, t_after)
 
-    drift = seen.drifts[c]  # C has no entries at all: only a LEFT JOIN keeps it in the snapshot
+    # C has no entries at all: only a LEFT JOIN keeps it in the snapshot.
+    assert c in seen.drifts, ("no drift_detected for C", c, seen.completed, seen.drifts)
+    drift = seen.drifts[c]
     assert (drift["account_type"], drift["balance"], drift["entry_sum"], drift["drift"]) == (
         "CUSTOMER", "0.0100", "0.0000", "0.0100"
     )
@@ -219,6 +221,7 @@ def test_b_a_negative_sub_cent_drift_survives(rs, scene):
     _, t_after = _inject(rs, _add_balance(m, Decimal("-0.0001")))
     seen = _run_after(w, t_after)
 
+    assert m in seen.drifts, ("no drift_detected for M", m, seen.completed, seen.drifts)
     assert seen.drifts[m]["drift"] == "-0.0001"  # sub-cent survives: scale 4, never the scale-2 formatter
     assert (seen.drifts[m]["balance"], seen.drifts[m]["entry_sum"]) == ("99.9999", "100.0000")
     assert seen.completed["drifted_accounts"] == 2
