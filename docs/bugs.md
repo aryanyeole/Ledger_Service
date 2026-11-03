@@ -713,7 +713,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
     - Flyway's DataSource is a `SimpleDriverDataSource` whose connection has network timeout 0;
     - both a `SimpleDriverDataSource` derived from Flyway's and a Hikari pool copied from the application's give up a login to the stalled server with "Connection attempt timed out", after 10.07 s and 11.03 s;
     - each login case has a 60 s JUnit timeout, so before the fix it fails instead of hanging.
-  - **`services/settlement-worker/tests/integration/test_ledger_api_db_timeouts.py`:** the real jar against a paused Postgres, in server and migrate-only mode, exits 1 within 30 s with "Connection attempt timed out" in its log. On a miss it takes a thread dump before the kill.
+  - **`services/settlement-worker/tests/integration/test_ledger_api_db_timeouts.py`:** the real jar against a paused Postgres, in server and migrate-only mode, exits 1 within 60 s with "Connection attempt timed out" in its log. On a miss it takes a thread dump before the kill.
   - **Red before the fix:** the one-off 180 s run and thread dumps above (code as on `main`).
   - **Green after** (`650a6a1`, jar rebuilt):
     - **The harness test:** server mode `exit=1 elapsed_s=22.1`, migrate-only `exit=1 elapsed_s=19.5`, `2 passed in 59.55s`.

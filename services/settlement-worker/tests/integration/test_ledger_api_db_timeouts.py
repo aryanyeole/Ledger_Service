@@ -14,7 +14,9 @@ import pytest
 
 from support import stack
 
-EXIT_BOUND_SECONDS = 30  # loginTimeout (10 s) plus the JVM's start and Spring's context up to Flyway
+# Bounded failure, not speed: loginTimeout (10 s) plus the JVM's start and Spring's context up to
+# Flyway, with CI headroom (locally 19.5-23.3 s, suite load included); before D-132 it ran past 180 s.
+EXIT_BOUND_SECONDS = 60
 
 
 @pytest.fixture(scope="module")
