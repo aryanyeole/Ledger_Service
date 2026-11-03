@@ -27,8 +27,8 @@
 | BUG-008 | 2026-11-02 11:53 | M4 | Retry-in-place scenario (b)–(d) reads the log before the committed offset, so a correct dead letter can fail its not-past check | none (component: settlement-worker tests; the test's evidence for invariant 6) | fixed | 3ed04ce (PR #55) |
 | BUG-009 | 2026-11-02 13:37 | M4 | The worker stacks' Kafka startup wait reports a started broker as not started, long after its 90 s timeout | none (component: settlement-worker tests, `support/stack.py`) | fixed | 7562fc0 (PR #56) |
 | BUG-010 | 2026-11-02 13:37 | M4 | A Kafka container whose startup wait fails is never stopped | none (component: settlement-worker tests, `support/stack.py`) | fixed | 7562fc0 (PR #56) |
-| BUG-011 | 2026-11-02 16:12 | M4 | Failure-mode setups that publish until a payment lands on a chosen partition give up after a fixed 12 or 15 tries, so a correct run fails about 0.7% of the time | none (component: settlement-worker tests) | fixed | 0252caf (PR #57; squash SHA to follow) |
-| BUG-012 | 2026-11-02 18:51 | M4 | ledger-api's startup hung after "Root WebApplicationContext: initialization completed", before Flyway's first database line, through a 120 s health wait | none observed (component: ledger-api startup; seen through the settlement-worker test stack) | open | — |
+| BUG-011 | 2026-11-02 16:12 | M4 | Failure-mode setups that publish until a payment lands on a chosen partition give up after a fixed 12 or 15 tries, so a correct run fails about 0.7% of the time | none (component: settlement-worker tests) | fixed | 873c84e (PR #57) |
+| BUG-012 | 2026-11-02 18:51 | M4 | ledger-api's startup hung after "Root WebApplicationContext: initialization completed", before Flyway's first database line, through a 120 s health wait | none observed (component: ledger-api startup; seen through the settlement-worker test stack) | fixed | 650a6a1 (PR #59; squash SHA to follow) |
 
 ---
 
@@ -619,7 +619,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
   - **The call sites keep their own conditions and return shapes:**
     - R in (b)–(d), Q in (b)–(d) (the other candidates on P's partition still become witnesses), and R in `test_connection_loss.py` (d);
     - `_one_per_partition` in T10 case 3, now a thin wrapper.
-  - **Commit:** `0252caf` · PR #57 (squash SHA to follow).
+  - **Commit:** `0252caf` · PR #57, squash-merged to `main` as `873c84e`.
 - **Regression test:** `services/settlement-worker/tests/unit/test_draw_until.py`. No broker; scripted partition sequences:
   - **Draw 13:** a target partition first drawn on draw 13 is found.
   - **Draw 16:** all three partitions, first covered on draw 16, are found.
@@ -640,7 +640,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 ### BUG-012 — ledger-api's startup hung after "Root WebApplicationContext: initialization completed", before Flyway's first database line, through a 120 s health wait
 
 - **Found:** 2026-11-02 18:51 (entry opened; the failing run finished 18:22:03) · M4 · Task T11 (its third full-suite run) · branch `m4/t11-reconciliation` at `6e925de`, ledger-api and the stack builders as on `main` at `873c84e`; entry on `m4/t11a-fix-bug-012`
-- **Status:** open
+- **Status:** fixed
 - **Component:** ledger-api startup (the jar in server mode), seen through the settlement-worker test stack (`tests/support/stack.py`, `ledger_api()`)
 - **Property / invariant touched:** none observed. ledger-api never finished starting, so it served no request.
 - **Symptom:** in the full worker suite on `6e925de` (jar rebuilt per D-083; `346 passed, 5 errors in 768.67s`), all five tests of `tests/failure_modes/test_processor_failures.py` errored in setup. That module's `fm` fixture builds the failure_modes stack, and the ledger-api jar never became healthy:
@@ -665,14 +665,61 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
   - **The machine:** about 2.8 GB of 15.7 GB physical memory was free when it was checked after the run (not at 18:14).
   - **Nothing left behind:** the harness bounded the wait and cleaned up. PID 25428 was gone afterwards, and no Testcontainers container was left.
 - **How detected:** the full-suite run above, local i5-1240P, the first time in many runs of these stacks. The other four failure_modes stacks and the e2e, negative-control and integration stacks in the same run started normally.
-- **Reproduction:** not reproduced yet. The fix plan is to show the stall deterministically against a Postgres container that is `docker pause`d.
-- **Time to diagnose:** in progress.
-- **Root cause:** not established.
-  - **Hypothesis (reasoning, not verified):** ledger-api's first connections have no pgjdbc login or socket timeout. A database that accepts the TCP connection but stalls the handshake or the first query would then hang startup indefinitely, with nothing logged.
-  - **Not checked yet:** the timeouts that actually apply (pgjdbc `connectTimeout`/`loginTimeout`/`socketTimeout` defaults, Hikari `connectionTimeout`), and which DataSource Flyway uses.
-- **Why it wasn't caught earlier:** not known yet. It needs a database that stalls on the first connection, which no earlier run produced.
-- **Fix:** pending (its own PR, plan first, after T11's PR).
-- **Regression test:** pending.
-- **Decision Log impact:** not known yet.
-- **Summary (one sentence):** written when fixed.
+- **Reproduction:** deterministic. Start a migrated Postgres container, then `docker pause` it: its published port still accepts TCP, but nothing answers. Then start the jar against it, in server or migrate-only mode.
+  - **The one-off run on the code as on `main`** (2026-11-02, started 19:26:55, both modes at once): both were still running after 180 s, with no Flyway line. The server-mode log was the same 16 lines as the symptom, ending at `Root WebApplicationContext: initialization completed in 7220 ms`.
+  - **The `jcmd` thread dump of each** showed `main` blocked in a socket read during pgjdbc's startup handshake:
+    ```
+    "main" #1 [25696] prio=5 os_prio=0 cpu=11296.88ms elapsed=180.54s ... runnable
+       java.lang.Thread.State: RUNNABLE
+    	at sun.nio.ch.Net.poll(java.base@21.0.4/Native Method)
+    	...
+    	at java.net.Socket$SocketInputStream.read(java.base@21.0.4/Socket.java:1099)
+    	...
+    	at org.postgresql.core.PGStream.receiveChar(PGStream.java:480)
+    	at org.postgresql.core.v3.ConnectionFactoryImpl.doAuthentication(ConnectionFactoryImpl.java:804)
+    	at org.postgresql.core.v3.ConnectionFactoryImpl.tryConnect(ConnectionFactoryImpl.java:309)
+    	at org.postgresql.core.v3.ConnectionFactoryImpl.tryConnectWithoutSsl(ConnectionFactoryImpl.java:147)
+    	...
+    	at org.postgresql.Driver.makeConnection(Driver.java:437)
+    	at org.postgresql.Driver.connect(Driver.java:305)
+    	at org.springframework.jdbc.datasource.SimpleDriverDataSource.getConnectionFromDriver(SimpleDriverDataSource.java:143)
+    	...
+    	at org.flywaydb.core.internal.jdbc.JdbcUtils.openConnection(JdbcUtils.java:73)
+    	...
+    	at org.springframework.boot.flyway.autoconfigure.FlywayMigrationInitializer.afterPropertiesSet(FlywayMigrationInitializer.java:67)
+    ```
+    The migrate-only dump showed the same frames. The process in the symptom behaved the same way: the same last log line, and no Flyway line. Why Postgres stopped answering on 2026-11-02 at 18:14 is not known.
+- **Time to diagnose:** the mechanism was read from the sources of the versions in use (Spring Boot 4.1.1, pgjdbc 42.7.13, HikariCP 7.0.2) while writing the fix plan, after T11's PR #58 merged on 2026-11-02. The 19:26 run's thread dumps confirmed it.
+- **Root cause:** nothing bounded ledger-api's first Postgres connection, so a database that accepts TCP but doesn't answer hung startup indefinitely, with nothing logged.
+  - **Flyway's DataSource is a plain driver DataSource, not a pool.** With `spring.flyway.user` set, Boot's `FlywayAutoConfiguration.getMigrationDataSource` builds `DataSourceBuilder.derivedFrom(dataSource).type(SimpleDriverDataSource.class)`. `derivedFrom` copies only url, driverClassName, username and password, so none of Hikari's settings reach it.
+  - **pgjdbc 42.7.13's defaults:**
+    - `connectTimeout` 10 s covers the TCP connect only.
+    - `sslResponseTimeout` 5 s covers the reply to the SSL request (the default `sslmode=prefer`); on that timeout pgjdbc retries without SSL.
+    - `loginTimeout` is `"0"`, so `Driver.connect` runs `makeConnection` directly, unbounded.
+    - `socketTimeout` is `"0"`, so `sendStartupPacket` and `doAuthentication` read with no timeout.
+  - **Hikari's login timeout never applies.** HikariCP sets a JVM-wide `DriverManager.setLoginTimeout`, but `Driver.timeout()` reads `LOGIN_TIMEOUT.getOrDefault(props)`, which returns `"0"` when unset, so `DriverManager.getLoginTimeout()` is never consulted.
+  - **Migrate-only mode** (D-083) builds the same Flyway DataSource, so it hung the same way.
+- **Why it wasn't caught earlier:** it needs a database that accepts TCP and then doesn't answer, which no earlier run had produced. The worker harness's 120 s health wait and the migrate step's 120 s timeout turned the hang into a test error without showing where it stopped.
+- **Fix** (`650a6a1`; D-132):
+  - **`loginTimeout=10`** in `services/ledger-api/src/main/resources/org/postgresql/driverconfig.properties`. pgjdbc reads these classpath defaults for every connection in the JVM: Flyway's `SimpleDriverDataSource` in server and migrate-only mode, and the Hikari pool. They survive `SPRING_DATASOURCE_URL` replacing the URL.
+  - **`socketTimeout: 60`** on the pool only (`spring.datasource.hikari.data-source-properties`). It doesn't reach Flyway's connection (`derivedFrom` doesn't copy it), so a long migration is never cut off.
+  - **On a timeout during a startup connection,** the context fails and the process exits 1 (D-083).
+  - **What happens to the connect thread** (pgjdbc 42.7.13, `Driver.ConnectTask`): when `loginTimeout` fires, the attempt is abandoned. It is marked abandoned and its daemon connect thread is cancelled with an interrupt, best effort. A thread that keeps running closes any connection it later establishes, so nothing leaks. On the pool, that thread's blocked reads are bounded by the 60 s `socketTimeout`, which pgjdbc sets on the stream before the startup handshake.
+  - **The harness** (`824e02b`): a `jcmd` thread dump is taken before a hung ledger-api is killed, whether the server mode's health wait or the migrate-only run timed out.
+  - **Commits:** `824e02b` and `650a6a1` · PR #59 (squash SHA to follow).
+- **Regression test:**
+  - **`services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/ConnectionTimeoutsTest.java`** (Testcontainers Postgres plus a local TCP server that accepts and never answers):
+    - the pool's connection has network timeout 60 000 ms;
+    - Flyway's DataSource is a `SimpleDriverDataSource` whose connection has network timeout 0;
+    - both a `SimpleDriverDataSource` derived from Flyway's and a Hikari pool copied from the application's give up a login to the stalled server with "Connection attempt timed out", after 10.07 s and 11.03 s;
+    - each login case has a 60 s JUnit timeout, so before the fix it fails instead of hanging.
+  - **`services/settlement-worker/tests/integration/test_ledger_api_db_timeouts.py`:** the real jar against a paused Postgres, in server and migrate-only mode, exits 1 within 30 s with "Connection attempt timed out" in its log. On a miss it takes a thread dump before the kill.
+  - **Red before the fix:** the one-off 180 s run and thread dumps above (code as on `main`).
+  - **Green after** (`650a6a1`, jar rebuilt):
+    - **The harness test:** server mode `exit=1 elapsed_s=22.1`, migrate-only `exit=1 elapsed_s=19.5`, `2 passed in 59.55s`.
+    - **The same one-off script with the fixed jar** (both modes at once): exit 1 after 25.0 s and 21.0 s, each log with `Message : Connection attempt timed out.`
+    - **The Java tests:** the four new ones pass, and `LockContentionTest` and `MigrateOnlyContextTest` pass unchanged.
+- **Decision Log impact:** D-132.
+- **Summary (one sentence):** ledger-api's first Postgres connection, Flyway's plain driver connection in server and migrate-only mode, had no login or read timeout, and Hikari's login timeout never reached pgjdbc, so a database that accepts TCP but doesn't answer hung startup forever in pgjdbc's `doAuthentication`. A 10 s `loginTimeout` for every pgjdbc connection now makes startup fail and exit 1, the pool's reads have a 60 s socket timeout, and the harness dumps the threads of any ledger-api it has to kill.
 - **Notes:**
+  - **What remains unknown:** why Postgres stopped answering in the 2026-11-02 18:14 run. The fix bounds the hang, and the new thread dump will locate the next one.
