@@ -15,6 +15,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -50,6 +51,8 @@ PASSWORDS = {"settlement_worker": WORKER_PASSWORD, "ledger_api_app": APP_PASSWOR
 
 PACKAGE_HINT = r"run .\mvnw.cmd -q -DskipTests package in services\ledger-api"
 MIGRATE_TIMEOUT_SECONDS = 120
+HEALTH_TIMEOUT_SECONDS = 120
+JCMD_TIMEOUT_SECONDS = 30  # the thread dump taken before a hung ledger-api is killed (D-132)
 
 # The broker's readiness gate (BUG-009): the whole wait, one attempt (admin start + describe_cluster),
 # closing an attempt's client, and the container-log fetch for a failed wait's message.
@@ -148,6 +151,42 @@ def java() -> str:
     return found
 
 
+def _jcmd() -> str | None:
+    """jcmd from the same JDK as java(), if there is one (a JRE has none)."""
+    candidate = Path(java()).with_name("jcmd.exe" if os.name == "nt" else "jcmd")
+    return str(candidate) if candidate.is_file() else (shutil.which("jcmd") or None)
+
+
+def _main_thread(dump: str) -> str:
+    """The "main" thread's section of a jcmd Thread.print dump: its header line through the blank line."""
+    lines = dump.splitlines()
+    for start, line in enumerate(lines):
+        if line.startswith('"main"'):
+            end = next((i for i in range(start + 1, len(lines)) if not lines[i].strip()), len(lines))
+            return "\n".join(lines[start:end])
+    return "(no \"main\" thread in the dump)"
+
+
+def thread_dump(pid: int, path: Path) -> str:
+    """Before a hung ledger-api is killed (D-132): jcmd <pid> Thread.print, bounded by
+    JCMD_TIMEOUT_SECONDS, written in full to path. Returns a summary for the failure message: the
+    main thread's stack and where the full dump is, or why there is none. Never raises."""
+    jcmd = _jcmd()
+    if jcmd is None:
+        return "(no thread dump: jcmd not found next to java or on PATH)"
+    try:
+        result = subprocess.run(
+            [jcmd, str(pid), "Thread.print"], capture_output=True, text=True, timeout=JCMD_TIMEOUT_SECONDS, check=False
+        )
+    except subprocess.TimeoutExpired:
+        return f"(no thread dump: jcmd did not answer within {JCMD_TIMEOUT_SECONDS} s)"
+    except OSError as ex:
+        return f"(no thread dump: {ex!r})"
+    dump = result.stdout + result.stderr
+    path.write_text(dump, encoding="utf-8")
+    return f"--- main thread (full dump: {path}) ---\n{_main_thread(dump)}"
+
+
 @contextmanager
 def postgres():
     """postgres:17.11 bootstrapped by the same roles script as Compose and ledger-api's tests."""
@@ -174,7 +213,7 @@ def _jdbc_url(database: Database) -> str:
     return f"jdbc:postgresql://{database.host}:{database.port}/{database.name}"
 
 
-def _jar_env() -> dict:
+def jar_env() -> dict:
     return dict(os.environ, LEDGER_API_APP_PASSWORD=APP_PASSWORD, LEDGER_API_OWNER_PASSWORD=OWNER_PASSWORD)
 
 
@@ -195,17 +234,25 @@ async def _latest_applied(database: Database) -> str | None:
         await conn.close()
 
 
+def migrate_command(database: Database, jar: Path) -> list[str]:
+    return [java(), "-jar", str(jar), "--ledger.migrate-only=true", f"--spring.datasource.url={_jdbc_url(database)}"]
+
+
 def migrate(database: Database, jar: Path) -> None:
-    """The Flyway-built schema: the jar in migrate-only mode must exit 0 (D-083)."""
-    command = [java(), "-jar", str(jar), "--ledger.migrate-only=true", f"--spring.datasource.url={_jdbc_url(database)}"]
+    """The Flyway-built schema: the jar in migrate-only mode must exit 0 (D-083). If it doesn't exit
+    within MIGRATE_TIMEOUT_SECONDS, a thread dump is taken before it is killed (D-132)."""
+    process = subprocess.Popen(
+        migrate_command(database, jar), env=jar_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
     try:
-        result = subprocess.run(
-            command, env=_jar_env(), capture_output=True, text=True, timeout=MIGRATE_TIMEOUT_SECONDS, check=False
-        )
-    except subprocess.TimeoutExpired as ex:
-        pytest.fail(f"migrate-only run did not exit within {MIGRATE_TIMEOUT_SECONDS} s:\n{(ex.stdout or '')[-4000:]}")
-    if result.returncode != 0:
-        pytest.fail(f"migrate-only run exited {result.returncode}:\n{(result.stdout + result.stderr)[-4000:]}")
+        output, _ = process.communicate(timeout=MIGRATE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        dump = thread_dump(process.pid, Path(tempfile.mkdtemp(prefix="ledger-api-migrate-")) / "ledger-api-threads.txt")
+        process.kill()
+        output, _ = process.communicate(timeout=30)
+        pytest.fail(f"migrate-only run did not exit within {MIGRATE_TIMEOUT_SECONDS} s:\n{(output or '')[-4000:]}\n{dump}")
+    if process.returncode != 0:
+        pytest.fail(f"migrate-only run exited {process.returncode}:\n{output[-4000:]}")
     latest = asyncio.run(_latest_applied(database))
     expected = _highest_migration()
     assert latest == str(expected), f"flyway_schema_history is at {latest}, highest migration file is V{expected}"
@@ -345,6 +392,8 @@ def kafka():
 
 
 def _wait_for_health(base_url: str, process: subprocess.Popen, log_path: Path, *, deadline: float) -> None:
+    """Until /actuator/health is UP. On a timeout, a thread dump is taken before the caller kills the
+    process (D-132), so an unknown hang shows where it stopped."""
     while time.monotonic() < deadline:
         if process.poll() is not None:
             pytest.fail(f"ledger-api exited {process.returncode}:\n{log_path.read_text(errors='replace')[-4000:]}")
@@ -355,21 +404,11 @@ def _wait_for_health(base_url: str, process: subprocess.Popen, log_path: Path, *
         except (urllib.error.URLError, ConnectionError, TimeoutError):
             pass
         time.sleep(0.25)
-    pytest.fail(f"ledger-api not healthy at {base_url}:\n{log_path.read_text(errors='replace')[-4000:]}")
+    dump = thread_dump(process.pid, log_path.with_name("ledger-api-threads.txt"))
+    pytest.fail(f"ledger-api not healthy at {base_url}:\n{log_path.read_text(errors='replace')[-4000:]}\n{dump}")
 
 
-@contextmanager
-def ledger_api(database: Database, jar: Path, log_dir: Path, *, relay_bootstrap: str | None = None):
-    """The jar in server mode on 127.0.0.1 with one test API key (D-103).
-
-    relay_bootstrap None: the outbox relay is off. Otherwise it runs on its 200 ms schedule against
-    that broker (D-104). Only the key's SHA-256 reaches the jar (D-049); the key itself stays in
-    this process and is never printed. The jar's output goes to a file, shown only on failure.
-    """
-    port = free_port()
-    api_key = secrets.token_urlsafe(24)
-    key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
-    log_path = log_dir / "ledger-api.log"
+def server_command(database: Database, jar: Path, port: int, key_hash: str, relay_bootstrap: str | None = None) -> list[str]:
     command = [
         java(),
         "-jar",
@@ -388,11 +427,27 @@ def ledger_api(database: Database, jar: Path, log_dir: Path, *, relay_bootstrap:
             "--ledger.outbox.relay.poll-interval=200ms",
             f"--ledger.outbox.relay.bootstrap-servers={relay_bootstrap}",
         ]
+    return command
+
+
+@contextmanager
+def ledger_api(database: Database, jar: Path, log_dir: Path, *, relay_bootstrap: str | None = None):
+    """The jar in server mode on 127.0.0.1 with one test API key (D-103).
+
+    relay_bootstrap None: the outbox relay is off. Otherwise it runs on its 200 ms schedule against
+    that broker (D-104). Only the key's SHA-256 reaches the jar (D-049); the key itself stays in
+    this process and is never printed. The jar's output goes to a file, shown only on failure.
+    """
+    port = free_port()
+    api_key = secrets.token_urlsafe(24)
+    key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    log_path = log_dir / "ledger-api.log"
+    command = server_command(database, jar, port, key_hash, relay_bootstrap)
     with open(log_path, "wb") as log:
-        process = subprocess.Popen(command, env=_jar_env(), stdout=log, stderr=subprocess.STDOUT)
+        process = subprocess.Popen(command, env=jar_env(), stdout=log, stderr=subprocess.STDOUT)
     base_url = f"http://127.0.0.1:{port}"
     try:
-        _wait_for_health(base_url, process, log_path, deadline=time.monotonic() + 120)
+        _wait_for_health(base_url, process, log_path, deadline=time.monotonic() + HEALTH_TIMEOUT_SECONDS)
         yield ApiClient(base_url, api_key)
     finally:
         process.terminate()

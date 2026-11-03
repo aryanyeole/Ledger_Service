@@ -7,6 +7,15 @@ spring:
     # Runtime role: not the schema owner (D-006). Roles come from infra/postgres/init.
     username: ledger_api_app
     password: ${LEDGER_API_APP_PASSWORD}
+    # Connection timeouts (D-132). loginTimeout (10 s) is in org/postgresql/driverconfig.properties,
+    # not in the URL (SPRING_DATASOURCE_URL replaces it) and not here (Flyway's DataSource is derived
+    # from the URL and credentials only, so Hikari's properties never reach it): every pgjdbc
+    # connection gets it. socketTimeout bounds each read on the pool's connections only: 60 s, 12x
+    # ledger.db.lock-timeout, and the relay's Kafka wait is not a socket read. Flyway's connection
+    # has none, so a long migration is never cut off.
+    hikari:
+      data-source-properties:
+        socketTimeout: 60
   flyway:
     enabled: true
     # Migrations run as the owner on their own connection.
