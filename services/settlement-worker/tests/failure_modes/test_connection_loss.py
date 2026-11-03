@@ -37,7 +37,9 @@ from support.failure_kit import (
     dedup_rows,
     fresh_group,
     funded_pair,
+    newest_position,
     postings,
+    publish_until,
     results,
     status,
     terminate_worker_backends,
@@ -151,18 +153,6 @@ def test_a_reconnect_with_the_wrong_role_exits_2(fm):
     assert status(fm, payment) == "AUTHORIZED" and postings(fm, payment) == 0
 
 
-def _publish_until(fm, customer, merchant, predicate, limit: int = 12):
-    others = {}
-    for _ in range(limit):
-        candidate = fm.api.authorize(customer, merchant, "10.00")
-        fm.publish(candidate)
-        position = fm.position(candidate)
-        if predicate(position):
-            return candidate, others
-        others[candidate] = position
-    raise AssertionError(f"no candidate matched within {limit} publishes: {others}")
-
-
 # (d)
 def test_a_failed_offset_commit_is_recommitted_not_rerun(fm):
     group = fresh_group(fm, "commit-fail")
@@ -177,7 +167,11 @@ def test_a_failed_offset_commit_is_recommitted_not_rerun(fm):
         mine = {"partition": partition, "offset": offset}
         w.wait_for("offset_commit_failed", timeout=60, **mine)
         # Published while P's commit is pending: must not be fetched until the commit lands.
-        r, _ = _publish_until(fm, customer, merchant, lambda pos: pos[0] == partition and pos[1] > offset)
+        def behind_p(drawn) -> bool:
+            drawn_partition, drawn_offset = newest_position(drawn)
+            return drawn_partition == partition and drawn_offset > offset
+
+        r = next(reversed(publish_until(fm, customer, merchant, behind_p)))
         wait(w, lambda: (committed(fm, group, partition) or 0) > offset, 30, "P's offset committed")
         w.wait_for("payment_settled", payment_id=str(r), timeout=60)
         assert w.process.poll() is None, w.diagnostics()
