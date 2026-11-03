@@ -1,6 +1,11 @@
-"""The negative control's own stack (D-086, D-104): a fresh migrated Postgres, its own Kafka, and the
-ledger-api jar with the outbox relay on, built per module and shared with nothing else, so its
-deliberate duplicates can't leak into another test's ledger and the stack-wide escrow check is exact.
+"""The negative controls' own stacks, built per module and shared with nothing else.
+
+control (D-086, D-104): a fresh migrated Postgres, its own Kafka, and the ledger-api jar with the
+outbox relay on, so the dedup control's deliberate duplicates can't leak into another test's ledger
+and the stack-wide escrow check is exact.
+
+two_query_stack (D-118): a fresh migrated Postgres and the jar with the relay off. No Kafka: nothing
+is published or consumed, and the jar starts without a broker when its relay is off.
 """
 
 import asyncio
@@ -43,3 +48,21 @@ def control(tmp_path_factory) -> ControlStack:
         with stack.ledger_api(database, jar, log_dir, relay_bootstrap=broker.bootstrap_servers) as api:
             assert _wait_for_topic(broker.bootstrap_servers, stack.TOPIC) == {0, 1, 2}
             yield ControlStack(database, broker, api, stack.AppDb(database), stack.WorkerDb(database), log_dir)
+
+
+@dataclass(frozen=True)
+class TwoQueryStack:
+    database: stack.Database
+    api: ApiClient
+    app_db: stack.AppDb
+    worker_db: stack.WorkerDb
+
+
+@pytest.fixture(scope="module")
+def two_query_stack(tmp_path_factory) -> TwoQueryStack:
+    jar = stack.find_jar()
+    log_dir = tmp_path_factory.mktemp("two-query-control")
+    with stack.postgres() as database:
+        stack.migrate(database, jar)
+        with stack.ledger_api(database, jar, log_dir) as api:
+            yield TwoQueryStack(database, api, stack.AppDb(database), stack.WorkerDb(database))
