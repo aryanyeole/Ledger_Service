@@ -11,10 +11,13 @@ each transfer or authorize, its amount is added to the sender's running outflow,
 counted, and a request that would take it past its funding fails the test instead of being sent.
 
 The load runs until RECONCILE_RUNS runs (default 20, CI; the soak sets more) have as_of later than
-T_start, read just before the load. Then it stops, the worker drains, and one more run is observed.
-Every run, before, during and after the load, must report 0 on all three checks. The snapshot is one
-statement, so it has no seam a test could hold open: the proof is load-based, and its tripwire shows
-the load reached the snapshots (D-067, D-106).
+T_start, read just before the load. When it stops, before any drain, the fixture records and prints
+the load-window runs' clean check, the in-flight tripwire and the summary line; then the worker
+drains and one more run is observed. The fixture raises on neither the checks nor the drain, so a
+slow drain can't hide the proof: each test asserts one of them. Every run, before, during and after
+the load, must report 0 on all three checks. The snapshot is one statement, so it has no seam a test
+could hold open: the proof is load-based, and its tripwire shows the load reached the snapshots
+(D-067, D-106).
 """
 
 import asyncio
@@ -61,11 +64,15 @@ if _seed and not _seed.isdigit():
     raise pytest.UsageError(f"RECONCILE_SNAPSHOT_SEED must be a non-negative integer, got {_seed!r}")
 SEED = int(_seed) if _seed else random.SystemRandom().randrange(1 << 40)
 
-# The load stops after RECONCILE_RUNS runs; a run under load takes about 0.25 s, so 2 s a run is ample.
+# The load stops after RECONCILE_RUNS runs; a run under load takes well under a second, so 2 s a run
+# is ample.
 LOAD_TIMEOUT_S = 60 + 2 * RECONCILE_RUNS
-# The drain waits out the worker's backlog when the load stops, which can only grow with the load's
-# length: 120 s for CI's 20 runs, plus 0.1 s for every run beyond them (soak of 2,000: 318 s).
-DRAIN_TIMEOUT_S = 120 + 0.1 * (RECONCILE_RUNS - 20)
+
+
+def drain_timeout_s(backlog: int) -> float:
+    """120 s plus the load's payments still AUTHORIZED at load stop at 10 a second: half the idle
+    settle rate measured on the local soak (~22-25/s, one worker)."""
+    return 120 + backlog / 10
 
 
 def run(coro):
@@ -151,11 +158,11 @@ class Load:
             self._outflow[customer] += amount
             return True
 
-    def _request(self, rng: random.Random) -> tuple[str, str, dict, int] | None:
-        """(kind, path, body, sender) of the next request, or None if it would overdraw its sender."""
+    def _request(self, rng: random.Random) -> tuple[str, str, dict] | None:
+        """(kind, path, body) of the next request, or None if it would overdraw its sender."""
         choice = rng.random()
         if choice < 0.2:
-            return "deposit", "/v1/deposits", {"account_id": rng.choice(self._everyone), "amount": str(_amount(rng))}, 0
+            return "deposit", "/v1/deposits", {"account_id": rng.choice(self._everyone), "amount": str(_amount(rng))}
         source = rng.choice(self._working)
         if choice < 0.6:
             target = source
@@ -169,7 +176,7 @@ class Load:
             kind, path, body = "authorize", "/v1/payments", {"customer_account_id": source, "merchant_account_id": merchant}
         if not self._reserve(source, amount):
             return None
-        return kind, path, {**body, "amount": str(amount)}, source
+        return kind, path, {**body, "amount": str(amount)}
 
     def _run(self, index: int) -> None:
         rng = random.Random(f"{SEED}-{index}")
@@ -178,7 +185,7 @@ class Load:
             if planned is None:
                 self.stop.set()
                 return
-            kind, path, body, _ = planned
+            kind, path, body = planned
             try:
                 status, response = self._api.try_post(path, body)
             except Exception as ex:  # noqa: BLE001 - recorded and asserted on
@@ -191,20 +198,63 @@ class Load:
                     self.payments.append(uuid.UUID(response["payment_id"]))
 
 
+@dataclass(frozen=True)
+class Run:
+    completed: dict
+    drifts: list  # the drift_detected lines emitted just before it
+
+
 class LogTail:
-    """The worker's complete JSON lines, read incrementally from where the last read stopped."""
+    """The worker's complete JSON lines, read incrementally from where the last read stopped, with
+    each reconciliation_completed paired with the drift_detected lines just before it (one reconciler
+    task emits them; drift_detected carries no run_id)."""
 
     def __init__(self, path) -> None:
         self._path = path
         self._offset = 0
+        self._pending: list = []
+        self.retries: list[dict] = []
 
-    def new(self) -> list[dict]:
+    def new_runs(self) -> list[Run]:
         with open(self._path, "rb") as f:
             f.seek(self._offset)
             data = f.read()
         complete = data[: data.rfind(b"\n") + 1]
         self._offset += len(complete)
-        return [json.loads(line) for line in complete.decode("utf-8").splitlines() if line.strip()]
+        runs = []
+        for raw in complete.decode("utf-8").splitlines():
+            if not raw.strip():
+                continue
+            line = json.loads(raw)
+            if line["event"] == "drift_detected":
+                self._pending.append(line)
+            elif line["event"] == "reconciliation_completed":
+                runs.append(Run(line, self._pending))
+                self._pending = []
+            elif line["event"] == "reconciliation_failed":
+                self._pending = []
+            elif line["event"] == "retry_scheduled":
+                self.retries.append(line)
+        return runs
+
+
+def _clean(run_: Run) -> bool:
+    c = run_.completed
+    return (c["drifted_accounts"], c["global_sum"], c["escrow_drift"], run_.drifts) == (0, "0.0000", "0.0000", [])
+
+
+def _breakdown(runs: list[Run]) -> str:
+    drifted = [r for r in runs if r.completed["drifted_accounts"] != 0]
+    global_off = [r for r in runs if r.completed["global_sum"] != "0.0000"]
+    escrow_off = [r for r in runs if r.completed["escrow_drift"] != "0.0000"]
+    lines = [d for r in runs for d in r.drifts]
+    first = next((r for r in runs if not _clean(r)), None)
+    return (
+        f"of {len(runs)} runs: {sum(1 for r in runs if not _clean(r))} not clean ({len(drifted)} with drifted "
+        f"accounts, {len(global_off)} with global_sum != 0, {len(escrow_off)} with escrow drift); "
+        f"{len(lines)} drift_detected lines over {len({d['account_id'] for d in lines})} accounts; "
+        f"first: {(first.completed, first.drifts[:3]) if first else None}"
+    )
 
 
 @dataclass
@@ -212,9 +262,15 @@ class Loaded:
     worker: object = None
     load: Load | None = None
     t_start: datetime | None = None
-    t_drained: datetime | None = None
-    load_runs: list[dict] = field(default_factory=list)  # the runs counted towards RECONCILE_RUNS
+    load_runs: list[Run] = field(default_factory=list)  # the runs counted towards RECONCILE_RUNS
+    load_breakdown: str = ""  # the load-window runs' clean check, recorded at load stop
     in_flight: dict[int, int] = field(default_factory=dict)  # run_id -> transactions in flight
+    backlog: int | None = None  # the load's payments still AUTHORIZED at load stop
+    drain_timeout_s: float | None = None
+    drained: bool = False
+    drain_s: float | None = None
+    drain_last: tuple | None = None
+    t_drained: datetime | None = None
     post_drain: dict | None = None
     max_transaction_id: int | None = None
     lines: list[dict] = field(default_factory=list)  # the worker's whole log, after it stopped
@@ -233,27 +289,30 @@ def _seed(api) -> tuple[list[int], list[int], list[int]]:
     return customers, merchants, working
 
 
-async def _drained(rs, group: str, payment_ids: list[uuid.UUID], w) -> tuple:
+_AUTHORIZED_SQL = "SELECT count(*) FROM payments WHERE id = ANY($1::uuid[]) AND status = 'AUTHORIZED'"
+
+
+async def _drain(rs, group: str, payment_ids: list[uuid.UUID], w, timeout: float) -> tuple[bool, float, tuple]:
     """Polls until, twice in a row: none of the load's payments is AUTHORIZED, no outbox row is
-    unpublished, and the group's lag is 0 on every partition."""
+    unpublished, and the group's lag is 0 on every partition. Returns (drained, seconds, last poll);
+    never raises on a timeout or a worker exit, so the checks recorded at load stop stand."""
     conn = await rs.app_db.connect()
+    started = time.monotonic()
     try:
-        deadline = time.monotonic() + DRAIN_TIMEOUT_S
         consecutive, last = 0, None
-        while time.monotonic() < deadline:
-            assert w.process.poll() is None, w.diagnostics()
-            authorized = await conn.fetchval(
-                "SELECT count(*) FROM payments WHERE id = ANY($1::uuid[]) AND status = 'AUTHORIZED'", payment_ids
-            )
+        while time.monotonic() - started < timeout:
+            if w.process.poll() is not None:
+                return False, time.monotonic() - started, ("worker exited", w.process.returncode, last)
+            authorized = await conn.fetchval(_AUTHORIZED_SQL, payment_ids)
             unpublished = await conn.fetchval("SELECT count(*) FROM outbox WHERE published_at IS NULL")
             lag = await group_lag(rs.kafka.bootstrap_servers, group)
             last = (authorized, unpublished, lag)
             quiet = authorized == 0 and unpublished == 0 and set(lag) == {0, 1, 2} and all(v == 0 for v in lag.values())
             consecutive = consecutive + 1 if quiet else 0
             if consecutive == 2:
-                return last
+                return True, time.monotonic() - started, last
             await asyncio.sleep(0.5)
-        raise AssertionError(f"not drained within {DRAIN_TIMEOUT_S} s: (authorized, unpublished, lag) = {last}")
+        return False, time.monotonic() - started, last
     finally:
         await conn.close()
 
@@ -270,17 +329,25 @@ FROM unnest($1::int[], $2::bigint[], $3::timestamptz[]) AS r(run_id, max_tx, as_
 """
 
 
-def _summary(loaded: Loaded) -> str:
-    durations = [r["duration_ms"] for r in loaded.load_runs]
-    counts = [loaded.in_flight.get(r["run_id"], 0) for r in loaded.load_runs] if loaded.in_flight else []
-    retries = [e for e in loaded.events("retry_scheduled") if e.get("sqlstate") == "55P03"]
+def _summary(state: Loaded, retries_55p03: int) -> str:
+    durations = [r.completed["duration_ms"] for r in state.load_runs]
+    counts = list(state.in_flight.values())
     return (
-        f"RECONCILE_SNAPSHOT runs={len(loaded.load_runs)} in_flight_runs={sum(1 for n in counts if n >= 1)} "
+        f"RECONCILE_SNAPSHOT runs={len(state.load_runs)} in_flight_runs={sum(1 for n in counts if n >= 1)} "
         f"in_flight_total={sum(counts)} max_in_flight={max(counts) if counts else 'na'} "
         f"duration_ms_p50={_nearest_rank(durations, 50)} duration_ms_max={max(durations) if durations else 'na'} "
-        f"requests={loaded.load.requests if loaded.load else 0} retries_55P03={len(retries)} seed={SEED} "
-        f"{hardware.summary_fields()}"
+        f"requests={state.load.requests} retries_55P03={retries_55p03} "
+        f"drifted_runs={sum(1 for r in state.load_runs if not _clean(r))} "
+        f"drift_lines={sum(len(r.drifts) for r in state.load_runs)} seed={SEED} {hardware.summary_fields()}"
     )
+
+
+def _write(request, line: str) -> None:
+    reporter = request.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line(line)
+    else:
+        print(line)
 
 
 @pytest.fixture(scope="module")
@@ -305,34 +372,46 @@ def loaded(relay_rs, request):
             assert w.process.poll() is None, w.diagnostics()
             assert state.load.exhausted is None, state.load.exhausted
             assert state.load.alive(), "the load threads stopped on their own"
-            for line in tail.new():
-                if line["event"] == "reconciliation_completed" and _time(line["as_of"]) > state.t_start:
-                    state.load_runs.append(line)
+            for r in tail.new_runs():
+                if _time(r.completed["as_of"]) > state.t_start and len(state.load_runs) < RECONCILE_RUNS:
+                    state.load_runs.append(r)
             time.sleep(0.05)
         state.load.join()
 
-        # Drained, then one more run.
-        run(_drained(rs, group, state.load.payments, w))
-        state.t_drained = _clock(rs)
-        deadline = time.monotonic() + RUN_TIMEOUT_S
-        while state.post_drain is None:
-            assert time.monotonic() < deadline, f"no run with as_of > {state.t_drained} within {RUN_TIMEOUT_S} s"
-            assert w.process.poll() is None, w.diagnostics()
-            for line in tail.new():
-                if line["event"] == "reconciliation_completed" and _time(line["as_of"]) > state.t_drained:
-                    state.post_drain = state.post_drain or line
-            time.sleep(0.05)
-        state.max_transaction_id = _app(rs, "SELECT max(id) AS id FROM transactions")[0]["id"]
-
-        # The tripwire, counted after the load stopped, as ledger_api_app.
+        # At load stop, before any drain: the clean check, the tripwire (as ledger_api_app) and the
+        # summary line, recorded and printed whatever the drain does next.
+        state.load_breakdown = _breakdown(state.load_runs)
         rows = _app(
             rs,
             IN_FLIGHT_SQL,
-            [r["run_id"] for r in state.load_runs],
-            [r["max_transaction_id"] for r in state.load_runs],
-            [_time(r["as_of"]) for r in state.load_runs],
+            [r.completed["run_id"] for r in state.load_runs],
+            [r.completed["max_transaction_id"] for r in state.load_runs],
+            [_time(r.completed["as_of"]) for r in state.load_runs],
         )
         state.in_flight = {row["run_id"]: row["in_flight"] for row in rows}
+        tail.new_runs()
+        _write(request, _summary(state, sum(1 for e in tail.retries if e.get("sqlstate") == "55P03")))
+
+        # The drain, then one more run.
+        state.backlog = _app(rs, _AUTHORIZED_SQL, state.load.payments)[0][0]
+        state.drain_timeout_s = drain_timeout_s(state.backlog)
+        state.drained, state.drain_s, state.drain_last = run(
+            _drain(rs, group, state.load.payments, w, state.drain_timeout_s)
+        )
+        _write(
+            request,
+            f"RECONCILE_SNAPSHOT_DRAIN backlog_at_stop={state.backlog} timeout_s={state.drain_timeout_s:.0f} "
+            f"drained={state.drained} drain_s={state.drain_s:.1f} last={state.drain_last}",
+        )
+        if state.drained:
+            state.t_drained = _clock(rs)
+            deadline = time.monotonic() + RUN_TIMEOUT_S
+            while state.post_drain is None and time.monotonic() < deadline and w.process.poll() is None:
+                for r in tail.new_runs():
+                    if state.post_drain is None and _time(r.completed["as_of"]) > state.t_drained:
+                        state.post_drain = r.completed
+                time.sleep(0.05)
+            state.max_transaction_id = _app(rs, "SELECT max(id) AS id FROM transactions")[0]["id"]
 
         state.exit_code = w.stop()
         state.lines = w.lines()
@@ -341,27 +420,28 @@ def loaded(relay_rs, request):
         w.__exit__(None, None, None)
         if state.load is not None and state.load.alive():
             state.load.join()
-        line = _summary(state)
-        reporter = request.config.pluginmanager.get_plugin("terminalreporter")
-        if reporter is not None:
-            reporter.write_line(line)
-        else:
-            print(line)
+
+
+def _all_runs(lines: list[dict]) -> list[Run]:
+    runs, pending = [], []
+    for line in lines:
+        if line["event"] == "drift_detected":
+            pending.append(line)
+        elif line["event"] == "reconciliation_completed":
+            runs.append(Run(line, pending))
+            pending = []
+        elif line["event"] == "reconciliation_failed":
+            pending = []
+    return runs
 
 
 def test_every_run_reports_no_drift_under_load(loaded):
-    runs = loaded.events("reconciliation_completed")
-    assert len(loaded.load_runs) >= RECONCILE_RUNS and loaded.post_drain in runs, (len(loaded.load_runs), len(runs))
-    drifted = [r for r in runs if r["drifted_accounts"] != 0]
-    global_off = [r for r in runs if r["global_sum"] != "0.0000"]
-    escrow_off = [r for r in runs if r["escrow_drift"] != "0.0000"]
-    drift_lines = loaded.events("drift_detected")
-    breakdown = (
-        f"of {len(runs)} runs: {len(drifted)} with drifted accounts, {len(global_off)} with global_sum != 0, "
-        f"{len(escrow_off)} with escrow drift; {len(drift_lines)} drift_detected lines over "
-        f"{len({d['account_id'] for d in drift_lines})} accounts; first: {(drifted + global_off + escrow_off)[:1]}"
-    )
-    assert (drifted, global_off, escrow_off, drift_lines) == ([], [], [], []), breakdown
+    """Every run in the log (before, during and after the load) is clean; the message also gives the
+    load-window breakdown recorded at load stop."""
+    runs = _all_runs(loaded.lines)
+    assert len(loaded.load_runs) == RECONCILE_RUNS, len(loaded.load_runs)
+    assert all(_clean(r) for r in runs), f"whole log {_breakdown(runs)}; load window {loaded.load_breakdown}"
+    assert loaded.events("drift_detected") == [], loaded.events("drift_detected")[:3]
     assert loaded.events("reconciliation_failed") == [], loaded.events("reconciliation_failed")[:3]
 
 
@@ -388,8 +468,16 @@ def test_writes_were_in_flight_at_the_snapshots(loaded):
     )
 
 
+def test_the_worker_drained_within_its_timeout(loaded):
+    assert loaded.drained, (
+        f"not drained within {loaded.drain_timeout_s:.0f} s (backlog at stop {loaded.backlog}): "
+        f"(authorized, unpublished, lag) = {loaded.drain_last}"
+    )
+
+
 def test_the_run_after_the_drain_saw_every_transaction(loaded):
     post = loaded.post_drain
+    assert post is not None, f"no run after the drain (drained={loaded.drained}, t_drained={loaded.t_drained})"
     assert _time(post["as_of"]) > loaded.t_drained, post
     assert (post["drifted_accounts"], post["global_sum"], post["escrow_drift"]) == (0, "0.0000", "0.0000"), post
     assert post["max_transaction_id"] == loaded.max_transaction_id, (post, loaded.max_transaction_id)
