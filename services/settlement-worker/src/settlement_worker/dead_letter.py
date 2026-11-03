@@ -20,7 +20,9 @@ Every header value is UTF-8.
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
+
+from settlement_worker import timestamps
 
 ERROR_MAX_BYTES = 1024
 _LINE_BREAKS = re.compile(r"[\r\n]+")
@@ -43,7 +45,7 @@ def one_line(error: str, max_bytes: int = ERROR_MAX_BYTES) -> str:
 
 
 def failed_at_text(moment: datetime) -> str:
-    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return timestamps.utc_text(moment)
 
 
 def build(

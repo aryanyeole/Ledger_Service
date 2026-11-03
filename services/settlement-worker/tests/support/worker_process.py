@@ -99,11 +99,12 @@ def start_worker(
     extra_env: dict[str, str] | None = None,
 ) -> WorkerProcess:
     """command defaults to the real worker; the negative control passes its naive entrypoint (D-086).
-    FAULT_*, NAIVE_* and FAKE_* (D-112) never leak in from the caller's environment; a test sets them."""
+    FAULT_*, NAIVE_*, FAKE_* (D-112) and RECONCILE_* (D-114) never leak in from the caller's
+    environment; a test sets them."""
     env = {
         k: v
         for k, v in os.environ.items()
-        if k != "PYTHONUNBUFFERED" and not k.startswith(("FAULT_", "NAIVE_", "FAKE_"))
+        if k != "PYTHONUNBUFFERED" and not k.startswith(("FAULT_", "NAIVE_", "FAKE_", "RECONCILE_"))
     }
     env.update(
         POSTGRES_HOST=database.host,
