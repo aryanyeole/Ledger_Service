@@ -36,9 +36,11 @@ jobs:
     name: settlement-worker
     # Pinned image (D-070): concurrency proofs are timing-sensitive; upgrades are explicit PRs.
     runs-on: ubuntu-24.04
-    # Provisional, calibrated in this PR (M4 T16a): the calibration runs must not be cut off by the
-    # old 8 min limit, which M4's suite has nearly reached (7.8 min on PR #62).
-    timeout-minutes: 20
+    # D-089, recalibrated in M4 T16a: ceil(max x 1.5) rounded up to a whole 5 min = ceil(8.05 x 1.5) = 13 -> 15.
+    # Job durations over n = 14 warm-cache runs: min 6.48, median 7.47, max 8.05 min (runs 41601291439,
+    # 41603867870, 41608478669, 41609616267, and 41610244246 attempts 1-10). Attempt 10 failed in its
+    # ledger-api job (BUG-013); this job runs on its own runner and completed normally, so it counts.
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: services/settlement-worker

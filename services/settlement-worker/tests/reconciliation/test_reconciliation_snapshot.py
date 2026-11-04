@@ -46,9 +46,13 @@ FUND = Decimal("100000.00")
 THREADS = 8
 SEED_THREADS = 8
 RUN_TIMEOUT_S = 30
-# UNCALIBRATED (D-106): the floor of runs with a write in flight at the snapshot starts at 2 until
-# it is calibrated from this test's CI history plus 10 fresh runs.
-RECONCILE_INFLIGHT_FLOOR = 2
+# D-106: floor = max(2, floor(0.6 x CI minimum of in_flight_runs)) = max(2, floor(0.6 x 19)) = 11.
+# n = 14 (M4 T16a, ubuntu-24.04 runners, 20 runs each): runs 41601291439 (PR #61), 41603867870 (main
+# after #61), 41608478669 (PR #62), 41609616267 (main after #62), each attempt 1, and 41610244246
+# (PR #63) attempts 1-10. Values: 19 in six of them (41601291439, 41609616267, and attempts 2, 3, 7
+# and 10 of 41610244246), 20 in the other eight. Attempt 10 failed overall in its ledger-api job
+# (BUG-013); the worker job runs on its own runner and completed normally, so it counts.
+RECONCILE_INFLIGHT_FLOOR = 11
 
 
 def _positive_int(name: str, default: str) -> int:
