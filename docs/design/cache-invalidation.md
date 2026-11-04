@@ -79,7 +79,9 @@ bounded by the value TTL (§5 row 2c).
 
 ### 1.6 Never inside a DB transaction (CLAUDE.md invariant 5, D-147)
 
-Redis is a network call, and invariant 5 names it. Placement in ledger-api:
+Redis is a network call, and invariant 5 names it: "In ledger-api, Redis calls run only outside a transaction: on a
+write path, before WriteTransactions opens one or after its TransactionTemplate.execute has returned (D-147)."
+Placement in ledger-api:
 
 - The fast-path read runs before `WriteTransactions.execute` opens a transaction. The balance read path holds no
   transaction at all.
@@ -99,13 +101,14 @@ the lease `SET` runs before the snapshot transaction opens.
 
 ### 2.1 Formats (D-139, D-142, D-144)
 
-All keys start with `ledger:v1:`. A format change bumps `v1` in the key or the leading version field in the value,
-never both silently.
+All keys start with `ledger:v1:`. A format change bumps the key's v1 (a new keyspace) or the value's leading version
+field (readers treat an unknown version as a miss, D-139), and updates the literal-string tests in both languages
+(D-143).
 
 | Key | Value | Notes |
 |---|---|---|
 | `ledger:v1:idem:{len}:{client_id}:{key}` | `1\|{hex(request_hash)}\|{status}\|{text}` | `len` = `client_id`'s UTF-8 byte length in decimal. `hex` = 64 lowercase hex digits. `status` = the stored `status_code` in decimal. `text` = `response_body::text` exactly as Postgres returned it, UTF-8. Parsed by splitting on the first three `\|` only; `text` may contain `\|`. |
-| `ledger:v1:bal:{id}` | `1\|{balance}\|{as_of}` | `balance` = the `NUMERIC(19,4)` value as a plain scale-4 string (`100.0000`, `-250.5000` for EXTERNAL), read back through `Money` (sub-cent digits → 500, D-056). `as_of` = the filling read's `now()` in UTC with exactly six fractional digits and `Z` (the D-097 format). A hit's response body must be byte-identical to the miss response that filled it (T7). |
+| `ledger:v1:bal:{id}` | `1\|{balance}\|{as_of}` | `balance` = the `NUMERIC(19,4)` value as a plain scale-4 string (`100.0000`, `-250.5000` for EXTERNAL), read back through `Money` (sub-cent digits → 500, D-056). `as_of` = the filling read's `now()` in UTC with exactly six fractional digits and `Z` (the D-097 format). A hit's response body must be byte-identical to the miss response that filled it (T7). A hit parses as_of back to an OffsetDateTime at UTC and rebuilds BalanceResponse through the same serializer as a miss; cached strings are never spliced into the response body. |
 | `ledger:v1:bal-gen:{id}` | a canonical lowercase UUID (8-4-4-4-12) | The account's token. Replaced by every invalidation, `PX 300000`. |
 | `ledger:v1:reconcile:lease` | `{host}:{pid}:{uuid}` | `SET NX PX RECONCILE_LOCK_TTL_MS`; never released. The value is for diagnosis only; nobody compares it. |
 
@@ -117,7 +120,7 @@ Example: client `acme`, key `order-42:retry` → `ledger:v1:idem:4:acme:order-42
 
 **Invalidation script.** The same text in Java and Python, pinned by literal-string tests in both languages (D-143).
 `KEYS` holds one value-key/token-key pair per account touched by the posting, in that order. `ARGV[1]` is a fresh
-UUID for this call. The `DEL` comes first so a value is gone even if a later write in the script fails.
+UUID for this call. The `DEL` comes first so a value is gone even if a later write in the script fails **(verify in T2)**.
 
 ```lua
 -- ledger:v1 balance invalidation (D-142). KEYS: ledger:v1:bal:{id}, ledger:v1:bal-gen:{id} per account.
@@ -441,7 +444,7 @@ The "Rejected alternative" column of each row, verbatim.
 - **D-136:** spring-boot-starter-data-redis; Jedis; Redisson/Redlock (multi-master, an anti-goal); the Testcontainers redis module or extra
 - **D-137:** Library defaults; eager connect at startup; a circuit-breaker library; bypassing invalidations; a connection pool (loses send order); MULTI on the shared connection
 - **D-138:** Default RDB persistence; noeviction (a full Redis fails writes, invalidations included; behaviour observed in T2); one Redis shared across test contexts
-- **D-139:** Deciding 422 in Redis; a TTL equal to expires_at; the purger DELing Redis keys; caching Jackson's bytes; an absolute PXAT deadline from the DB clock (swaps the pause bound for a clock-skew bound)
+- **D-139:** Deciding 422 in Redis; a TTL equal to expires_at; the purger DELing Redis keys; caching Jackson's bytes; an absolute PXAT deadline from the DB clock (swaps the pause bound for a clock-skew bound); closing the connection after a command timeout (the bytes are already in the paused server's socket buffer)
 - **D-140:** Relying on no code updating completed rows; rejecting every update to a completed row (breaks the D-120 backdating fixture used by IdempotencyKeyExpiryTest, DbRolePrivilegesTest and M5's purge case)
 - **D-141:** pg_terminate_backend timing; no rollback proof
 - **D-142:** Delete-only cache-aside; API-only invalidation; invalidating inside or before the transaction; TransactionSynchronization.afterCommit (D-147); a token TTL of 2 × value TTL (couples two services' config); MULTI invalidation
@@ -451,9 +454,6 @@ The "Rejected alternative" column of each row, verbatim.
 - **D-146:** Shadow DB reads (over-count racing commits); comparing timestamps across clocks; Number arithmetic in the judge; Compose services for the API and worker in M5 (open issue)
 - **D-147:** TransactionSynchronization.afterCommit / afterCompletion; invalidating in each controller
 - **D-148:** Arguing it only; a fault point inside the invalidation call
-
-Also rejected in this document, with no row of its own: **closing Lettuce's connection after a command timeout** to
-stop a late execution. The bytes are already in the paused server's socket buffer and are read before the EOF (§1.5).
 
 ---
 
@@ -610,6 +610,6 @@ docker compose exec redis redis-cli --scan --pattern "ledger:v1:bal:*" | Select-
 | 1 | Spring runs `TransactionSynchronization.afterCommit` before it releases the connection (quote `AbstractPlatformTransactionManager` from the Spring Framework 7 source jar) | §1.6 | T6 |
 | 2 | Lettuce `RedisClient.connect()` throws when Redis is down | §5 row 6 | T2 |
 | 3 | Lettuce: commands from other threads join a `MULTI` on a shared connection (quote the reference guide's passage on transactions and shared connections) | §2.2 | T2 |
-| 4 | What the invalidation script does when Redis is over `maxmemory` with `noeviction` | §5 row 12 | T2 |
+| 4 | What the invalidation script does when Redis is over `maxmemory` with `noeviction`: whether Redis 7 refuses the unflagged script before it runs (then the `DEL` doesn't run either), or runs it until the first refused write, so that "the `DEL` comes first so a value is gone even if a later write in the script fails" holds | §2.1, §5 row 12 | T2 |
 | 5 | redis-py 8.1.0's default retry behaviour (D-137 sets retries to 0 explicitly either way) | D-137 | T2 |
 | 6 | k6 2.3.0 supports BigInt | §8.3 | T14 |

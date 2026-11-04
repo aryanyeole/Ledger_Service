@@ -18,7 +18,7 @@ Payments ledger: Spring Boot API + Python settlement worker + React/TS dashboard
 2. `entries` is append-only. Corrections are new reversing transactions.
 3. Money is `BigDecimal` / `Decimal` / JSON string. No `double`, `float`, or JS `Number` anywhere in a money path. Rounding mode is always explicit (HALF_EVEN).
 4. Lock accounts in ascending id order before updating balances (Java and Python).
-5. No network calls (Kafka, HTTP, Redis, the payment processor) inside a DB transaction, except the outbox relay's send-and-await inside its batch transaction (D-008, D-079). In ledger-api, Redis calls run only after WriteTransactions has returned (D-147). Events go through the `outbox` table, except dead letters, which the worker produces directly to `ledger.payments.dlq.v1` outside any DB transaction (D-111).
+5. No network calls (Kafka, HTTP, Redis, the payment processor) inside a DB transaction, except the outbox relay's send-and-await inside its batch transaction (D-008, D-079). In ledger-api, Redis calls run only outside a transaction: on a write path, before WriteTransactions opens one or after its TransactionTemplate.execute has returned (D-147). Events go through the `outbox` table, except dead letters, which the worker produces directly to `ledger.payments.dlq.v1` outside any DB transaction (D-111).
 6. Consumer side: `processed_messages` insert + effect + outbox in ONE DB transaction; commit the Kafka offset after the DB commit, or, for a dead-lettered record, after the DLQ ack (D-111).
 7. Idempotency key row and the business effect commit in the same transaction.
 
