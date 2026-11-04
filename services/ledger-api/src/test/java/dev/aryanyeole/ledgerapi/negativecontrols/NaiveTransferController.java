@@ -86,9 +86,10 @@ public class NaiveTransferController {
 	/**
 	 * BUG-013's regression hooks, armed per Idempotency-Key by the test only. The first request
 	 * to find an armed key absent (the owner) holds after its claim until release(); blocked
-	 * fires once it waits at the D-133 barrier or holds, whichever comes first, so the test can
-	 * send a second request while the owner is still in flight. No transaction or connection is
-	 * held while holding (tx 3 has committed).
+	 * fires once it is really waiting, at the D-133 barrier (no second request has found the key
+	 * absent yet) or in the hold, whichever comes first, so the test can send a second request
+	 * while the owner is still in flight and can't race it. No transaction or connection is held
+	 * while holding (tx 3 has committed).
 	 */
 	public static final class Hold {
 
@@ -147,7 +148,8 @@ public class NaiveTransferController {
 		// control's overlap assertion fails.
 		CountDownLatch barrier = this.barriers.computeIfAbsent(clientId + "\n" + key, (k) -> new CountDownLatch(2));
 		barrier.countDown();
-		if (held) {
+		if (held && barrier.getCount() > 0) {
+			// Only when the owner will really wait: a barrier that doesn't hold it must not signal.
 			hold.blocked.countDown();
 		}
 		barrier.await(BARRIER_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
