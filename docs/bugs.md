@@ -729,7 +729,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 
 ### BUG-013 — CheckThenInsertIdempotencyTest's round produced one transfer on CI, so the D-017 control failed its overlap check against a correct system
 
-- **Found:** 2026-11-03 19:23 · M4 · Task T16a (calibration reruns) · branch `m4/t16a-closeout-calibration` at `f4904e2`, ledger-api code and tests as on `main` at `6775554` (that branch changes only `docs/bugs.md` and the settlement-worker job's `timeout-minutes`); entry on `m4/fix-bug-013`
+- **Found:** 2026-11-03 19:23 · M4 · Task T16a (calibration reruns) · branch `m4/t16a-closeout-calibration` at `f4904e2`, ledger-api code and tests as on `main` at `6775554` (that branch changes only `docs/bugs.md` and the settlement-worker job's `timeout-minutes`); entry on `m4/t16b-fix-bug-013`
 - **Status:** open
 - **Component:** ledger-api tests (`services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/negativecontrols/CheckThenInsertIdempotencyTest.java`, with the shared `ConcurrentRequestHarness`)
 - **Property / invariant touched:** P2 proof evidence, D-067. On CI this control's n > 1 is the primary evidence that the harness overlaps requests; a round with n = 1 fails CI against a correct system. No system behaviour is wrong: the main code under test is not the naive controller.
