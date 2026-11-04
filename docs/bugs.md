@@ -29,6 +29,7 @@
 | BUG-010 | 2026-11-02 13:37 | M4 | A Kafka container whose startup wait fails is never stopped | none (component: settlement-worker tests, `support/stack.py`) | fixed | 7562fc0 (PR #56) |
 | BUG-011 | 2026-11-02 16:12 | M4 | Failure-mode setups that publish until a payment lands on a chosen partition give up after a fixed 12 or 15 tries, so a correct run fails about 0.7% of the time | none (component: settlement-worker tests) | fixed | 873c84e (PR #57) |
 | BUG-012 | 2026-11-02 18:51 | M4 | ledger-api's startup hung after "Root WebApplicationContext: initialization completed", before Flyway's first database line, through a 120 s health wait | none observed (component: ledger-api startup; seen through the settlement-worker test stack) | fixed | 650a6a1 (PR #59; squash SHA to follow) |
+| BUG-013 | 2026-11-03 19:23 | M4 | CheckThenInsertIdempotencyTest's round produced one transfer on CI, so the D-017 control failed its overlap check against a correct system | P2 proof evidence, D-067 (component: ledger-api tests) | open | — |
 
 ---
 
@@ -723,3 +724,35 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 - **Summary (one sentence):** ledger-api's first Postgres connection, Flyway's plain driver connection in server and migrate-only mode, had no login or read timeout, and Hikari's login timeout never reached pgjdbc, so a database that accepts TCP but doesn't answer hung startup forever in pgjdbc's `doAuthentication`. A 10 s `loginTimeout` for every pgjdbc connection now makes startup fail and exit 1, the pool's reads have a 60 s socket timeout, and the harness dumps the threads of any ledger-api it has to kill.
 - **Notes:**
   - **What remains unknown:** why Postgres stopped answering in the 2026-11-02 18:14 run. The fix bounds the hang, and the new thread dump will locate the next one.
+
+---
+
+### BUG-013 — CheckThenInsertIdempotencyTest's round produced one transfer on CI, so the D-017 control failed its overlap check against a correct system
+
+- **Found:** 2026-11-03 19:23 · M4 · Task T16a (calibration reruns) · branch `m4/t16a-closeout-calibration` at `f4904e2`, ledger-api code and tests as on `main` at `6775554` (that branch changes only `docs/bugs.md` and the settlement-worker job's `timeout-minutes`); entry on `m4/fix-bug-013`
+- **Status:** open
+- **Component:** ledger-api tests (`services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/negativecontrols/CheckThenInsertIdempotencyTest.java`, with the shared `ConcurrentRequestHarness`)
+- **Property / invariant touched:** P2 proof evidence, D-067. On CI this control's n > 1 is the primary evidence that the harness overlaps requests; a round with n = 1 fails CI against a correct system. No system behaviour is wrong: the main code under test is not the naive controller.
+- **Symptom:** the ledger-api job of CI run `41610244246`, attempt 10, failed in `./mvnw -B verify` (job finished 2026-11-03 19:18:16):
+  ```
+  [ERROR] dev.aryanyeole.ledgerapi.negativecontrols.CheckThenInsertIdempotencyTest.naiveIdempotencyLetsDuplicatesThrough()[1] -- Time elapsed: 0.148 s <<< FAILURE!
+  [ERROR]   CheckThenInsertIdempotencyTest.lambda$naiveIdempotencyLetsDuplicatesThrough$0:68->round:126 [round 1: harness produced no overlap (new TRANSFER transactions = 1)]
+  [ERROR] Tests run: 573, Failures: 1, Errors: 0, Skipped: 0
+  ```
+  The control's report lines from the same job (CI runs 1 round):
+  ```
+  CONCURRENCY control config processors=4 maxHeapMB=3996 hikari.maximumPoolSize=10 tomcat.maxThreads=200 tomcat.minSpareThreads=10 tomcat.keepAliveTimeout=60000 tomcat.maxKeepAliveRequests=100 rounds=1
+  CONCURRENCY control warmup serverArrivedBeforeFirstCompletion=44 arrivalSpreadMs=111 connections=74 clientSentBeforeFirst=53 peakInFlight=76
+  CONCURRENCY control round=1 processors=4 serverArrivedBeforeFirstCompletion=8 arrivalSpreadMs=80 reusedConnections=74/74 clientSentBeforeFirst=36 peakInFlight=48 transactions=1 distinctBodies=2 statuses={201=100}
+  ```
+  Observed, not yet explained: 8 requests reached the server before the first completed, yet only one TRANSFER was posted, and the 100 responses had 2 distinct bodies.
+- **How detected:** CI, during T16a's 10-attempt §9 rerun loop on PR #63 (run `41610244246`, https://github.com/aryanyeole/Ledger_Service/actions/runs/41610244246/job/126343839352). Attempts 1–9 of the same run passed; the guarded loop stopped at attempt 10. The settlement-worker job of attempt 10 passed.
+- **Reproduction:** not yet attempted.
+- **Time to diagnose:** pending.
+- **Root cause:** pending.
+- **Why it wasn't caught earlier:** pending.
+- **Fix:** pending.
+- **Regression test:** pending.
+- **Decision Log impact:** pending.
+- **Summary (one sentence):** written only after Status = fixed.
+- **Notes:**
