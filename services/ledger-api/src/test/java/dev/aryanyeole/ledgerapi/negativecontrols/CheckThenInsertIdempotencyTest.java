@@ -5,11 +5,16 @@ import static org.junit.jupiter.api.DynamicTest.dynamicTest;
 
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
@@ -17,6 +22,7 @@ import java.util.stream.Stream;
 import javax.sql.DataSource;
 
 import org.junit.jupiter.api.DynamicTest;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -56,6 +62,46 @@ class CheckThenInsertIdempotencyTest {
 
 	@Autowired
 	ServerArrivals arrivals;
+
+	@Autowired
+	NaiveTransferController naive;
+
+	// BUG-013's regression test: its CI signature, n = 1 with two requests overlapping at the
+	// server, reproduced with no timing. The owner (A) holds after its claim; B is sent only once
+	// A is blocked, so B arrives while A is still in flight (both arrive before the first
+	// completion) and must still become a duplicate.
+	@Test
+	void twoRequestsInTheHandlerAtOnceAlwaysDuplicate() throws Exception {
+		ConcurrentRequestHarness harness = new ConcurrentRequestHarness(this.port);
+		long a = harness.createAccount("CUSTOMER");
+		long b = harness.createAccount("CUSTOMER");
+		harness.deposit(a, "1000.00");
+		String key = ConcurrentRequestHarness.newKey();
+		byte[] body = ("{\"from_account_id\": " + a + ", \"to_account_id\": " + b + ", \"amount\": \"10.00\"}")
+			.getBytes(StandardCharsets.UTF_8);
+		NaiveTransferController.Hold hold = this.naive.arm(key);
+
+		ExecutorService pool = Executors.newSingleThreadExecutor();
+		try {
+			Future<Response> first = pool.submit(() -> harness.send(harness.post(NaiveTransferController.ROUTE, key, body)));
+			assertThat(hold.awaitBlocked(Duration.ofSeconds(30))).as("A blocked in the handler").isTrue();
+			Response second = harness.send(harness.post(NaiveTransferController.ROUTE, key, body));
+			hold.release();
+			Response owner = first.get(30, TimeUnit.SECONDS);
+
+			int n = LedgerTestSupport.transactionIds(this.dataSource, a, "TRANSFER").size();
+			ServerArrivals.Overlap server = this.arrivals.overlap(key, new HashSet<>());
+			System.out.println("CONCURRENCY control regression serverArrivedBeforeFirstCompletion="
+					+ server.arrivedBeforeFirstCompletion() + " transactions=" + n);
+			assertThat(List.of(owner.status(), second.status())).as("statuses").containsExactly(201, 201);
+			assertThat(server.arrivedBeforeFirstCompletion()).as("both arrived before the first completed").isEqualTo(2);
+			assertThat(n).as("two requests in the handler at once: new TRANSFER transactions").isEqualTo(2);
+		}
+		finally {
+			hold.release();
+			pool.shutdownNow();
+		}
+	}
 
 	@TestFactory
 	Stream<DynamicTest> naiveIdempotencyLetsDuplicatesThrough() throws Exception {

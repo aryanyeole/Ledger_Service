@@ -1,8 +1,14 @@
 package dev.aryanyeole.ledgerapi.negativecontrols;
 
+import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import jakarta.servlet.http.HttpServletRequest;
 
@@ -68,9 +74,44 @@ public class NaiveTransferController {
 	private record Stored(int status, String body) {
 	}
 
+	private static final Duration HOLD_TIMEOUT = Duration.ofSeconds(30);
+
+	/**
+	 * BUG-013's regression hooks, armed per Idempotency-Key by the test only. The first request
+	 * to find an armed key absent (the owner) holds after its claim until release(); blocked
+	 * fires once it holds, so the test can send a second request while the owner is still in
+	 * flight. No transaction or connection is held while holding (tx 3 has committed).
+	 */
+	public static final class Hold {
+
+		private final AtomicBoolean owner = new AtomicBoolean();
+
+		private final CountDownLatch blocked = new CountDownLatch(1);
+
+		private final CountDownLatch released = new CountDownLatch(1);
+
+		public boolean awaitBlocked(Duration timeout) throws InterruptedException {
+			return this.blocked.await(timeout.toMillis(), TimeUnit.MILLISECONDS);
+		}
+
+		public void release() {
+			this.released.countDown();
+		}
+
+	}
+
+	private final Map<String, Hold> holds = new ConcurrentHashMap<>();
+
+	/** Arms the hold for this key (BUG-013's regression test only). */
+	public Hold arm(String key) {
+		Hold hold = new Hold();
+		this.holds.put(key, hold);
+		return hold;
+	}
+
 	@PostMapping(ROUTE)
 	ResponseEntity<String> transfer(@RequestBody NaiveTransferRequest request,
-			@RequestHeader("Idempotency-Key") String key, HttpServletRequest http) {
+			@RequestHeader("Idempotency-Key") String key, HttpServletRequest http) throws InterruptedException {
 		String clientId = ApiKeyFilter.clientId(http);
 		long from = request.fromAccountId();
 		long to = request.toAccountId();
@@ -88,6 +129,8 @@ public class NaiveTransferController {
 				.contentType(MediaType.APPLICATION_JSON)
 				.body(existing.get().body());
 		}
+		Hold hold = this.holds.get(key);
+		boolean held = hold != null && hold.owner.compareAndSet(false, true);
 
 		// tx 2: the real posting, committed on its own.
 		String body = this.transactions.execute((status) -> {
@@ -119,6 +162,10 @@ public class NaiveTransferController {
 			}
 			return null;
 		});
+		if (held) {
+			hold.blocked.countDown();
+			hold.released.await(HOLD_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+		}
 		return ResponseEntity.status(HttpStatus.CREATED).contentType(MediaType.APPLICATION_JSON).body(body);
 	}
 
