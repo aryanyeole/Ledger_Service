@@ -46,7 +46,9 @@ import dev.aryanyeole.ledgerapi.api.EdgeProbe;
 // real overlap and a green proof would mean nothing. Only idempotency is broken here: every
 // duplicate is a balanced posting and balances still equal their entry sums, and the unique
 // key still allows one key row, which shows the key alone doesn't prevent duplicates when it
-// commits outside the effect's transaction.
+// commits outside the effect's transaction. D-133: the naive controller holds the first request
+// to find the key absent until a second has too, so n > 1 shows requests are concurrently in the
+// server; it no longer depends on them landing inside the naive race window (BUG-013).
 @Import({ TestcontainersConfiguration.class, ServerArrivals.Configuration.class, NaiveTransferController.class })
 @SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT, properties = EdgeProbe.API_KEYS_PROPERTY)
 class CheckThenInsertIdempotencyTest {
@@ -166,11 +168,16 @@ class CheckThenInsertIdempotencyTest {
 		String context = "round " + round;
 		assertThat(statuses).as("%s: status counts", context)
 			.containsExactly(Map.entry(201, (long) ConcurrentRequestHarness.THREADS));
-		// On CI this control's n > 1 (below) is the primary overlap evidence (D-067, BUG-003); the
-		// server and client overlap metrics are report-only here.
+		// On CI this control's n > 1 (below) is the primary overlap evidence (D-067, BUG-003): with
+		// D-133's barrier it shows two requests were in the handler at once. The server and client
+		// overlap metrics are report-only here.
 		assertThat(n).as("%s: harness produced no overlap (new TRANSFER transactions = %d)", context, n)
 			.isGreaterThan(1);
-		assertThat(bodies.size()).as("%s: distinct raw bodies (was %d)", context, bodies.size()).isGreaterThan(1);
+		// Exact (D-133): each owner returns Jackson's bytes for its own transfer, and every replay
+		// returns the one stored row's JSONB text, which formats the same content differently
+		// (D-044: only the real path returns the stored text to its owner too).
+		int replays = ConcurrentRequestHarness.THREADS - n;
+		assertThat(bodies.size()).as("%s: distinct raw bodies", context).isEqualTo(n + (replays > 0 ? 1 : 0));
 
 		assertThat(LedgerTestSupport.transactionIds(this.dataSource, b, "TRANSFER")).as("%s: TRANSFERs on B", context)
 			.isEqualTo(transfers);

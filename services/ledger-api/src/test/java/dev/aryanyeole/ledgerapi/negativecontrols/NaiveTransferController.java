@@ -42,6 +42,8 @@ import dev.aryanyeole.ledgerapi.posting.PostingService.Posted;
 // hold: the posting is the real one, through WriteTransactions and PostingService (ordered
 // locks, funds check, deferred balance trigger active). Triggers, schema and roles are
 // untouched; tx 3 stores the response with its key, so V6's completeness trigger is satisfied.
+// D-133: the first request to find its key absent waits at a per-key barrier until a second has
+// also found it absent, so two requests in the handler at once always both post (BUG-013).
 @TestComponent
 @RestController
 public class NaiveTransferController {
@@ -74,13 +76,19 @@ public class NaiveTransferController {
 	private record Stored(int status, String body) {
 	}
 
+	private static final Duration BARRIER_TIMEOUT = Duration.ofSeconds(10);
+
 	private static final Duration HOLD_TIMEOUT = Duration.ofSeconds(30);
+
+	/** D-133's barriers, one per client and key. */
+	private final Map<String, CountDownLatch> barriers = new ConcurrentHashMap<>();
 
 	/**
 	 * BUG-013's regression hooks, armed per Idempotency-Key by the test only. The first request
 	 * to find an armed key absent (the owner) holds after its claim until release(); blocked
-	 * fires once it holds, so the test can send a second request while the owner is still in
-	 * flight. No transaction or connection is held while holding (tx 3 has committed).
+	 * fires once it waits at the D-133 barrier or holds, whichever comes first, so the test can
+	 * send a second request while the owner is still in flight. No transaction or connection is
+	 * held while holding (tx 3 has committed).
 	 */
 	public static final class Hold {
 
@@ -131,6 +139,18 @@ public class NaiveTransferController {
 		}
 		Hold hold = this.holds.get(key);
 		boolean held = hold != null && hold.owner.compareAndSet(false, true);
+
+		// D-133: wait until a second request has also found the key absent. No transaction or
+		// connection is held here (tx 1 has committed, tx 2 hasn't begun). Two requests in the
+		// handler at once therefore always both post; a serialized harness never sends a second
+		// while the first waits, so the first goes on alone after BARRIER_TIMEOUT, n = 1, and the
+		// control's overlap assertion fails.
+		CountDownLatch barrier = this.barriers.computeIfAbsent(clientId + "\n" + key, (k) -> new CountDownLatch(2));
+		barrier.countDown();
+		if (held) {
+			hold.blocked.countDown();
+		}
+		barrier.await(BARRIER_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
 
 		// tx 2: the real posting, committed on its own.
 		String body = this.transactions.execute((status) -> {
