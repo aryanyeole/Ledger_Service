@@ -28,7 +28,7 @@
 | BUG-009 | 2026-11-02 13:37 | M4 | The worker stacks' Kafka startup wait reports a started broker as not started, long after its 90 s timeout | none (component: settlement-worker tests, `support/stack.py`) | fixed | 7562fc0 (PR #56) |
 | BUG-010 | 2026-11-02 13:37 | M4 | A Kafka container whose startup wait fails is never stopped | none (component: settlement-worker tests, `support/stack.py`) | fixed | 7562fc0 (PR #56) |
 | BUG-011 | 2026-11-02 16:12 | M4 | Failure-mode setups that publish until a payment lands on a chosen partition give up after a fixed 12 or 15 tries, so a correct run fails about 0.7% of the time | none (component: settlement-worker tests) | fixed | 873c84e (PR #57) |
-| BUG-012 | 2026-11-02 18:51 | M4 | ledger-api's startup hung after "Root WebApplicationContext: initialization completed", before Flyway's first database line, through a 120 s health wait | none observed (component: ledger-api startup; seen through the settlement-worker test stack) | fixed | 650a6a1 (PR #59; squash SHA to follow) |
+| BUG-012 | 2026-11-02 18:51 | M4 | ledger-api's startup hung after "Root WebApplicationContext: initialization completed", before Flyway's first database line, through a 120 s health wait | none observed (component: ledger-api startup; seen through the settlement-worker test stack) | fixed | 5d7e331 (PR #59) |
 | BUG-013 | 2026-11-03 19:23 | M4 | CheckThenInsertIdempotencyTest's round produced one transfer on CI, so the D-017 control failed its overlap check against a correct system | P2 proof evidence, D-067 (component: ledger-api tests) | open | — |
 
 ---
@@ -707,7 +707,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
   - **On a timeout during a startup connection,** the context fails and the process exits 1 (D-083).
   - **What happens to the connect thread** (pgjdbc 42.7.13, `Driver.ConnectTask`): when `loginTimeout` fires, the attempt is abandoned. It is marked abandoned and its daemon connect thread is cancelled with an interrupt, best effort. A thread that keeps running closes any connection it later establishes, so nothing leaks. On the pool, that thread's blocked reads are bounded by the 60 s `socketTimeout`, which pgjdbc sets on the stream before the startup handshake.
   - **The harness** (`824e02b`): a `jcmd` thread dump is taken before a hung ledger-api is killed, whether the server mode's health wait or the migrate-only run timed out.
-  - **Commits:** `824e02b` and `650a6a1` · PR #59 (squash SHA to follow).
+  - **Commits:** `824e02b` and `650a6a1` · PR #59, squash-merged to `main` as `5d7e331`.
 - **Regression test:**
   - **`services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/ConnectionTimeoutsTest.java`** (Testcontainers Postgres plus a local TCP server that accepts and never answers):
     - the pool's connection has network timeout 60 000 ms;
