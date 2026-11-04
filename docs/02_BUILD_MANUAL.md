@@ -179,7 +179,7 @@ Commit `docs/PROGRESS.md` to the repo, then **replace** `PROGRESS.md` in project
 
 Jobs on every push/PR, both on the pinned `ubuntu-24.04` image (D-070; upgrades are explicit PRs):
 1. `ledger-api`: `./mvnw verify` (Testcontainers; Docker is available on the runner).
-2. `settlement-worker`: builds the ledger-api jar first (`./mvnw -B -q -DskipTests package` in `services/ledger-api`; the worker's tests take their schema from it in migrate-only mode, D-083, D-089), then `pip install -e ".[dev]" -c constraints.txt` + `pytest` with `CRASH_ITERATIONS=5`, `NEGATIVE_CONTROL_ITERATIONS=3` and `LOCK_ORDER_ROUNDS=1`.
+2. `settlement-worker`: builds the ledger-api jar first (`./mvnw -B -q -DskipTests package` in `services/ledger-api`; the worker's tests take their schema from it in migrate-only mode, D-083, D-089), then `pip install -e ".[dev]" -c constraints.txt` + `pytest` with `CRASH_ITERATIONS=5`, `NEGATIVE_CONTROL_ITERATIONS=3` and `LOCK_ORDER_ROUNDS=1`; the reconciliation proofs use their defaults (`RECONCILE_RUNS=20`, `NAIVE_RECON_RUNS=50`). Job timeout 15 minutes (D-134).
 3. `dashboard` (from M7): `npm ci && npm run build` (typecheck included).
 
 By M3, CI must run `ConcurrentIdempotentTransferTest` and `test_crash_recovery.py`. Badge goes in the README from day 1.
@@ -293,6 +293,34 @@ $env:LOCK_ORDER_ROUNDS = "20"; pytest tests\e2e\test_cross_operation_lock_order.
 Remove-Item Env:CRASH_ITERATIONS, Env:NEGATIVE_CONTROL_ITERATIONS, Env:LOCK_ORDER_ROUNDS, Env:LOCK_ORDER_SEED -ErrorAction SilentlyContinue
 ```
 
+Worker failure modes and reconciliation (M4):
+```powershell
+# Package the jar first (D-083), as for M3
+cd services\ledger-api; .\mvnw.cmd -q -DskipTests package
+cd services\settlement-worker; .\.venv\Scripts\Activate.ps1
+pytest tests\failure_modes             # retry, connection loss, dead letters, processor failures (own stacks, D-123)
+pytest tests\reconciliation            # drift injection (spec §9) and the snapshot proof
+pytest tests\negative_controls         # separate-tx dedup and two-query reconciliation controls
+# Soaks (report each with the machine it ran on; these are the published figures)
+$env:RECONCILE_RUNS = "2000"; pytest tests\reconciliation\test_reconciliation_snapshot.py
+$env:NAIVE_RECON_RUNS = "10000"; pytest tests\negative_controls\test_two_query_reconciliation.py
+# Replay the snapshot proof's load: RECONCILE_SNAPSHOT_SEED=<seed from the summary line>
+Remove-Item Env:RECONCILE_RUNS, Env:NAIVE_RECON_RUNS, Env:RECONCILE_SNAPSHOT_SEED -ErrorAction SilentlyContinue
+```
+
+Removed-test check (CLAUDE.md, D-130):
+```powershell
+# Per PR, before pushing: every removed or renamed test, with a reason in the PR body
+git diff --no-renames main...HEAD -U0 -- services | Select-String -Pattern '^-\s*(@Test|@ParameterizedTest|(async\s+)?def test_\w+|class \w+Test\b)'
+# Audit across several merged PRs: per commit, never one range diff (a test added and removed inside the range is invisible)
+git log -p --no-renames -U0 <from>..HEAD -- services | Select-String -Pattern '^commit |^-\s*(@Test|@ParameterizedTest|(async\s+)?def test_\w+|class \w+Test\b)'
+```
+
+Reading CI history per attempt (BUG-013 lesson: `gh run view --job` reads the latest attempt's archive):
+```powershell
+gh run view <run> --attempt <n> --log | Select-String "RECONCILE_SNAPSHOT|TWO_QUERY_CONTROL|CONCURRENCY"
+```
+
 Dev broker topic check:
 ```powershell
 # After changing Kafka settings in Compose (or before the relay first runs against the dev broker)
@@ -300,6 +328,16 @@ docker compose up -d kafka
 docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic ledger.payments.v1
 #   "does not exist"   → fine: the relay creates it with 3 partitions on its first tick (D-080)
 #   PartitionCount: 1  → docker compose down -v (wipes Postgres and Kafka together, D-028)
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic ledger.payments.dlq.v1
+#   expect PartitionCount: 1 (or "does not exist" before the relay's first tick)
+docker compose exec kafka /opt/kafka/bin/kafka-configs.sh --bootstrap-server localhost:9092 --describe --entity-type topics --entity-name ledger.payments.dlq.v1
+#   expect retention.ms=-1; anything else: the relay logs ERROR once and never alters it — fix by hand or docker compose down -v (D-028)
 # Optional: confirm auto-create is off (broker id per KAFKA_NODE_ID, usually 1)
 docker compose exec kafka /opt/kafka/bin/kafka-configs.sh --bootstrap-server localhost:9092 --describe --entity-type brokers --entity-name 1 --all | Select-String "auto.create.topics.enable"
+```
+
+Leaked test containers (BUG-010):
+```powershell
+docker ps -a --filter "label=org.testcontainers=true" --format "{{.ID}}  {{.Image}}  {{.Status}}  {{.CreatedAt}}"
+# save logs before removing anything that isn't from a run in progress: docker logs -t <id> > <file>
 ```

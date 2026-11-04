@@ -63,10 +63,24 @@
 
 | Question | A complete answer must mention |
 |---|---|
-| What does reconciliation check and why does a real ledger need it? | Materialized balance vs `SUM(entries)` per account, global sum = 0; catches bugs in any writer, manual edits, partial deploys |
-| Drift alert fires at 3 AM. How do you find the cause? | Which account(s), since when (entry ids/timestamps), which transaction kinds, which service/version wrote them, correlation id → logs |
-| How do you split a $100 payment with a 2.9% fee without losing a cent? | Fee rounded explicitly; merchant = amount − fee, never computed independently |
-| What's a poison message and what do you do with it? | Message that always fails; bounded retries with backoff → DLQ topic → alert; never block the partition forever |
+| What does reconciliation check and why does a real ledger need it? | Per account: materialized balance vs `SUM(entries)`; global `SUM(entries) = 0`; ESCROW's entry sum = Σ AUTHORIZED payment amounts. The trigger guarantees each commit balances, not that balances match entries or that a balanced posting should exist; catches bugs in either writer, manual edits, partial deploys |
+| Why does reconciliation have to read one snapshot? What did your proof and control show? | Two reads under READ COMMITTED see different commits → false drift; one statement = one snapshot (D-019, D-114). Soak: 0 drifted of 2,000 runs, a write in flight at every snapshot; split-snapshot mutation 170/200 drifted; two-query control drifts exactly {A:+x, B:−x} at a barrier, REPEATABLE READ clean; 2,685/10,000 under load (local, i5-1240P) |
+| How do you know the snapshot proof isn't passing because nothing was happening? | In-flight tripwire: a transaction with id > the run's max_transaction_id and created_at < as_of started before the snapshot and wasn't in it; floor 11 of 20 calibrated on CI (D-106, D-134); load-disabled run goes red |
+| What does the ESCROW = Σ AUTHORIZED check catch that the others can't? | A balanced posting that shouldn't exist (double settle, M3's negative control) and a status change without a posting (drift case D); every per-account and global check stays 0 |
+| Drift alert fires at 3 AM. How do you find the cause? | Which accounts and which check; the window last_clean_as_of → first_drift_as_of; transactions in that window by kind and correlation_id → logs; last_entry_id; a balance written without an entry leaves no entry, only the window; which service/version (M6) |
+| How do you split a $100 payment with a 2.9% fee without losing a cent? | Fee rounded explicitly (HALF_EVEN, once, in Java at authorize, D-074); merchant = amount − fee, never computed independently |
+| What's a poison message and what do you do with it? | A message that fails because of what it contains, every time. Classify first (D-107): classified poison → DLQ on the first failure; unclassified → bounded retries (5) → DLQ; transient → retry indefinitely with backoff, never DLQ; fatal → stop the worker. DLQ keeps original bytes, no dedup row, replayable (D-111, D-125); never block the partition forever |
+| Why not dead-letter a DB outage? | It isn't the message's fault: an outage would drain the whole topic into the DLQ and force a mass replay; a revoked grant would do the same. Transient failures retry in place and show up as lag |
+| Why does a retry re-run the processor call, and why is that safe? | Retry = redelivery to self (D-108): the same path a Kafka redelivery takes; the processor is idempotent by payment id (D-010), so it returns the decision already made; dedup and the status guard cover the effect |
+| The processor timed out. Approve, decline or retry? | Retry. A timeout is "unknown": the processor may have decided and the reply was lost. Mapping it to decline would release escrow for money that was captured. Unavailable = never reached the processor; timeout = may have decided (D-112) |
+| Why pause the partition instead of sleeping in the handler? | Sleeping stops polling → max.poll.interval eviction and a rebalance (measured: rejoined after ~2.1 s with a 2 s limit), and blocks every partition; pausing keeps heartbeating and lets other partitions move |
+| Why must a paused partition's already-fetched records be dropped? | A committed offset is a position, not a per-message ack; committing a later record's offset acknowledges the failed one, so it's silently skipped (the mutation committed offset 2 past P at 0) |
+| The DB connection died during COMMIT. What happened to the settlement? | Unknown outcome; the connection is terminated, the record retried after reconnecting (role re-checked); if the commit landed, dedup skips the effect; if not, it applies once (D-109) |
+| A payment.authorized was dead-lettered. Where's the customer's money and how do you recover it? | Still in ESCROW, payment AUTHORIZED; reconciliation stays clean; replay re-produces the original key/value/headers (no dlq.*) — no dedup row exists, so it settles once; a second replay is skipped (D-125) |
+| An idempotency key expired 3 hours ago. The same request arrives. What happens? | It replays until the purge deletes it; after the purge the key is new (a second effect). The DB refuses deleting a live key (23514 idempotency_keys_purge, D-119); a request blocks on an in-flight purge and becomes owner or replays depending on commit/rollback |
+| When can you delete a processed_messages row? | Only once its message can no longer be delivered: older than the longest retention of any topic the group reads plus any offset-reset look-back (offsets.retention.minutes) plus a margin; otherwise an offset reset readmits it (D-121) |
+| A test was deleted and the suite stayed green. How would you catch it? | A deleted test can't fail and counts rose anyway (PR #47); diff test sources against main with rename detection off, per PR; audit across PRs per commit, since a range diff hides add-then-delete (D-130) |
+| Why does ledger-api set a login timeout in a driver config file? | Flyway uses a plain driver DataSource that takes no Hikari settings, and pgjdbc ignores DriverManager's login timeout, so a DB that accepts TCP but never answers hung startup forever (BUG-012, reproduced with a paused Postgres and a thread dump); the classpath file reaches every connection and survives a replaced URL (D-132) |
 
 ## M5 — Redis
 
@@ -113,6 +127,11 @@
 | Negative control (separate-tx dedup): double-applied | 20 of 20 (local, i5-1240P); 3 of 3 on CI | `tests/negative_controls/test_separate_tx_dedup.py` |
 | Cross-operation lock order: rounds / deadlocks | 20 rounds × 70 requests / 0 deadlocks (local, i5-1240P) | `test_cross_operation_lock_order.py` |
 | Server-overlap floors per test (CI minimum over observations) | Transfer 3 (6 over 65); Opposite 2 (3 over 53); Payment 6 (11 over 35); PayLock 2 (4 over 35); 4-processor CI runners | D-106 |
+| Reconciliation under load: runs / false drift / write in flight at the snapshot | 2,000 / 0 / 2,000 (local soak, i5-1240P); 20 / 0 / 19 CI | `test_reconciliation_snapshot.py` |
+| Split-snapshot mutation: runs drifted | 170 / 200 (local) | ″ (D-051 mutation) |
+| Two-query control under load: runs drifted | 2,685 / 10,000 (local); barrier → exactly {A:+7.25, B:−7.25} every run | `test_two_query_reconciliation.py` |
+| In-flight tripwire floor | 11 of 20 (CI min 19 over 14 observations) | D-134 |
+| Settlement under ESCROW contention (test-load, not M8) | ~22–25/s idle vs 3–7/s at ~30 authorizes/s, one worker | PR #61 |
 | Transfer p50 / p95 / p99 @ 1x | | `docs/load-tests/report.md` |
 | Transfer p50 / p95 / p99 @ 10x | | ″ |
 | 1x definition (req/s) | | ″ |
