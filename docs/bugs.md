@@ -29,6 +29,7 @@
 | BUG-010 | 2026-11-02 13:37 | M4 | A Kafka container whose startup wait fails is never stopped | none (component: settlement-worker tests, `support/stack.py`) | fixed | 7562fc0 (PR #56) |
 | BUG-011 | 2026-11-02 16:12 | M4 | Failure-mode setups that publish until a payment lands on a chosen partition give up after a fixed 12 or 15 tries, so a correct run fails about 0.7% of the time | none (component: settlement-worker tests) | fixed | 873c84e (PR #57) |
 | BUG-012 | 2026-11-02 18:51 | M4 | ledger-api's startup hung after "Root WebApplicationContext: initialization completed", before Flyway's first database line, through a 120 s health wait | none observed (component: ledger-api startup; seen through the settlement-worker test stack) | fixed | 5d7e331 (PR #59) |
+| BUG-013 | 2026-11-03 19:23 | M4 | CheckThenInsertIdempotencyTest's round produced one transfer on CI, so the D-017 control failed its overlap check against a correct system | P2 proof evidence, D-067 (component: ledger-api tests) | fixed | d1a787e (PR #64; squash SHA to follow) |
 
 ---
 
@@ -723,3 +724,93 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 - **Summary (one sentence):** ledger-api's first Postgres connection, Flyway's plain driver connection in server and migrate-only mode, had no login or read timeout, and Hikari's login timeout never reached pgjdbc, so a database that accepts TCP but doesn't answer hung startup forever in pgjdbc's `doAuthentication`. A 10 s `loginTimeout` for every pgjdbc connection now makes startup fail and exit 1, the pool's reads have a 60 s socket timeout, and the harness dumps the threads of any ledger-api it has to kill.
 - **Notes:**
   - **What remains unknown:** why Postgres stopped answering in the 2026-11-02 18:14 run. The fix bounds the hang, and the new thread dump will locate the next one.
+
+---
+
+### BUG-013 — CheckThenInsertIdempotencyTest's round produced one transfer on CI, so the D-017 control failed its overlap check against a correct system
+
+- **Found:** 2026-11-03 19:23 · M4 · Task T16a (calibration reruns) · branch `m4/t16a-closeout-calibration` at `f4904e2`, ledger-api code and tests as on `main` at `6775554` (that branch changes only `docs/bugs.md` and the settlement-worker job's `timeout-minutes`); entry on `m4/t16b-fix-bug-013`
+- **Status:** fixed
+- **Component:** ledger-api tests (`services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/negativecontrols/CheckThenInsertIdempotencyTest.java`, with the shared `ConcurrentRequestHarness`)
+- **Property / invariant touched:** P2 proof evidence, D-067. On CI this control's n > 1 is the primary evidence that the harness overlaps requests; a round with n = 1 fails CI against a correct system. No system behaviour is wrong: the main code under test is not the naive controller.
+- **Symptom:** the ledger-api job of CI run `41610244246`, attempt 10, failed in `./mvnw -B verify` (job finished 2026-11-03 19:18:16):
+  ```
+  [ERROR] dev.aryanyeole.ledgerapi.negativecontrols.CheckThenInsertIdempotencyTest.naiveIdempotencyLetsDuplicatesThrough()[1] -- Time elapsed: 0.148 s <<< FAILURE!
+  [ERROR]   CheckThenInsertIdempotencyTest.lambda$naiveIdempotencyLetsDuplicatesThrough$0:68->round:126 [round 1: harness produced no overlap (new TRANSFER transactions = 1)]
+  [ERROR] Tests run: 573, Failures: 1, Errors: 0, Skipped: 0
+  ```
+  The control's report lines from the same job (CI runs 1 round):
+  ```
+  CONCURRENCY control config processors=4 maxHeapMB=3996 hikari.maximumPoolSize=10 tomcat.maxThreads=200 tomcat.minSpareThreads=10 tomcat.keepAliveTimeout=60000 tomcat.maxKeepAliveRequests=100 rounds=1
+  CONCURRENCY control warmup serverArrivedBeforeFirstCompletion=44 arrivalSpreadMs=111 connections=74 clientSentBeforeFirst=53 peakInFlight=76
+  CONCURRENCY control round=1 processors=4 serverArrivedBeforeFirstCompletion=8 arrivalSpreadMs=80 reusedConnections=74/74 clientSentBeforeFirst=36 peakInFlight=48 transactions=1 distinctBodies=2 statuses={201=100}
+  ```
+  Observed, not yet explained: 8 requests reached the server before the first completed, yet only one TRANSFER was posted, and the 100 responses had 2 distinct bodies.
+- **How detected:** CI, during T16a's 10-attempt §9 rerun loop on PR #63 (run `41610244246`, https://github.com/aryanyeole/Ledger_Service/actions/runs/41610244246/job/126343839352). Attempts 1–9 of the same run passed; the guarded loop stopped at attempt 10. The settlement-worker job of attempt 10 passed.
+- **Reproduction:** deterministic, with the regression test's hooks (below): the owner holds after its claim, and a second request is sent while it is still in flight. On the code as on `main` the pair gives `serverArrivedBeforeFirstCompletion=2 transactions=1`, BUG-013's signature, every run. The CI failure itself is timing-dependent (see the history under Notes).
+- **Time to diagnose:** observed 2026-11-03 19:18 (the job finished), entry opened 19:23. The mechanism was confirmed by a local run of the control with temporary per-request timings (20 rounds, reverted afterwards), whose output file was written at 19:50. The per-attempt CI history was written at 20:10.
+- **Root cause:** the control's n > 1 depended on a race window that the harness's overlap metric doesn't measure.
+  - **Where the race is.** `NaiveTransferController` checks the key in tx 1 (`SELECT … FROM idempotency_keys`), posts in tx 2, and claims the key in tx 3. A request becomes a duplicate only if its tx 1 runs before the first owner's tx 3 commits.
+  - **Where the metric measures.** `ServerArrivals` records arrival in the outermost filter (`HIGHEST_PRECEDENCE`). That's before the rest of the filter chain, DispatcherServlet, JSON parsing and the Hikari connection for tx 1 (pool size 10). It records completion after the response is written.
+  - **So the metric is a weaker condition.** "Arrived before the first completion" also counts requests that reached the filter while the owner was in tx 2, tx 3 or writing its response. Such a request reaches its check after the claim and replays.
+  - **What the local run showed** (20 rounds, i5-1240P): the number of owners equalled the number of checks made before the first claim in every round, and the first completion came 0.4–2 ms after the first claim.
+  - **In attempt 10,** only 8 requests arrived before the first completion, over an 80 ms spread. All 7 besides the owner reached their check after its claim. CI logs carry no per-request timings, so how long each took isn't measured.
+  - **`distinctBodies=2` is D-044's owner-vs-replay formatting, not overlap.** The naive owner returns Jackson's bytes, while every replay returns the stored row's `response_body::text`, which Postgres normalizes. So `distinctBodies = n + 1` whenever any request replays: in 20 of 20 local rounds and 147 of 147 retained CI rounds. That's why the control's old `distinctBodies > 1` assertion passed even at n = 1. From the local run:
+    ```
+    owner : {"transaction_id":30,"kind":"TRANSFER","from_account_id":6,"to_account_id":7,"amount":"10.00","created_at":"2026-11-04T02:49:57.918094Z"}
+    replay: {"kind": "TRANSFER", "amount": "10.00", "created_at": "2026-11-04T02:49:57.918094Z", "to_account_id": 7, "transaction_id": 30, "from_account_id": 6}
+    ```
+- **Why it wasn't caught earlier:** the same failure already happened on 2026-10-14 (run `38643951581`, attempt 4, see Notes), and that run was re-run to green without an entry. With one CI round per run, about 2 rounds in 127 since BUG-003's fix had n = 1, which is rare enough to pass as a one-off.
+- **Fix (test code only; D-133):** in `NaiveTransferController`, the first request to find its key absent waits at a per-client, per-key `CountDownLatch(2)` until a second request has also found the key absent (10 s timeout).
+  - **Nothing is held while it waits:** tx 1 has committed and tx 2 hasn't begun, so there's no transaction or connection.
+  - **Concurrent requests:** two requests in the handler at once always both post, so n ≥ 2.
+  - **A serialized harness:** it never sends a second request while the first waits, so the first goes on alone after 10 s, n = 1, and the overlap assertion fails as before.
+  - **The bodies assertion is now exact:** `distinctBodies == n + (replays > 0 ? 1 : 0)`, with a D-044 comment.
+  - **Commits:** `f35d42c` (the barrier) and `d1a787e` (the regression hook signals at the barrier only when the owner really waits) on `m4/t16b-fix-bug-013` · PR #64 (squash SHA to follow).
+- **Regression test:** `services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/negativecontrols/CheckThenInsertIdempotencyTest.java::twoRequestsInTheHandlerAtOnceAlwaysDuplicate`, with test-only hooks in `NaiveTransferController`.
+  - **The hooks:** `arm(key)` makes the key's first owner hold after its claim until released. Its `blocked` signal fires when the owner really waits, at the barrier or in that hold.
+  - **The test:**
+    1. Send A. Wait for `blocked`.
+    2. Send B and wait for its response.
+    3. Release A.
+    4. Assert both 201, `arrivedBeforeFirstCompletion` = 2 and n = 2.
+  - **Red before the fix** (`0be3e4b`, hooks and test only):
+    ```
+    CONCURRENCY control regression serverArrivedBeforeFirstCompletion=2 transactions=1
+    [ERROR]   CheckThenInsertIdempotencyTest.twoRequestsInTheHandlerAtOnceAlwaysDuplicate:98 [two requests in the handler at once: new TRANSFER transactions]
+    expected: 2
+     but was: 1
+    ```
+  - **Green after** (`d1a787e`): `CONCURRENCY control regression serverArrivedBeforeFirstCompletion=2 transactions=2`, `Tests run: 1, Failures: 0`.
+  - **The barrier is what makes it deterministic** (D-051, stage-first): with the latch count at 1, the test is red again with `serverArrivedBeforeFirstCompletion=2 transactions=1`.
+- **Decision Log impact:** D-133 (amends D-067).
+- **Summary (one sentence):** CheckThenInsertIdempotencyTest's n > 1 needed a request's check to land inside the first owner's check→claim window, which arrival at the outermost filter doesn't guarantee, so on CI a round could post one transfer against a correct system (seen twice in 127 rounds since BUG-003's fix). A per-key barrier now holds the first owner until a second request has also found the key absent (D-133), so two requests in the handler at once always duplicate, and a deterministic regression test reproduces the old signature.
+- **Notes:**
+  - **The control's CI history before D-133.** All 147 retained rounds, one per run attempt, from 2026-10-14 to 2026-11-04, are in [`docs/evidence/bug-013-control-history.txt`](evidence/bug-013-control-history.txt). New TRANSFER transactions per round:
+
+    | n | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 15 |
+    |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+    | rounds | 3 | 2 | 3 | 4 | 21 | 30 | 37 | 22 | 9 | 9 | 4 | 1 | 1 | 1 |
+
+    min 1, p5 3, median 7, max 15. `arrivalSpreadMs` was 51 / 125 / 196 ms (min / median / max), and `serverArrivedBeforeFirstCompletion` was 4 / 17 / 55. Since #22 (BUG-003's fix) merged on 2026-10-14 there are 127 rounds: n = 1 twice, n = 2 never, n = 3 twice.
+  - **The low tail, n ≤ 3:**
+
+    | Run | Attempt | Run created (UTC) | Context | `arrived` | Spread (ms) | n |
+    |---|---|---|---|---|---|---|
+    | 38633176987 | 1 | 2026-10-14 20:34 | PR #21, before BUG-003's fix (old metric) | — | — | 1 |
+    | 38633176987 | 2 | 2026-10-14 20:34 | PR #21, before BUG-003's fix (old metric) | — | — | 2 |
+    | 38639703432 | 5 | 2026-10-14 21:22 | `m2/fix-bug-003` | 4 | 128 | 2 |
+    | 38641481141 | 1 | 2026-10-14 21:35 | `m2/fix-bug-003` | 6 | 123 | 3 |
+    | 38643951581 | 4 | 2026-10-14 21:55 | `main`, #21's merge push (`8526079`, after #22) | 7 | 114 | 1 |
+    | 39505977882 | 1 | 2026-10-20 22:09 | `main` | 6 | 162 | 3 |
+    | 41509010770 | 1 | 2026-11-02 19:20 | PR #54 | 6 | 100 | 3 |
+    | 41610244246 | 10 | 2026-11-03 09:20 | PR #63 (this entry) | 8 | 80 | 1 |
+
+  - **An earlier occurrence, not logged at the time.** Run `38643951581` is `main` at `8526079`, #21's merge push. It came two minutes after #22 (`aaf2e1a`), so it already had BUG-003's warm-up. Its attempt 4 failed in the ledger-api job, finishing 2026-10-14 15:16, with the same error:
+    ```
+    [ERROR]   CheckThenInsertIdempotencyTest.lambda$naiveIdempotencyLetsDuplicatesThrough$0:68->round:126 [round 1: harness produced no overlap (new TRANSFER transactions = 1)]
+    [ERROR] Tests run: 297, Failures: 1, Errors: 0, Skipped: 0
+    ```
+    Attempts 1–3 and 5 of that run passed. It is the same defect, recorded here rather than as a separate entry.
+  - **A collection error, corrected.** The first pass over the history used `gh run view --job <id> --log`. That reads the run's latest attempt's log archive, so every attempt of a re-run run showed its last attempt's line: for example, attempts 1–9 of `41610244246` all showed attempt 10's n = 1. Per-attempt logs need `gh run view <run> --attempt <n> --log`. The tables above and the evidence file come from that second pass.
+  - **After the fix, locally** (on `f35d42c`; `d1a787e` changes only the armed key's signal, and the control's rounds arm no key): 200 rounds plus the regression test, `Tests run: 201, Failures: 0` (i5-1240P, 16 logical CPUs, Windows 11). n per round: min 2, median 11, max 26. One round had n = 2: `round=31 … serverArrivedBeforeFirstCompletion=89 arrivalSpreadMs=151 … transactions=2 distinctBodies=3`.

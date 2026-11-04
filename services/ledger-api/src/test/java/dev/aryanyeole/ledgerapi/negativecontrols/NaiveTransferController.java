@@ -1,8 +1,14 @@
 package dev.aryanyeole.ledgerapi.negativecontrols;
 
+import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import jakarta.servlet.http.HttpServletRequest;
 
@@ -36,6 +42,8 @@ import dev.aryanyeole.ledgerapi.posting.PostingService.Posted;
 // hold: the posting is the real one, through WriteTransactions and PostingService (ordered
 // locks, funds check, deferred balance trigger active). Triggers, schema and roles are
 // untouched; tx 3 stores the response with its key, so V6's completeness trigger is satisfied.
+// D-133: the first request to find its key absent waits at a per-key barrier until a second has
+// also found it absent, so two requests in the handler at once always both post (BUG-013).
 @TestComponent
 @RestController
 public class NaiveTransferController {
@@ -68,9 +76,51 @@ public class NaiveTransferController {
 	private record Stored(int status, String body) {
 	}
 
+	private static final Duration BARRIER_TIMEOUT = Duration.ofSeconds(10);
+
+	private static final Duration HOLD_TIMEOUT = Duration.ofSeconds(30);
+
+	/** D-133's barriers, one per client and key. */
+	private final Map<String, CountDownLatch> barriers = new ConcurrentHashMap<>();
+
+	/**
+	 * BUG-013's regression hooks, armed per Idempotency-Key by the test only. The first request
+	 * to find an armed key absent (the owner) holds after its claim until release(); blocked
+	 * fires once it is really waiting, at the D-133 barrier (no second request has found the key
+	 * absent yet) or in the hold, whichever comes first, so the test can send a second request
+	 * while the owner is still in flight and can't race it. No transaction or connection is held
+	 * while holding (tx 3 has committed).
+	 */
+	public static final class Hold {
+
+		private final AtomicBoolean owner = new AtomicBoolean();
+
+		private final CountDownLatch blocked = new CountDownLatch(1);
+
+		private final CountDownLatch released = new CountDownLatch(1);
+
+		public boolean awaitBlocked(Duration timeout) throws InterruptedException {
+			return this.blocked.await(timeout.toMillis(), TimeUnit.MILLISECONDS);
+		}
+
+		public void release() {
+			this.released.countDown();
+		}
+
+	}
+
+	private final Map<String, Hold> holds = new ConcurrentHashMap<>();
+
+	/** Arms the hold for this key (BUG-013's regression test only). */
+	public Hold arm(String key) {
+		Hold hold = new Hold();
+		this.holds.put(key, hold);
+		return hold;
+	}
+
 	@PostMapping(ROUTE)
 	ResponseEntity<String> transfer(@RequestBody NaiveTransferRequest request,
-			@RequestHeader("Idempotency-Key") String key, HttpServletRequest http) {
+			@RequestHeader("Idempotency-Key") String key, HttpServletRequest http) throws InterruptedException {
 		String clientId = ApiKeyFilter.clientId(http);
 		long from = request.fromAccountId();
 		long to = request.toAccountId();
@@ -88,6 +138,21 @@ public class NaiveTransferController {
 				.contentType(MediaType.APPLICATION_JSON)
 				.body(existing.get().body());
 		}
+		Hold hold = this.holds.get(key);
+		boolean held = hold != null && hold.owner.compareAndSet(false, true);
+
+		// D-133: wait until a second request has also found the key absent. No transaction or
+		// connection is held here (tx 1 has committed, tx 2 hasn't begun). Two requests in the
+		// handler at once therefore always both post; a serialized harness never sends a second
+		// while the first waits, so the first goes on alone after BARRIER_TIMEOUT, n = 1, and the
+		// control's overlap assertion fails.
+		CountDownLatch barrier = this.barriers.computeIfAbsent(clientId + "\n" + key, (k) -> new CountDownLatch(2));
+		barrier.countDown();
+		if (held && barrier.getCount() > 0) {
+			// Only when the owner will really wait: a barrier that doesn't hold it must not signal.
+			hold.blocked.countDown();
+		}
+		barrier.await(BARRIER_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
 
 		// tx 2: the real posting, committed on its own.
 		String body = this.transactions.execute((status) -> {
@@ -119,6 +184,10 @@ public class NaiveTransferController {
 			}
 			return null;
 		});
+		if (held) {
+			hold.blocked.countDown();
+			hold.released.await(HOLD_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+		}
 		return ResponseEntity.status(HttpStatus.CREATED).contentType(MediaType.APPLICATION_JSON).body(body);
 	}
 

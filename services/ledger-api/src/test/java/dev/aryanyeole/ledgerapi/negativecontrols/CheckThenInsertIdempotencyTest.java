@@ -5,11 +5,16 @@ import static org.junit.jupiter.api.DynamicTest.dynamicTest;
 
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
@@ -17,6 +22,7 @@ import java.util.stream.Stream;
 import javax.sql.DataSource;
 
 import org.junit.jupiter.api.DynamicTest;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -40,7 +46,9 @@ import dev.aryanyeole.ledgerapi.api.EdgeProbe;
 // real overlap and a green proof would mean nothing. Only idempotency is broken here: every
 // duplicate is a balanced posting and balances still equal their entry sums, and the unique
 // key still allows one key row, which shows the key alone doesn't prevent duplicates when it
-// commits outside the effect's transaction.
+// commits outside the effect's transaction. D-133: the naive controller holds the first request
+// to find the key absent until a second has too, so n > 1 shows requests are concurrently in the
+// server; it no longer depends on them landing inside the naive race window (BUG-013).
 @Import({ TestcontainersConfiguration.class, ServerArrivals.Configuration.class, NaiveTransferController.class })
 @SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT, properties = EdgeProbe.API_KEYS_PROPERTY)
 class CheckThenInsertIdempotencyTest {
@@ -56,6 +64,46 @@ class CheckThenInsertIdempotencyTest {
 
 	@Autowired
 	ServerArrivals arrivals;
+
+	@Autowired
+	NaiveTransferController naive;
+
+	// BUG-013's regression test: its CI signature, n = 1 with two requests overlapping at the
+	// server, reproduced with no timing. The owner (A) holds after its claim; B is sent only once
+	// A is blocked, so B arrives while A is still in flight (both arrive before the first
+	// completion) and must still become a duplicate.
+	@Test
+	void twoRequestsInTheHandlerAtOnceAlwaysDuplicate() throws Exception {
+		ConcurrentRequestHarness harness = new ConcurrentRequestHarness(this.port);
+		long a = harness.createAccount("CUSTOMER");
+		long b = harness.createAccount("CUSTOMER");
+		harness.deposit(a, "1000.00");
+		String key = ConcurrentRequestHarness.newKey();
+		byte[] body = ("{\"from_account_id\": " + a + ", \"to_account_id\": " + b + ", \"amount\": \"10.00\"}")
+			.getBytes(StandardCharsets.UTF_8);
+		NaiveTransferController.Hold hold = this.naive.arm(key);
+
+		ExecutorService pool = Executors.newSingleThreadExecutor();
+		try {
+			Future<Response> first = pool.submit(() -> harness.send(harness.post(NaiveTransferController.ROUTE, key, body)));
+			assertThat(hold.awaitBlocked(Duration.ofSeconds(30))).as("A blocked in the handler").isTrue();
+			Response second = harness.send(harness.post(NaiveTransferController.ROUTE, key, body));
+			hold.release();
+			Response owner = first.get(30, TimeUnit.SECONDS);
+
+			int n = LedgerTestSupport.transactionIds(this.dataSource, a, "TRANSFER").size();
+			ServerArrivals.Overlap server = this.arrivals.overlap(key, new HashSet<>());
+			System.out.println("CONCURRENCY control regression serverArrivedBeforeFirstCompletion="
+					+ server.arrivedBeforeFirstCompletion() + " transactions=" + n);
+			assertThat(List.of(owner.status(), second.status())).as("statuses").containsExactly(201, 201);
+			assertThat(server.arrivedBeforeFirstCompletion()).as("both arrived before the first completed").isEqualTo(2);
+			assertThat(n).as("two requests in the handler at once: new TRANSFER transactions").isEqualTo(2);
+		}
+		finally {
+			hold.release();
+			pool.shutdownNow();
+		}
+	}
 
 	@TestFactory
 	Stream<DynamicTest> naiveIdempotencyLetsDuplicatesThrough() throws Exception {
@@ -120,11 +168,16 @@ class CheckThenInsertIdempotencyTest {
 		String context = "round " + round;
 		assertThat(statuses).as("%s: status counts", context)
 			.containsExactly(Map.entry(201, (long) ConcurrentRequestHarness.THREADS));
-		// On CI this control's n > 1 (below) is the primary overlap evidence (D-067, BUG-003); the
-		// server and client overlap metrics are report-only here.
+		// On CI this control's n > 1 (below) is the primary overlap evidence (D-067, BUG-003): with
+		// D-133's barrier it shows two requests were in the handler at once. The server and client
+		// overlap metrics are report-only here.
 		assertThat(n).as("%s: harness produced no overlap (new TRANSFER transactions = %d)", context, n)
 			.isGreaterThan(1);
-		assertThat(bodies.size()).as("%s: distinct raw bodies (was %d)", context, bodies.size()).isGreaterThan(1);
+		// Exact (D-133): each owner returns Jackson's bytes for its own transfer, and every replay
+		// returns the one stored row's JSONB text, which formats the same content differently
+		// (D-044: only the real path returns the stored text to its owner too).
+		int replays = ConcurrentRequestHarness.THREADS - n;
+		assertThat(bodies.size()).as("%s: distinct raw bodies", context).isEqualTo(n + (replays > 0 ? 1 : 0));
 
 		assertThat(LedgerTestSupport.transactionIds(this.dataSource, b, "TRANSFER")).as("%s: TRANSFERs on B", context)
 			.isEqualTo(transfers);
