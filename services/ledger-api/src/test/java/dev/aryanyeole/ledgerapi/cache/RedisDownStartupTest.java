@@ -153,6 +153,9 @@ class RedisDownStartupTest {
 				long elapsed = (System.nanoTime() - started) / 1_000_000;
 				assertThat(thrown).as("connect to a silent server").isInstanceOf(RedisConnectionException.class);
 				System.out.printf("SILENT_SERVER raw connect threw after %d ms: %s%n", elapsed, chain(thrown));
+				// A characterization, not a timing claim: measured 100 / 200 / 300 ms at command timeouts of
+				// 50 / 100 / 200 ms, mechanism not identified (T2b, docs/design/cache-invalidation.md §2.3).
+				assertThat(elapsed).as("one connect attempt against a silent server").isLessThan(ONE_CONNECT_BOUND.toMillis());
 			}
 			finally {
 				client.shutdown();
@@ -161,12 +164,9 @@ class RedisDownStartupTest {
 			RedisGateway gateway = new RedisGateway(new LedgerRedisProperties("redis://127.0.0.1:" + silent.port()));
 			try {
 				List<Long> elapsedMillis = burst(gateway);
-				Collections.sort(elapsedMillis);
-				long slowest = elapsedMillis.get(elapsedMillis.size() - 1);
 				System.out.printf("SILENT_SERVER %d concurrent always() calls, elapsed ms sorted: %s; connect attempts %d%n",
 						CALLERS, elapsedMillis, gateway.connectAttempts());
-				assertThat(slowest).as("the slowest caller waits at most one connect, not %d", CALLERS)
-					.isLessThan(ONE_CONNECT_BOUND.toMillis());
+				assertOneCallerWaited(elapsedMillis);
 				assertThat(gateway.connectAttempts()).as("one connect attempt for the whole burst").isEqualTo(1);
 
 				// The failed attempt opened the bypass: no new attempt starts inside the window, for
@@ -177,7 +177,7 @@ class RedisDownStartupTest {
 
 				// After the window, exactly one more attempt.
 				Thread.sleep(RedisGateway.BYPASS.toMillis() + 100);
-				assertThat(burst(gateway)).allMatch((millis) -> millis < ONE_CONNECT_BOUND.toMillis());
+				assertOneCallerWaited(burst(gateway));
 				assertThat(gateway.connectAttempts()).as("one attempt in the next window").isEqualTo(2);
 			}
 			finally {
@@ -186,7 +186,22 @@ class RedisDownStartupTest {
 		}
 	}
 
-	// CALLERS concurrent always() calls behind a start gate; every one must be unavailable.
+	// D-137's "every other caller returns at once": the CALLERS - 1 callers that didn't make the
+	// connect attempt each return in under the command timeout, and the one that did waits at most
+	// one connect. A bound on the slowest alone would pass a gateway that queues callers behind the
+	// attempt.
+	private static void assertOneCallerWaited(List<Long> elapsedMillis) {
+		List<Long> sorted = new ArrayList<>(elapsedMillis);
+		Collections.sort(sorted);
+		assertThat(sorted.subList(0, CALLERS - 1))
+			.as("the %d callers that didn't attempt the connect, elapsed ms", CALLERS - 1)
+			.allMatch((millis) -> millis < RedisGateway.COMMAND_TIMEOUT.toMillis());
+		assertThat(sorted.get(CALLERS - 1)).as("the caller that made the attempt waits at most one connect")
+			.isLessThan(ONE_CONNECT_BOUND.toMillis());
+	}
+
+	// CALLERS concurrent always() calls behind a start gate; every one must be unavailable. Elapsed
+	// ms, sorted.
 	private static List<Long> burst(RedisGateway gateway) throws Exception {
 		ExecutorService pool = Executors.newFixedThreadPool(CALLERS);
 		try {
@@ -211,6 +226,7 @@ class RedisDownStartupTest {
 			for (Future<Long> call : calls) {
 				elapsed.add(call.get(30, TimeUnit.SECONDS));
 			}
+			Collections.sort(elapsed);
 			return elapsed;
 		}
 		finally {
