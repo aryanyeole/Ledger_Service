@@ -11,7 +11,7 @@ import org.springframework.core.env.MapPropertySource;
 // Migrate-only mode (D-083): with ledger.migrate-only=true the application runs Flyway and nothing
 // else, then LedgerApiApplication.main exits. This forces the rest off, at a precedence above
 // command-line arguments, so no argument can start a web server, the outbox relay, the
-// idempotency key purge (D-126) or their schedulers during a migration:
+// idempotency key purge (D-126), their schedulers or a Redis client (D-137) during a migration:
 // spring.main.web-application-type is bound after this runs, and the @Conditional checks are
 // evaluated later still. A purge during the migrate step would delete keys before the API that
 // owns them starts. Runs last among the post-processors
@@ -25,7 +25,8 @@ public class MigrateOnlyEnvironmentPostProcessor implements EnvironmentPostProce
 
 	static final Map<String, Object> FORCED = Map.of("spring.main.web-application-type", "none",
 			"ledger.outbox.relay.enabled", "false", "ledger.outbox.relay.scheduled", "false",
-			"ledger.idempotency.purge.enabled", "false", "ledger.idempotency.purge.scheduled", "false");
+			"ledger.idempotency.purge.enabled", "false", "ledger.idempotency.purge.scheduled", "false",
+			"ledger.cache.idempotency.enabled", "false", "ledger.cache.balance.enabled", "false");
 
 	@Override
 	public void postProcessEnvironment(ConfigurableEnvironment environment, SpringApplication application) {

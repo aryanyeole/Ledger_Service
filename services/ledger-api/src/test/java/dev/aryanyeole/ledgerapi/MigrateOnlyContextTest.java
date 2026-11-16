@@ -23,21 +23,28 @@ import org.springframework.context.annotation.Import;
 import org.springframework.core.env.Environment;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 
+import io.lettuce.core.RedisClient;
+import io.lettuce.core.api.StatefulRedisConnection;
+
 import dev.aryanyeole.ledgerapi.api.ApiKeyFilter;
+import dev.aryanyeole.ledgerapi.cache.LedgerRedisProperties;
+import dev.aryanyeole.ledgerapi.cache.RedisGateway;
 import dev.aryanyeole.ledgerapi.idempotency.IdempotencyKeyPurgeScheduler;
 import dev.aryanyeole.ledgerapi.idempotency.IdempotencyKeyPurger;
 import dev.aryanyeole.ledgerapi.outbox.OutboxRelay;
 import dev.aryanyeole.ledgerapi.outbox.OutboxRelayScheduler;
 
 // Migrate-only mode in process (D-083): with ledger.migrate-only=true the application context
-// starts without a web server, a web filter, the outbox relay, the idempotency key purge or their
-// schedulers, and Flyway has applied every migration. Exiting is main()'s job, proven out of
-// process by the worker's test harness (java -jar ... --ledger.migrate-only=true must exit 0).
-// Relay and purge switches passed as properties don't matter: the post-processor overrides them.
+// starts without a web server, a web filter, the outbox relay, the idempotency key purge, their
+// schedulers or any Redis bean (D-137), and Flyway has applied every migration. Exiting is main()'s
+// job, proven out of process by the worker's test harness (java -jar ... --ledger.migrate-only=true
+// must exit 0). Relay, purge and cache switches passed as properties don't matter: the
+// post-processor overrides them.
 @Import(TestcontainersConfiguration.class)
 @SpringBootTest(webEnvironment = WebEnvironment.NONE, properties = { "ledger.migrate-only=true",
 		"ledger.outbox.relay.enabled=true", "ledger.outbox.relay.scheduled=true",
-		"ledger.idempotency.purge.enabled=true", "ledger.idempotency.purge.scheduled=true" })
+		"ledger.idempotency.purge.enabled=true", "ledger.idempotency.purge.scheduled=true",
+		"ledger.cache.idempotency.enabled=true", "ledger.cache.balance.enabled=true" })
 class MigrateOnlyContextTest {
 
 	// Relative to the module directory, the working directory for Maven tests.
@@ -61,8 +68,11 @@ class MigrateOnlyContextTest {
 		assertThat(this.environment.getProperty("ledger.outbox.relay.scheduled")).isEqualTo("false");
 		assertThat(this.environment.getProperty("ledger.idempotency.purge.enabled")).isEqualTo("false");
 		assertThat(this.environment.getProperty("ledger.idempotency.purge.scheduled")).isEqualTo("false");
+		assertThat(this.environment.getProperty("ledger.cache.idempotency.enabled")).isEqualTo("false");
+		assertThat(this.environment.getProperty("ledger.cache.balance.enabled")).isEqualTo("false");
 		for (Class<?> type : List.of(ApiKeyFilter.class, OutboxRelay.class, OutboxRelayScheduler.class,
-				IdempotencyKeyPurger.class, IdempotencyKeyPurgeScheduler.class)) {
+				IdempotencyKeyPurger.class, IdempotencyKeyPurgeScheduler.class, RedisGateway.class,
+				LedgerRedisProperties.class, RedisClient.class, StatefulRedisConnection.class)) {
 			assertThat(this.context.getBeanNamesForType(type)).as("beans of type %s", type.getSimpleName()).isEmpty();
 		}
 	}

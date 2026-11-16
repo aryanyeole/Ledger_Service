@@ -54,7 +54,10 @@ D-107 classifier, so it can't cause a worker retry or a dead letter.
 | Invalidation (API or worker) | Logged without keys or bodies, counted (`cache_invalidation_failed` in the worker); the stale value lives at most the value TTL |
 | Reconciliation lease | The tick runs (`reconciliation_lock_unavailable`, WARNING) |
 
-After any failure, a 1 s in-process bypass skips reads, populates and the lease. It never skips an invalidation (§1.5).
+After any failure, a 1 s in-process bypass skips reads, populates and the lease. It never skips an invalidation sent on
+an established connection (§1.5). With no connection established, at most one connect attempt is in flight and at most
+one starts per bypass window; every other caller, invalidations included, returns at once, and an invalidation that
+can't be sent is a failed invalidation (§5 row 5, D-137).
 
 ### 1.5 Commands can execute late
 
@@ -120,7 +123,11 @@ Example: client `acme`, key `order-42:retry` → `ledger:v1:idem:4:acme:order-42
 
 **Invalidation script.** The same text in Java and Python, pinned by literal-string tests in both languages (D-143).
 `KEYS` holds one value-key/token-key pair per account touched by the posting, in that order. `ARGV[1]` is a fresh
-UUID for this call. The `DEL` comes first so a value is gone even if a later write in the script fails **(verify in T2)**.
+UUID for this call. Under noeviction (rejected by D-138), Redis refuses a write command in a script only until the
+script has executed a write command; after that it can't stop the script without leaving it half-applied, so it runs
+to completion. The script's first command is a DEL, so the whole invalidation runs (whether or not the value existed)
+and memory can end above maxmemory. A script whose first write is a SET, like the populate script, is refused before it
+changes anything (observed in T2).
 
 ```lua
 -- ledger:v1 balance invalidation (D-142). KEYS: ledger:v1:bal:{id}, ledger:v1:bal-gen:{id} per account.
@@ -155,8 +162,12 @@ return 1
 | `reconcile:lease` | — | write (`SET NX PX`) |
 
 **Connections.** ledger-api uses one shared `StatefulRedisConnection`: no pool and no `MULTI`, so its commands
-execute in the order sent (D-137). On a shared connection, commands other threads send between `MULTI` and `EXEC`
-join the transaction **(verify in T2)**, which is why invalidation is one `EVAL`, not a `MULTI`. The worker uses
+execute in the order sent (D-137). Redis queues every command a connection sends between `MULTI` and `EXEC` into
+that transaction, and Lettuce doesn't keep other threads off a shared connection while one has a `MULTI` open. Its
+reference guide (Transactions/Multi): "Transactional use requires external synchronization when a single connection
+is used by multiple threads/processes." … "Lettuce itself does not synchronize transactional/non-transactional
+invocations regardless of the used API facade." So commands other threads send between `MULTI` and `EXEC` would join
+the transaction, which is why invalidation is one `EVAL`, not a `MULTI`. The worker uses
 redis-py's asyncio connection pool. Order across its own calls doesn't matter: each invalidation is one command, and so
 is the lease.
 
@@ -172,8 +183,8 @@ is the lease.
 | `socketTimeout` (input) | 60 s (D-132) | Input to the token bound | Bounds the miss's DB read. |
 | Lease PX (`RECONCILE_LOCK_TTL_MS`) | default = `RECONCILE_INTERVAL_MS`; Compose 60 000 | ≥ 2 × `WORKER_DB_COMMAND_TIMEOUT_MS` + `RECONCILE_STATEMENT_TIMEOUT_MS` (50 000 with defaults) while the lease is active, else `config_invalid` naming both values, exit 2 | The longest run is connect (command timeout) + statement + client slack (command timeout, D-114). A live run ends, or is cut off, before its lease expires, so runs don't overlap while the DB timeouts work. |
 | Command timeout | 100 ms | ≪ the API's request latency | Bounds what each Redis call can add while Redis is paused. |
-| Connect timeout | 200 ms | — | Bounds a lazy connect attempt; a failed connect is a bypass. |
-| Bypass | 1 s after any failure; skips reads, populates and the lease; **never invalidations** | — | A paused Redis then costs about one read timeout per second per process. Invalidations are always sent (§1.5). |
+| Connect timeout | 200 ms | — | Bounds the TCP connect of a lazy connect attempt; a failed connect is a bypass. Lettuce's connection initialization (the `HELLO` handshake) is bounded by the command timeout: against a server that accepts TCP and never answers, an attempt ended after 188–205 ms with "Connection initialization timed out after 100 millisecond(s)" (T2, `RedisDownStartupTest`). |
+| Bypass | 1 s after any failure; skips reads, populates and the lease; **never invalidations on an established connection** | — | A paused Redis then costs about one read timeout per second per process. Invalidations are always sent while a connection exists (§1.5). With none, one connect attempt per window and nobody waits on it (§1.4). |
 
 ---
 
@@ -422,14 +433,14 @@ value TTL (60 s), because the stale value is written with `PX` = the value TTL.
 | 4b | Eviction of a token | Nothing directly; reopens the populate race for one read (§4.3) | Stale reads only | Value TTL | Argued (§4.3); T14/T15 run validity (`evicted_keys` unchanged) |
 | 4c | Eviction of an idempotency entry | A miss; DB replay | None | — | Argued |
 | 4d | Eviction of the lease | Another instance may start a run before the period ends | None: a harmless double run (D-115) | One run | Argued; T13 case 4 shows double runs report no drift |
-| 5 | A failed invalidation (Redis reachable, the command fails or times out) | The posting's response is unchanged; the API logs and counts; the worker emits `cache_invalidation_failed` | Stale reads only | Value TTL | Argued, plus the counter; T11 (stopped) exercises the Redis-down case |
-| 6 | ledger-api started with Redis down | Startup succeeds (the connection is made lazily, D-137); the first calls bypass | None | — | T10 (context startup with Redis down). `RedisClient.connect()` throws when the server is down **(verify in T2)**, which is why the connection is lazy |
+| 5 | A failed invalidation (the command fails or times out, or no connection is established so it can't be sent, D-137) | The posting's response is unchanged; the API logs and counts; the worker emits `cache_invalidation_failed` | Stale reads only | Value TTL | Argued, plus the counter; T11 (stopped) exercises the Redis-down case; T2 `RedisDownStartupTest` shows invalidations return at once with no connection (20 concurrent callers: slowest 188–200 ms, one connect attempt per window) |
+| 6 | ledger-api started with Redis down | Startup succeeds (the connection is made lazily, D-137); the first calls bypass | None | — | T2 `RedisDownStartupTest`: the context starts with Redis down, calls are unavailable, and once Redis starts calls succeed without a restart; `RedisClient.connect()` throws `RedisConnectionException` while the server is down, which is why the connection is lazy. T10 repeats it under load |
 | 7 | Worker without `REDIS_URL` while the API caches | Settles and releases never invalidate: merchant, ESCROW, PLATFORM_FEES and (on a release) customer balances are stale after every settle | Stale reads only | Value TTL per read, but it recurs after every settle | Consequence shown by T9's red evidence ("worker doesn't invalidate → red"); detected by `worker_started.balance_invalidation` and the D-146 harness guard; Compose makes `REDIS_URL` required (open issue) |
 | 8 | Postgres reset or restore without a Redis flush | Idempotency replays for rows that no longer exist; balances of another database state | **Wrong outcomes:** a request whose key replays from Redis is not executed. The same harm as rows 2a and 11, with no timing margin to protect against it, which is why the flush is a runbook step | Idempotency: fast-path TTL (10 min). Balances: value TTL | Runbook §9.1; residual |
 | 9 | A test Redis shared across databases | One database's replays and balances served to another (account ids and test keys repeat) | Wrong test results | — | Prevented by D-138; T2: every test Redis asserts `DBSIZE = 0` before its first test |
 | 10 | Clock skew between API, DB and Redis | Nothing | None: no absolute time is compared across hosts. Remaining life is measured by the DB; every PX is counted by Redis from execution. Only a jump in Redis's own clock changes when a PX ends | For idempotency, a Redis clock jump is a delay like any other: bounded by the margin | Argued |
 | 11 | An idempotency `SET` delayed in transit for more than 1 h | As row 2a | Residual: a purged key could replay | Margin (1 h) | Argued; residual |
-| 12 | `noeviction` under memory pressure (the rejected config) | Writes are refused with OOM errors, invalidations included | Stale reads, plus invalidations that fail outright | — | T2 records what the invalidation script does under `noeviction` **(verify in T2)**. Rejected by D-138 |
+| 12 | `noeviction` under memory pressure (the rejected config) | Populates and fast-path SETs are refused with OOM; each refusal is a Redis failure, so the 1 s bypass opens and nearly every balance read and keyed request goes to the DB. Invalidations still run in full. | None: latency only. Memory grows above maxmemory by the tokens invalidations write (each has PX 300000). | Token PX for the extra memory. | T2 RedisClientSmokeTest.invalidationScriptUnderNoeviction (cases: value present, value absent, both absent, populate, SET NX PX, SET-first control, plain DEL). Rejected by D-138. |
 | 13 | A single blip trips the bypass while Redis is healthy | 1 s of DB reads and skipped populates; invalidations are still sent | None: latency only | 1 s | Argued |
 | 14 | Worker crash between the settle commit and its invalidation | Redelivery → `duplicate_skipped` → invalidation | Stale reads until the redelivered record is processed | Redelivery time, and value TTL | T9 `test_balance_invalidation.py` (D-148) |
 | 15 | ledger-api crash between commit and its post-commit invalidation | No redelivery exists. A client retry with the same key replays without posting, so it doesn't invalidate either | Stale reads only | Value TTL | Argued; residual |
@@ -442,8 +453,8 @@ The "Rejected alternative" column of each row, verbatim.
 
 - **D-135:** Redis as a second source of truth; fail-closed; treating a timed-out command as not executed
 - **D-136:** spring-boot-starter-data-redis; Jedis; Redisson/Redlock (multi-master, an anti-goal); the Testcontainers redis module or extra
-- **D-137:** Library defaults; eager connect at startup; a circuit-breaker library; bypassing invalidations; a connection pool (loses send order); MULTI on the shared connection
-- **D-138:** Default RDB persistence; noeviction (a full Redis fails writes, invalidations included; behaviour observed in T2); one Redis shared across test contexts
+- **D-137:** Library defaults; eager connect at startup; a circuit-breaker library; bypassing invalidations; a connection pool (loses send order); MULTI on the shared connection; a blocking connect lock; accepting any URL the client parses
+- **D-138:** Default RDB persistence; noeviction (a full Redis refuses populates and fast-path SETs, and each refusal opens the bypass, while the DEL-first invalidation script still runs and pushes memory above maxmemory; observed in T2); one Redis shared across test contexts
 - **D-139:** Deciding 422 in Redis; a TTL equal to expires_at; the purger DELing Redis keys; caching Jackson's bytes; an absolute PXAT deadline from the DB clock (swaps the pause bound for a clock-skew bound); closing the connection after a command timeout (the bytes are already in the paused server's socket buffer)
 - **D-140:** Relying on no code updating completed rows; rejecting every update to a completed row (breaks the D-120 backdating fixture used by IdempotencyKeyExpiryTest, DbRolePrivilegesTest and M5's purge case)
 - **D-141:** pg_terminate_backend timing; no rollback proof
@@ -579,9 +590,9 @@ docker compose exec redis redis-cli FLUSHALL
 docker compose exec redis redis-cli DBSIZE    # expect 0
 ```
 
-`docker compose down -v` already wipes Postgres and Kafka together (D-028). Once T2 runs Redis without persistence
-(D-138), a Redis restart empties it too; until then Compose's Redis keeps its RDB snapshot on an anonymous volume, so
-flush explicitly.
+`docker compose down -v` already wipes Postgres and Kafka together (D-028). Compose's Redis keeps nothing on disk
+(`--save "" --appendonly no`, D-138), so a Redis restart empties it too. The flush is still the runbook step: a
+restore doesn't restart Redis.
 
 ### 9.2 Drills (PowerShell, repo root)
 
@@ -608,8 +619,9 @@ docker compose exec redis redis-cli --scan --pattern "ledger:v1:bal:*" | Select-
 | # | Claim | Where | Task |
 |---|---|---|---|
 | 1 | Spring runs `TransactionSynchronization.afterCommit` before it releases the connection (quote `AbstractPlatformTransactionManager` from the Spring Framework 7 source jar) | §1.6 | T6 |
-| 2 | Lettuce `RedisClient.connect()` throws when Redis is down | §5 row 6 | T2 |
-| 3 | Lettuce: commands from other threads join a `MULTI` on a shared connection (quote the reference guide's passage on transactions and shared connections) | §2.2 | T2 |
-| 4 | What the invalidation script does when Redis is over `maxmemory` with `noeviction`: whether Redis 7 refuses the unflagged script before it runs (then the `DEL` doesn't run either), or runs it until the first refused write, so that "the `DEL` comes first so a value is gone even if a later write in the script fails" holds | §2.1, §5 row 12 | T2 |
-| 5 | redis-py 8.1.0's default retry behaviour (D-137 sets retries to 0 explicitly either way) | D-137 | T2 |
 | 6 | k6 2.3.0 supports BigInt | §8.3 | T14 |
+
+Claims 2–5 were verified in T2 (PR body): `RedisClient.connect()` throws while Redis is down (§5 row 6); Lettuce's
+reference guide on shared connections and transactions (§2.2); the invalidation script under `noeviction` (§2.1,
+§5 row 12); redis-py 8.1.0 retries `ConnectionError` and `TimeoutError` 10 times with exponential backoff by default,
+so the worker's client sets retries to 0 (D-137, `test_redis_client.py`).

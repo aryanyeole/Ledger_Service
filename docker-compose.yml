@@ -63,6 +63,8 @@ services:
 
   redis:
     image: redis:7.4.11
+    # A pure cache (D-138): nothing on disk, so a restart empties it; every key is safe to evict.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
     ports:
       - "127.0.0.1:6379:6379"  # loopback only (D-029)
     healthcheck:

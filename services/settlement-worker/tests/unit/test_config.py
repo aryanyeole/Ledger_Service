@@ -12,7 +12,7 @@ import structlog
 from structlog.testing import capture_logs
 
 from settlement_worker import consumer
-from settlement_worker.config import Config, ConfigError
+from settlement_worker.config import Config, ConfigError, redis_address
 
 PAYMENT = "5b01a9e5-32ce-4c82-90b0-ac8c5143460c"
 
@@ -302,3 +302,69 @@ def test_worker_started_reports_the_reconcile_interval():
     with capture_logs() as logs:
         consumer.announce_start(structlog.get_logger(), config)
     assert [(log["reconcile_interval_ms"], log["log_level"]) for log in logs] == [(60000, "info")]
+
+
+# REDIS_URL (D-137): ledger-api's rule for ledger.redis.url, the same cases as LedgerRedisPropertiesTest.
+@pytest.mark.parametrize("raw", [None, "", "   "])
+def test_redis_url_unset_means_no_client(raw):
+    assert Config.from_env(_env(REDIS_URL=raw)).redis_url is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "host", "port"),
+    [
+        ("redis://localhost", "localhost", 6379),
+        ("redis://localhost:6380", "localhost", 6380),
+        ("redis://redis:6379/0", "redis", 6379),
+        ("redis://127.0.0.1:1", "127.0.0.1", 1),
+        ("redis://h:65535", "h", 65535),
+        ("REDIS://Host", "host", 6379),
+    ],
+)
+def test_redis_url_accepted(raw, host, port):
+    config = Config.from_env(_env(REDIS_URL=raw))
+    assert config.redis_url == raw
+    assert redis_address(config.redis_url) == (host, port)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "localhost:6379",
+        "rediss://localhost",
+        "http://localhost",
+        "redis://",
+        "redis://:6379",
+        "redis://localhost:0",
+        "redis://localhost:65536",
+        "redis://localhost:abc",
+        "redis://localhost/1",
+        "redis://localhost/0/x",
+        "redis://localhost?db=0",
+        "redis://localhost#x",
+        "redis://user@localhost",
+        "redis://:secret@localhost",
+        "redis://user:secret@localhost:6379",
+    ],
+)
+def test_redis_url_rejected(raw):
+    with pytest.raises(ConfigError, match=r"^REDIS_URL "):
+        Config.from_env(_env(REDIS_URL=raw))
+
+
+def test_redis_url_message_never_echoes_user_info():
+    with pytest.raises(ConfigError) as caught:
+        Config.from_env(_env(REDIS_URL="redis://admin:hunter2@localhost:6379"))
+    assert str(caught.value) == "REDIS_URL must not contain user info"
+    assert "hunter2" not in str(caught.value) and "admin" not in str(caught.value)
+
+
+def test_malformed_redis_url_exits_2():
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("FAULT_", "REDIS_"))}
+    env.update(_env(WORKER_METRICS_PORT="0", REDIS_URL="redis://user:hunter2@localhost:6379"))
+    result = subprocess.run([sys.executable, "-m", "settlement_worker"], capture_output=True, text=True, env=env, timeout=30)
+    assert result.returncode == 2, result.stdout + result.stderr
+    lines = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [line["event"] for line in lines] == ["config_invalid"]
+    assert lines[0]["error"] == "REDIS_URL must not contain user info"
+    assert "hunter2" not in result.stdout + result.stderr
