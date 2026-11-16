@@ -51,6 +51,16 @@ ledger:
       # batch-size (1000) and interval (5m) keep their defaults.
       enabled: true
       scheduled: true
+  cache:
+    # The Redis gateway exists while either cache is on (D-137); tests turn both off in
+    # src/test/resources/application.properties (D-096), migrate-only forces both off (D-083).
+    idempotency:
+      enabled: true
+    balance:
+      enabled: true
+  redis:
+    # redis://host[:port], database 0, no user info (D-137); checked at startup while a cache is on.
+    url: ${REDIS_URL:redis://localhost:6379}
 
 management:
   endpoints:

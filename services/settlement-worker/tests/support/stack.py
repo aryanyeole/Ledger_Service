@@ -1,4 +1,4 @@
-"""Builders for the worker's test stacks (D-083, D-084, D-103, D-104).
+"""Builders for the worker's test stacks (D-083, D-084, D-103, D-104, D-138).
 
 Postgres gets its schema from the real ledger-api jar in migrate-only mode; Kafka is a generic
 apache/kafka container (testcontainers' Kafka module only knows the Confluent image); ledger-api
@@ -30,6 +30,7 @@ from aiokafka.admin import AIOKafkaAdminClient, NewTopic
 from testcontainers.community.postgres import PostgresContainer
 from testcontainers.core.container import DockerContainer
 
+from settlement_worker import redis_client
 from support.api import ApiClient
 
 REPO = Path(__file__).resolve().parents[4]
@@ -39,6 +40,9 @@ MIGRATIONS = LEDGER_API / "src" / "main" / "resources" / "db" / "migration"
 
 POSTGRES_IMAGE = "postgres:17.11"  # D-027
 KAFKA_IMAGE = "apache/kafka:4.3.1"  # D-027
+REDIS_IMAGE = "redis:7.4.11"  # D-027
+# Compose's pure-cache flags (D-138).
+REDIS_COMMAND = ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
 TOPIC = "ledger.payments.v1"
 DLQ_TOPIC = "ledger.payments.dlq.v1"  # D-110: ledger-api owns it; the failure_modes harness creates it
 
@@ -60,6 +64,7 @@ BROKER_READY_TIMEOUT_SECONDS = 90
 BROKER_ATTEMPT_TIMEOUT_SECONDS = 5
 BROKER_CLOSE_TIMEOUT_SECONDS = 1
 DIAGNOSTIC_LOGS_TIMEOUT_SECONDS = 10
+REDIS_READY_TIMEOUT_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -111,6 +116,12 @@ class AppDb:
 class Kafka:
     bootstrap_servers: str
     # The broker container, for tests that exec a Kafka CLI tool in it (T9).
+    container_id: str | None = None
+
+
+@dataclass(frozen=True)
+class Redis:
+    url: str
     container_id: str | None = None
 
 
@@ -207,6 +218,43 @@ def postgres():
         )
     finally:
         container.stop()
+
+
+@contextmanager
+def redis():
+    """redis:7.4.11 with Compose's pure-cache flags (D-138), published on 127.0.0.1 only (D-029).
+
+    One per stack: every test Redis belongs to exactly one Postgres, and it must be empty before
+    its first test (DBSIZE = 0). Readiness is a PING through redis-py, not a log wait (BUG-009);
+    start() is inside the try, so a failed start or wait still stops the container (BUG-010).
+    """
+    port = free_port()
+    container = DockerContainer(REDIS_IMAGE).with_command(REDIS_COMMAND)
+    container.ports["6379/tcp"] = ("127.0.0.1", port)
+    url = f"redis://127.0.0.1:{port}"
+    try:
+        container.start()
+        keys = asyncio.run(_wait_for_redis(url, time.monotonic() + REDIS_READY_TIMEOUT_SECONDS))
+        assert keys == 0, f"test Redis must start empty (D-138), DBSIZE = {keys}"
+        yield Redis(url=url, container_id=container.get_wrapped_container().id)
+    finally:
+        container.stop()
+
+
+async def _wait_for_redis(url: str, deadline: float) -> int:
+    """PING until Redis answers, then DBSIZE."""
+    last: Exception | None = None
+    while time.monotonic() < deadline:
+        client = redis_client.create(url)
+        try:
+            if await client.ping():
+                return await client.dbsize()
+        except Exception as ex:  # noqa: BLE001 - not up yet
+            last = ex
+        finally:
+            await client.aclose()
+        await asyncio.sleep(0.2)
+    raise TimeoutError(f"Redis at {url} not ready after {REDIS_READY_TIMEOUT_SECONDS} s: {last!r}")
 
 
 def _jdbc_url(database: Database) -> str:
@@ -408,7 +456,14 @@ def _wait_for_health(base_url: str, process: subprocess.Popen, log_path: Path, *
     pytest.fail(f"ledger-api not healthy at {base_url}:\n{log_path.read_text(errors='replace')[-4000:]}\n{dump}")
 
 
-def server_command(database: Database, jar: Path, port: int, key_hash: str, relay_bootstrap: str | None = None) -> list[str]:
+def server_command(
+    database: Database,
+    jar: Path,
+    port: int,
+    key_hash: str,
+    relay_bootstrap: str | None = None,
+    redis_url: str | None = None,
+) -> list[str]:
     command = [
         java(),
         "-jar",
@@ -418,6 +473,16 @@ def server_command(database: Database, jar: Path, port: int, key_hash: str, rela
         f"--spring.datasource.url={_jdbc_url(database)}",
         f"--ledger.api-keys.{key_hash}=worker-tests",
     ]
+    # Main config turns both caches on; a test API never talks to the dev Redis (D-138), so both stay
+    # off unless the caller brings its own Redis.
+    if redis_url is None:
+        command += ["--ledger.cache.idempotency.enabled=false", "--ledger.cache.balance.enabled=false"]
+    else:
+        command += [
+            "--ledger.cache.idempotency.enabled=true",
+            "--ledger.cache.balance.enabled=true",
+            f"--ledger.redis.url={redis_url}",
+        ]
     if relay_bootstrap is None:
         command += ["--ledger.outbox.relay.enabled=false", "--ledger.outbox.relay.scheduled=false"]
     else:
@@ -431,18 +496,22 @@ def server_command(database: Database, jar: Path, port: int, key_hash: str, rela
 
 
 @contextmanager
-def ledger_api(database: Database, jar: Path, log_dir: Path, *, relay_bootstrap: str | None = None):
+def ledger_api(
+    database: Database, jar: Path, log_dir: Path, *, relay_bootstrap: str | None = None, redis_url: str | None = None
+):
     """The jar in server mode on 127.0.0.1 with one test API key (D-103).
 
     relay_bootstrap None: the outbox relay is off. Otherwise it runs on its 200 ms schedule against
-    that broker (D-104). Only the key's SHA-256 reaches the jar (D-049); the key itself stays in
-    this process and is never printed. The jar's output goes to a file, shown only on failure.
+    that broker (D-104). redis_url None: both Redis caches are off; otherwise they use that Redis,
+    which must belong to this stack's database alone (D-138). Only the key's SHA-256 reaches the jar
+    (D-049); the key itself stays in this process and is never printed. The jar's output goes to a
+    file, shown only on failure.
     """
     port = free_port()
     api_key = secrets.token_urlsafe(24)
     key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
     log_path = log_dir / "ledger-api.log"
-    command = server_command(database, jar, port, key_hash, relay_bootstrap)
+    command = server_command(database, jar, port, key_hash, relay_bootstrap, redis_url)
     with open(log_path, "wb") as log:
         process = subprocess.Popen(command, env=jar_env(), stdout=log, stderr=subprocess.STDOUT)
     base_url = f"http://127.0.0.1:{port}"

@@ -1,5 +1,5 @@
 """The worker's configuration, from the environment (D-081, D-085, D-091, D-108, D-109, D-111, D-112, D-113,
-D-114, D-125, D-129).
+D-114, D-125, D-129, D-137).
 
 Names follow .env.example where it has them. Anything invalid is a ConfigError, and the worker
 refuses to start (exit 2). The password is never part of an error message or the repr.
@@ -7,6 +7,7 @@ refuses to start (exit 2). The password is never part of an error message or the
 
 import os
 import re
+import urllib.parse
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -26,6 +27,34 @@ _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}
 
 class ConfigError(ValueError):
     pass
+
+
+REDIS_DEFAULT_PORT = 6379
+
+
+def redis_address(url: str) -> tuple[str, int]:
+    """REDIS_URL -> (host, port) under ledger-api's rule for ledger.redis.url (D-137): redis://host[:port], port
+    1-65535, no user info, an empty path or /0 (both services address database 0), no query or fragment. The
+    message names the rule that failed and never echoes the URL, so a password typed into it can't reach a log."""
+    raw = url.strip()
+    try:
+        parts = urllib.parse.urlsplit(raw)
+        port = parts.port
+    except ValueError:
+        raise ConfigError("REDIS_URL is not a valid URL (redis://host[:port])") from None
+    if parts.scheme != "redis":
+        raise ConfigError("REDIS_URL must use the redis:// scheme")
+    if "@" in parts.netloc:
+        raise ConfigError("REDIS_URL must not contain user info")
+    if not parts.hostname:
+        raise ConfigError("REDIS_URL must name a host (redis://host[:port])")
+    if port is not None and not 1 <= port <= 65535:
+        raise ConfigError("REDIS_URL port must be 1-65535")
+    if parts.path not in ("", "/0"):
+        raise ConfigError("REDIS_URL must address database 0 (an empty path or /0)")
+    if parts.query or parts.fragment or "?" in raw or "#" in raw:
+        raise ConfigError("REDIS_URL must not have a query or fragment")
+    return parts.hostname, REDIS_DEFAULT_PORT if port is None else port
 
 
 @dataclass(frozen=True)
@@ -57,6 +86,8 @@ class Config:
     processor_outage: bool
     reconcile_interval_ms: int | None
     reconcile_statement_timeout_ms: int
+    # Redis (D-137): None when REDIS_URL is unset, so the worker has no Redis client.
+    redis_url: str | None
 
     @property
     def fault_armed(self) -> bool:
@@ -146,6 +177,10 @@ class Config:
         reconcile_interval = None
         if (env.get("RECONCILE_INTERVAL_MS") or "").strip():
             reconcile_interval = integer("RECONCILE_INTERVAL_MS", "", 100, 86_400_000)
+        # Redis (D-137): unset or empty means no client; anything set must pass the URL rule.
+        redis_url = (env.get("REDIS_URL") or "").strip() or None
+        if redis_url is not None:
+            redis_address(redis_url)
 
         return cls(
             postgres_host=text("POSTGRES_HOST", "localhost"),
@@ -179,4 +214,5 @@ class Config:
             processor_outage=outage == "1",
             reconcile_interval_ms=reconcile_interval,
             reconcile_statement_timeout_ms=integer("RECONCILE_STATEMENT_TIMEOUT_MS", "30000", 1, 600_000),
+            redis_url=redis_url,
         )

@@ -23,8 +23,8 @@ import org.springframework.core.io.support.PropertiesLoaderUtils;
 import org.springframework.core.io.support.SpringFactoriesLoader;
 
 // Migrate-only mode (D-083, D-126): ledger.migrate-only=true forces the web server, the outbox
-// relay, the idempotency key purge and their schedulers off, above command-line arguments;
-// otherwise nothing changes. The exit codes are
+// relay, the idempotency key purge, their schedulers and both Redis cache switches (D-137) off,
+// above command-line arguments; otherwise nothing changes. The exit codes are
 // proven out of process by the worker's test harness (it requires exit 0 from java -jar).
 class MigrateOnlyEnvironmentPostProcessorTest {
 
@@ -37,6 +37,7 @@ class MigrateOnlyEnvironmentPostProcessorTest {
 			.addFirst(new SimpleCommandLinePropertySource("--ledger.migrate-only=true",
 					"--ledger.outbox.relay.enabled=true", "--ledger.outbox.relay.scheduled=true",
 					"--ledger.idempotency.purge.enabled=true", "--ledger.idempotency.purge.scheduled=true",
+					"--ledger.cache.idempotency.enabled=true", "--ledger.cache.balance.enabled=true",
 					"--spring.main.web-application-type=servlet"));
 
 		this.processor.postProcessEnvironment(environment, new SpringApplication());
@@ -46,6 +47,8 @@ class MigrateOnlyEnvironmentPostProcessorTest {
 		assertThat(environment.getProperty("ledger.outbox.relay.scheduled")).isEqualTo("false");
 		assertThat(environment.getProperty("ledger.idempotency.purge.enabled")).isEqualTo("false");
 		assertThat(environment.getProperty("ledger.idempotency.purge.scheduled")).isEqualTo("false");
+		assertThat(environment.getProperty("ledger.cache.idempotency.enabled")).isEqualTo("false");
+		assertThat(environment.getProperty("ledger.cache.balance.enabled")).isEqualTo("false");
 		assertThat(environment.getPropertySources().iterator().next().getName())
 			.as("highest-precedence property source")
 			.isEqualTo(MigrateOnlyEnvironmentPostProcessor.SOURCE_NAME);

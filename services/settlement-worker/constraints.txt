@@ -14,6 +14,7 @@ Pygments==2.21.0
 pytest==9.1.1
 python-dotenv==1.2.4
 pywin32==312
+redis==8.1.0
 requests==2.34.2
 structlog==26.1.0
 testcontainers==4.15.0
