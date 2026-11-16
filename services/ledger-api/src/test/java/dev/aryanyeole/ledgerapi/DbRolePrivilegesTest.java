@@ -28,6 +28,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.postgresql.util.PSQLException;
 import org.postgresql.util.ServerErrorMessage;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -36,10 +37,11 @@ import org.springframework.context.annotation.Import;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 
 // Proof that the database roles match the declared model (D-006, D-033, D-034, D-040,
-// D-043, D-060, D-071, D-076, D-077, D-078, D-119, D-120):
+// D-043, D-060, D-071, D-076, D-077, D-078, D-119, D-120, D-140):
 // role attributes, memberships, ownership, the table/column/sequence privilege matrix,
 // schema and database privileges, trigger hardening, that the runtime roles cannot
-// bypass any of it, and that only expired idempotency keys can be deleted. Catalog reads go through the app connection; pg_catalog and the
+// bypass any of it, that only expired idempotency keys can be deleted, and that a completed
+// idempotency key row can't change what it replays. Catalog reads go through the app connection; pg_catalog and the
 // has_*_privilege() functions are readable by every role.
 @Import(TestcontainersConfiguration.class)
 @SpringBootTest
@@ -54,6 +56,10 @@ class DbRolePrivilegesTest {
 	private static final String PURGE_GUARD = "idempotency_keys_purge";
 
 	private static final String PURGE_GUARD_MESSAGE = "only expired idempotency keys may be deleted";
+
+	private static final String IMMUTABLE_GUARD = "idempotency_keys_immutable";
+
+	private static final String IMMUTABLE_GUARD_MESSAGE = "a completed idempotency key row is immutable";
 
 	private static final String SEARCH_PATH = "search_path=pg_catalog, public, pg_temp";
 
@@ -154,6 +160,8 @@ class DbRolePrivilegesTest {
 			Map.entry("idempotency_keys_purge",
 					new TriggerSpec("idempotency_keys", "idempotency_keys_purge_guard", false)),
 			Map.entry("idempotency_keys_no_truncate", new TriggerSpec("idempotency_keys", "forbid_mutation", false)),
+			Map.entry("idempotency_keys_immutable",
+					new TriggerSpec("idempotency_keys", "idempotency_keys_immutable_guard", false)),
 			Map.entry("payments_status_transition",
 					new TriggerSpec("payments", "payments_status_transition", false)),
 			Map.entry("payments_no_delete", new TriggerSpec("payments", "forbid_mutation", false)),
@@ -806,12 +814,186 @@ class DbRolePrivilegesTest {
 		}
 	}
 
+	// L: completed rows are immutable (D-140, V16). Once status_code is set, no role may change
+	// client_id, key, request_hash, status_code or the text of response_body; expires_at stays
+	// movable by the owner (the D-120 fixture). Rows are created through the app's normal insert and
+	// store, committed, and removed in finally as in K.
+	@Test
+	void appFirstStoreOnInProgressRow() throws SQLException {
+		String client = purgeClientId();
+		String key = "store-" + UUID.randomUUID();
+		try {
+			insertCompletedKey(client, key);
+			assertThat(storedRow(client, key)).as("ledger_api_app: first store on an in-progress row")
+				.isEqualTo(new StoredRow(client, key, "00".repeat(32), 201, "{}"));
+		}
+		finally {
+			deleteFixtureRows(client);
+		}
+	}
+
+	@Test
+	void appCannotChangeCompletedStatus() throws SQLException {
+		assertImmutable(Role.APP, "UPDATE idempotency_keys SET status_code = 422 WHERE client_id = ? AND key = ?",
+				"{}");
+	}
+
+	@Test
+	void appCannotChangeCompletedBody() throws SQLException {
+		assertImmutable(Role.APP,
+				"UPDATE idempotency_keys SET response_body = '{\"b\": 2}'::jsonb WHERE client_id = ? AND key = ?", "{}");
+	}
+
+	// jsonb equality is by value, so 1.0 and 1.00 are equal while their text differs; replays and the
+	// cache serve ::text, so the guard compares text.
+	@Test
+	void appCannotChangeBodyTextWithSameJsonbValue() throws SQLException {
+		String client = purgeClientId();
+		String key = "immutable-" + UUID.randomUUID();
+		try {
+			insertCompletedKey(client, key, "{\"a\": 1.0}");
+			try (Connection conn = connect(Role.APP)) {
+				try {
+					assertThat(queryBoolean(conn,
+							"SELECT response_body = '{\"a\": 1.00}'::jsonb AND response_body::text <> ('{\"a\": 1.00}'::jsonb)::text "
+									+ "FROM idempotency_keys WHERE client_id = ? AND key = ?",
+							client, key))
+						.as("the stored body and the new one are jsonb-equal with different text")
+						.isTrue();
+				}
+				finally {
+					conn.rollback();
+				}
+			}
+			StoredRow before = storedRow(client, key);
+			SQLException e = rejectedAndRolledBack(Role.APP,
+					"UPDATE idempotency_keys SET response_body = '{\"a\": 1.00}'::jsonb WHERE client_id = ? AND key = ?",
+					client, key);
+			assertImmutableRejected(e, Role.APP, client, key);
+			assertThat(storedRow(client, key)).as("ledger_api_app: row unchanged").isEqualTo(before);
+			assertThat(before.responseBody()).isEqualTo("{\"a\": 1.0}");
+		}
+		finally {
+			deleteFixtureRows(client);
+		}
+	}
+
+	// The guard's exact edge: an UPDATE that leaves every checked column as it was is allowed.
+	@Test
+	void appIdenticalBodyTextSucceeds() throws SQLException {
+		String client = purgeClientId();
+		String key = "identical-" + UUID.randomUUID();
+		try {
+			insertCompletedKey(client, key);
+			StoredRow before = storedRow(client, key);
+			assertThat(updateAndCommit(Role.APP,
+					"UPDATE idempotency_keys SET response_body = response_body WHERE client_id = ? AND key = ?", client,
+					key))
+				.as("ledger_api_app: no-change update")
+				.isEqualTo(1);
+			assertThat(storedRow(client, key)).isEqualTo(before);
+		}
+		finally {
+			deleteFixtureRows(client);
+		}
+	}
+
+	// Formerly IdempotencyKeyCompletenessTest's clear-after-commit case (23502 at COMMIT): V16 now
+	// refuses the UPDATE itself.
+	@ParameterizedTest(name = "{0}")
+	@ValueSource(strings = { "status_code", "response_body" })
+	void appCannotClearCompletedResponse(String column) throws SQLException {
+		assertImmutable(Role.APP, "UPDATE idempotency_keys SET " + column + " = NULL WHERE client_id = ? AND key = ?",
+				"{}");
+	}
+
+	@Test
+	void ownerCannotChangeCompletedRequestHash() throws SQLException {
+		assertImmutable(Role.OWNER,
+				"UPDATE idempotency_keys SET request_hash = decode(repeat('11', 32), 'hex') WHERE client_id = ? AND key = ?",
+				"{}");
+	}
+
+	@Test
+	void ownerCannotChangeCompletedKey() throws SQLException {
+		assertImmutable(Role.OWNER, "UPDATE idempotency_keys SET key = key || '-x' WHERE client_id = ? AND key = ?",
+				"{}");
+	}
+
+	// The D-120 fixture: expires_at isn't checked.
+	@Test
+	void ownerCanBackdateCompletedRow() throws SQLException {
+		String client = purgeClientId();
+		String key = "backdate-" + UUID.randomUUID();
+		try {
+			insertCompletedKey(client, key);
+			StoredRow before = storedRow(client, key);
+			backdate(client, key);
+			assertThat(storedRow(client, key)).as("checked columns unchanged by the backdate").isEqualTo(before);
+		}
+		finally {
+			deleteFixtureRows(client);
+		}
+	}
+
+	// A completed row, then `sql` (bound to its client and key) as `role`: refused with 23514 naming
+	// idempotency_keys_immutable, rolled back, the row unchanged.
+	private void assertImmutable(Role role, String sql, String body) throws SQLException {
+		String client = purgeClientId();
+		String key = "immutable-" + UUID.randomUUID();
+		try {
+			insertCompletedKey(client, key, body);
+			StoredRow before = storedRow(client, key);
+			SQLException e = rejectedAndRolledBack(role, sql, client, key);
+			assertImmutableRejected(e, role, client, key);
+			assertThat(storedRow(client, key)).as("%s: row unchanged", role.dbRole).isEqualTo(before);
+		}
+		finally {
+			deleteFixtureRows(client);
+		}
+	}
+
+	// 23514 naming idempotency_keys_immutable, with the fixed message: no client id or key in it.
+	private static void assertImmutableRejected(SQLException thrown, Role role, String client, String key) {
+		ServerErrorMessage error = rootServerError(thrown, role, CHECK_VIOLATION);
+		assertThat(error.getConstraint()).as("%s: constraint", role.dbRole).isEqualTo(IMMUTABLE_GUARD);
+		assertThat(error.getTable()).as("%s: table", role.dbRole).isEqualTo("idempotency_keys");
+		assertThat(error.getMessage()).as("%s: server message", role.dbRole)
+			.isEqualTo(IMMUTABLE_GUARD_MESSAGE)
+			.doesNotContain(client)
+			.doesNotContain(key);
+	}
+
+	record StoredRow(String clientId, String key, String requestHashHex, Integer statusCode, String responseBody) {
+	}
+
+	// The checked columns of the client's row, read as the app; response_body as text.
+	private StoredRow storedRow(String client, String key) throws SQLException {
+		try (Connection conn = connect(Role.APP)) {
+			try (PreparedStatement ps = prepare(conn,
+					"SELECT client_id, key, encode(request_hash, 'hex'), status_code, response_body::text "
+							+ "FROM idempotency_keys WHERE client_id = ? AND key = ?",
+					client, key); ResultSet rs = ps.executeQuery()) {
+				assertThat(rs.next()).as("row for %s/%s", client, key).isTrue();
+				return new StoredRow(rs.getString(1), rs.getString(2), rs.getString(3), rs.getObject(4, Integer.class),
+						rs.getString(5));
+			}
+			finally {
+				conn.rollback();
+			}
+		}
+	}
+
 	private static String purgeClientId() {
 		return "t1-purge-" + UUID.randomUUID();
 	}
 
 	// A complete key (V6 checks completeness at commit), inserted through the app's grants.
 	private void insertCompletedKey(String client, String key) throws SQLException {
+		insertCompletedKey(client, key, "{}");
+	}
+
+	private void insertCompletedKey(String client, String key, String body) throws SQLException {
 		try (Connection conn = connect(Role.APP)) {
 			try {
 				try (PreparedStatement ps = prepare(conn,
@@ -820,8 +1002,8 @@ class DbRolePrivilegesTest {
 					assertThat(ps.executeUpdate()).as("ledger_api_app: key inserted").isEqualTo(1);
 				}
 				try (PreparedStatement ps = prepare(conn,
-						"UPDATE idempotency_keys SET status_code = 201, response_body = '{}'::jsonb WHERE client_id = ? AND key = ?",
-						client, key)) {
+						"UPDATE idempotency_keys SET status_code = 201, response_body = ?::jsonb WHERE client_id = ? AND key = ?",
+						body, client, key)) {
 					assertThat(ps.executeUpdate()).as("ledger_api_app: response stored").isEqualTo(1);
 				}
 				conn.commit();

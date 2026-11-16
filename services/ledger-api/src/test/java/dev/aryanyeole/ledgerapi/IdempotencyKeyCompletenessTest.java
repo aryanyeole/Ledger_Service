@@ -80,25 +80,21 @@ class IdempotencyKeyCompletenessTest {
 			.isEqualTo(new StoredKey(201, "{\"transaction_id\": 7}", true));
 	}
 
-	@ParameterizedTest(name = "{0}")
-	@ValueSource(strings = { "response_body", "status_code" })
-	void clearingTheResponseIsRejectedAtCommit(String column) throws SQLException {
+	// The trigger checks the row as the transaction leaves it, later UPDATEs included: a store that
+	// sets only one of the two columns passes the UPDATE and fails at COMMIT. (Clearing a response
+	// after it was stored is refused earlier, at the UPDATE, by V16's idempotency_keys_immutable;
+	// DbRolePrivilegesTest covers that.)
+	@ParameterizedTest(name = "only {0} stored")
+	@ValueSource(strings = { "status_code", "response_body" })
+	void partialStoreIsRejectedAtCommit(String storedColumn) throws SQLException {
 		String key = newKey();
+		String assignment = storedColumn.equals("status_code") ? "status_code = 201"
+				: "response_body = '{\"transaction_id\": 9}'::jsonb";
 		try (Connection conn = connectApp()) {
 			try {
 				insertKey(conn, key);
-				storeResponse(conn, key, 201, "{\"transaction_id\": 8}");
-				conn.commit();
-			}
-			finally {
-				conn.rollback();
-			}
-		}
-
-		try (Connection conn = connectApp()) {
-			try {
 				try (PreparedStatement ps = conn.prepareStatement(
-						"UPDATE idempotency_keys SET " + column + " = NULL WHERE client_id = ? AND key = ?")) {
+						"UPDATE idempotency_keys SET " + assignment + " WHERE client_id = ? AND key = ?")) {
 					ps.setString(1, CLIENT);
 					ps.setString(2, key);
 					assertThat(ps.executeUpdate()).as("[%s] update is not checked until COMMIT", APP).isEqualTo(1);
@@ -111,8 +107,7 @@ class IdempotencyKeyCompletenessTest {
 				conn.rollback();
 			}
 		}
-		assertThat(stored(key)).as("[%s] key %s after the rejected commit", APP, key)
-			.isEqualTo(new StoredKey(201, "{\"transaction_id\": 8}", true));
+		assertThat(stored(key)).as("[%s] key %s after the rejected commit", APP, key).isNull();
 	}
 
 	private static void assertIncomplete(SQLException thrown, String key) {
