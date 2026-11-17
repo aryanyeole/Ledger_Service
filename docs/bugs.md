@@ -891,4 +891,5 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 - **Regression test:** open.
 - **Decision Log impact:** open.
 - **Summary (one sentence):** open.
-- **Notes:** none yet.
+- **Notes:**
+  - **Every retained CI attempt of this test** (read per attempt, `gh run view <run> --attempt <n> --log`; 27 attempts, from PR #64's run 41768685461 attempts 1-10 on `cc5408c` to `d71035f`): 26 printed `serverArrivedBeforeFirstCompletion=2 transactions=2`; only run 43989828650 attempt 1 (`7753dda`) printed `=1 transactions=2`. Run 43987278998 on `359b28e`, PR #68's head after main was merged in, has the same tree as the squash `7753dda` and printed `=2 transactions=2`, so the same code passed once and failed once.
