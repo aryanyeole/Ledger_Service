@@ -321,6 +321,16 @@ Reading CI history per attempt (BUG-013 lesson: `gh run view --job` reads the la
 gh run view <run> --attempt <n> --log | Select-String "RECONCILE_SNAPSHOT|TWO_QUERY_CONTROL|CONCURRENCY"
 ```
 
+Redis (M5): after changing Redis's Compose flags (D-138), recreate it with a fresh volume and check them:
+```powershell
+docker compose up -d --force-recreate --renew-anon-volumes redis   # --force-recreate alone keeps the anonymous /data volume, and Redis loads an existing dump.rdb at startup whatever --save says
+docker compose exec redis redis-cli CONFIG GET save                # expect ""
+docker compose exec redis redis-cli CONFIG GET appendonly          # expect no
+docker compose exec redis redis-cli CONFIG GET maxmemory-policy    # expect allkeys-lru
+docker compose exec redis redis-cli DBSIZE                         # expect 0
+```
+Flush on any Postgres reset or restore, and the pause/flush drills: docs/design/cache-invalidation.md §9.
+
 Dev broker topic check:
 ```powershell
 # After changing Kafka settings in Compose (or before the relay first runs against the dev broker)
