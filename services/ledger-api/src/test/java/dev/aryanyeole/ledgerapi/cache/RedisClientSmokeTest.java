@@ -87,7 +87,7 @@ class RedisClientSmokeTest {
 	}
 
 	private long invalidate(List<String> keys, String token) {
-		Reply<Long> reply = this.gateway.always("EVAL", (r) -> r.eval(DesignDocScripts.INVALIDATE, keys, List.of(token)));
+		Reply<Long> reply = this.gateway.always("EVAL", (r) -> r.eval(BalanceCacheScripts.INVALIDATE, keys, List.of(token)));
 		return ok(reply);
 	}
 
@@ -195,7 +195,7 @@ class RedisClientSmokeTest {
 	}
 
 	private long populate(String account, String tokenSeen, String entry) {
-		Reply<Long> reply = this.gateway.optional("EVAL", (r) -> r.eval(DesignDocScripts.POPULATE,
+		Reply<Long> reply = this.gateway.optional("EVAL", (r) -> r.eval(BalanceCacheScripts.POPULATE,
 				List.of("ledger:v1:bal:" + account, "ledger:v1:bal-gen:" + account), List.of(tokenSeen, entry, "60000")));
 		return ok(reply);
 	}
@@ -242,7 +242,7 @@ class RedisClientSmokeTest {
 					// Observed: Redis refuses a denyoom command in a script only while the script hasn't
 					// written yet. The DEL is a write, so the SET after it is allowed: the whole script runs
 					// and Redis ends up past maxmemory.
-					String invalidation = eval(r, DesignDocScripts.INVALIDATE, "ledger:v1:bal:1", "ledger:v1:bal-gen:1",
+					String invalidation = eval(r, BalanceCacheScripts.INVALIDATE, "ledger:v1:bal:1", "ledger:v1:bal-gen:1",
 							"new-token-1");
 					long afterInvalidation = memory(r, "used_memory");
 					lines.add("invalidation script (DEL then SET), account 1: " + invalidation);
@@ -264,7 +264,7 @@ class RedisClientSmokeTest {
 
 					// (a) The common case: nothing cached for the account, its token present. A DEL that deletes
 					// nothing still counts as the script's first write.
-					String valueAbsent = eval(r, DesignDocScripts.INVALIDATE, "ledger:v1:bal:3", "ledger:v1:bal-gen:3",
+					String valueAbsent = eval(r, BalanceCacheScripts.INVALIDATE, "ledger:v1:bal:3", "ledger:v1:bal-gen:3",
 							"new-token-3");
 					lines.add("(a) invalidation, value absent, token present: " + valueAbsent);
 					lines.add("  ledger:v1:bal:3 exists=" + r.exists("ledger:v1:bal:3") + "; ledger:v1:bal-gen:3="
@@ -273,7 +273,7 @@ class RedisClientSmokeTest {
 					assertThat(r.get("ledger:v1:bal-gen:3")).isEqualTo("new-token-3");
 
 					// (b) An account never read: neither key present.
-					String bothAbsent = eval(r, DesignDocScripts.INVALIDATE, "ledger:v1:bal:4", "ledger:v1:bal-gen:4",
+					String bothAbsent = eval(r, BalanceCacheScripts.INVALIDATE, "ledger:v1:bal:4", "ledger:v1:bal-gen:4",
 							"new-token-4");
 					lines.add("(b) invalidation, neither key present: " + bothAbsent);
 					lines.add("  ledger:v1:bal:4 exists=" + r.exists("ledger:v1:bal:4") + "; ledger:v1:bal-gen:4="
@@ -282,7 +282,7 @@ class RedisClientSmokeTest {
 					assertThat(r.get("ledger:v1:bal-gen:4")).isEqualTo("new-token-4");
 
 					// (c) The populate script: its first write is the SET.
-					String populate = eval(r, DesignDocScripts.POPULATE, "ledger:v1:bal:5", "ledger:v1:bal-gen:5", "token-5",
+					String populate = eval(r, BalanceCacheScripts.POPULATE, "ledger:v1:bal:5", "ledger:v1:bal-gen:5", "token-5",
 							"1|500.0000|2026-11-16T00:00:00.000000Z", "60000");
 					lines.add("(c) populate script, token matches: " + populate);
 					lines.add("  ledger:v1:bal:5 exists=" + r.exists("ledger:v1:bal:5"));
