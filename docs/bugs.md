@@ -31,7 +31,7 @@
 | BUG-012 | 2026-11-02 18:51 | M4 | ledger-api's startup hung after "Root WebApplicationContext: initialization completed", before Flyway's first database line, through a 120 s health wait | none observed (component: ledger-api startup; seen through the settlement-worker test stack) | fixed | 5d7e331 (PR #59) |
 | BUG-013 | 2026-11-03 19:23 | M4 | CheckThenInsertIdempotencyTest's round produced one transfer on CI, so the D-017 control failed its overlap check against a correct system | P2 proof evidence, D-067 (component: ledger-api tests) | fixed | c1aaf55 (PR #64) |
 | BUG-014 | 2026-11-16 15:33 | M5 | ConcurrentIdempotentPaymentTest misses its D-106 server-overlap floor on CI | P2 proof evidence, D-067/D-106 (component: ledger-api tests) | fixed | d71035f (PR #70) |
-| BUG-015 | 2026-11-16 17:44 | M5 | CheckThenInsertIdempotencyTest's BUG-013 regression test counted one server arrival, not two, on main | P2 proof evidence, D-133 (component: ledger-api tests, `ServerArrivals`) | open | — |
+| BUG-015 | 2026-11-16 17:44 | M5 | CheckThenInsertIdempotencyTest's BUG-013 regression test counted one server arrival, not two, on main | P2 proof evidence, D-133 (component: ledger-api tests, `ServerArrivals`) | fixed | 5038914 (PR #71) |
 | BUG-016 | 2026-11-16 19:05 | M5 | RedisClientSmokeTest's context fails to start: the test Redis's empty check times out connecting | none (component: ledger-api tests, `RedisTestcontainersConfiguration`) | open | — |
 
 ---
@@ -869,7 +869,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 ### BUG-015 — CheckThenInsertIdempotencyTest's BUG-013 regression test counted one server arrival, not two, on main
 
 - **Found:** 2026-11-16 17:44 · M5 · after PR #68 (T3) merged · branch `main`
-- **Status:** open
+- **Status:** fixed
 - **Component:** ledger-api tests (`negativecontrols/CheckThenInsertIdempotencyTest.twoRequestsInTheHandlerAtOnceAlwaysDuplicate`; the arrival recorder `ServerArrivals` it reads)
 - **Property / invariant touched:** P2's proof evidence (D-133's deterministic regression test for BUG-013). Production behaviour is not implicated: both requests returned 201 and the naive controller produced 2 TRANSFER transactions, which is the duplicate the control exists to show. Only the server-arrival count was wrong.
 - **Symptom:** ledger-api CI failed on `main` at `7753dda` (PR #68's squash; run 43989828650, CI #156, attempt 1, job 133727272163). 626 of 627 tests passed; the settlement-worker job passed. The same test passed on every earlier retained CI run since PR #64 added it. In the same class, `naiveIdempotencyLetsDuplicatesThrough` passed (round 1: overlap 12, 7 transactions).
@@ -902,10 +902,10 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 - **Root cause:** `ServerArrivals`' filter writes each request's record in its `finally`, after `chain.doFilter` returns, by which time the response can already have reached the client. The test read `arrivals.overlap(key, …)` as soon as A's response arrived; A's `finally` hadn't run yet, so only B's record existed and "arrived before the first completion" counted 1. Every overlap reader in the harness had the same race; the 100-request rounds just made a missing record rarer to matter.
 - **Why it wasn't caught earlier:** the `finally` almost always wins the race against the client's next statement: 26 of 27 retained CI attempts of this test recorded both arrivals. Nothing checked that a reader saw a record for every request it sent, and the summary lines didn't print the record count.
 - **Fix:** in the readers, not the record point (completion is stamped after the response is written, so an earlier record would only trade missing entries for half-done ones). `overlap(keys, expectedRequests, seenPorts)` waits, bounded at 5 s (Awaitility, already on the test classpath through spring-boot-starter-test), until exactly `expectedRequests` records carry those keys; too few fails with "arrival records missing: got X of Y", too many fails too (a request recorded twice is a harness bug). Every caller passes the count it sent: ConcurrentIdempotentTransferTest, OppositeTransfersNoDeadlockTest, ConcurrentIdempotentPaymentTest, PaymentAuthorizeLockOrderTest and CheckThenInsertIdempotencyTest (rounds, warm-ups and the regression test). Every overlap summary line prints `requests=<n>`.
-  - **Commits:** on `m5/bug-015-arrival-recorded-late` (squash SHA to follow after merge).
+  - **Commits:** `6944070` (the readers) on `m5/bug-015-arrival-recorded-late` · PR #71, squash-merged to `main` as `5038914`.
 - **Regression test:** `CheckThenInsertIdempotencyTest.twoRequestsInTheHandlerAtOnceAlwaysDuplicate` (`services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/negativecontrols/`).
   - **Red before:** CI run 43989828650 (`7753dda`): 1 of 2; locally with the 200 ms mutation: 0 of 2 (above).
-  - **Green after:** with the mutation still in place and the fix applied: `CONCURRENCY control regression serverArrivedBeforeFirstCompletion=2 requests=2 transactions=2`, passing (the reader waited). Mutation removed: the five overlap classes at default rounds all pass with `requests=` equal to the number sent (100, 100, 2, 60, 75). CI evidence to follow after merge.
+  - **Green after:** with the mutation still in place and the fix applied: `CONCURRENCY control regression serverArrivedBeforeFirstCompletion=2 requests=2 transactions=2`, passing (the reader waited). Mutation removed: the five overlap classes at default rounds all pass with `requests=` equal to the number sent (100, 100, 2, 60, 75). CI: PR #71's run 44001636141 on `6944070` and `main` run 44003553552 on `5038914` both printed `serverArrivedBeforeFirstCompletion=2 requests=2 transactions=2`.
 - **Decision Log impact:** none (D-067's instrument, fixed). Published overlap figures can only have been undercounted by a missing record, so no Measured-numbers change; the calibrated floors stay conservative (D-106).
 - **Summary (one sentence):** the arrival recorder writes each record after the response can reach the client, so a reader that ran right after its last response could miss a record; readers now wait for exactly the number of requests they sent and print it.
 - **Notes:**
@@ -934,12 +934,24 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
   [ERROR] Tests run: 627, Failures: 0, Errors: 7, Skipped: 0
   ```
 - **How detected:** the full local verify for BUG-015 (i5-1240P, 16 logical CPUs, Windows 11, Docker Desktop), run in the background; log read and this entry opened at 2026-11-17 02:10. RedisClientSmokeTest passed in every earlier run: the local verifies for T2, T3 and the BUG-014 branch, and every CI run since PR #67.
-- **Reproduction:** not attempted yet.
-- **Time to diagnose:** open.
-- **Root cause:** not yet established. Hypothesis to test (unverified): `EmptyRedis` builds its client with `RedisGateway.redisUri(...)`, so its handshake is bounded by the production 100 ms command timeout (D-137). That bound is meant for request paths that must never wait on Redis, not for a harness readiness probe run right after the container starts. The first connection through Docker Desktop's published port on Windows, under a full verify's load, can take longer than 100 ms. `localhost` may also resolve to `::1` first on Windows (the worker harness maps it to 127.0.0.1 for that reason; `support/stack.py` `_host`).
-- **Why it wasn't caught earlier:** open.
-- **Fix:** open.
-- **Regression test:** open.
-- **Decision Log impact:** open.
-- **Summary (one sentence):** open.
-- **Notes:** none yet.
+- **Reproduction:** deterministic, without load: `EmptyRedisProbeTest` starts the context's container (`RedisTestcontainersConfiguration.redisContainer()`), pauses it through Testcontainers' Docker client, schedules the unpause after 500 ms and constructs `EmptyRedis`. A paused container still completes the TCP handshake but doesn't answer HELLO, which is the reported failure. On `main`'s `EmptyRedis`:
+  ```
+  [ERROR] dev.aryanyeole.ledgerapi.EmptyRedisProbeTest.emptyCheckWaitsOutASlowFirstConnection -- Time elapsed: 9.287 s <<< ERROR!
+  io.lettuce.core.RedisConnectionException: Unable to connect to localhost/<unresolved>:53897
+  Caused by: io.lettuce.core.RedisCommandTimeoutException: Connection initialization timed out after 100 millisecond(s)
+  ```
+- **Time to diagnose:** opened 02:10 with a hypothesis; the deterministic reproduction above confirmed the failing step the next session.
+- **Root cause:** `EmptyRedis` built its client with `RedisGateway.redisUri(...)`, so its first handshake to a just-started container ran under the production 100 ms initialization budget (D-137), and under a full verify's load that handshake took longer. The reproduction shows the class (any first handshake slower than 100 ms fails the context); the original trigger, machine load or Docker Desktop's port forwarding on Windows, is unverified. `RedisClientSmokeTest` had two more exposures of the same kind: `raw()` used the same URI against fresh containers, and the gateway-based tests called the gateway with no warm-up, so one slow first connect (which also opens the 1 s bypass) could fail several tests at once.
+- **Why it wasn't caught earlier:** the first handshake to a local container normally completes well inside 100 ms; every earlier local verify and every CI run since PR #67 passed. Borrowing the gateway's production timeout for a harness readiness probe looked like reuse, not a bound.
+- **Fix:** test sources only.
+  - `EmptyRedis` builds its own URI (`RedisTestcontainersConfiguration.patientUri`: database 0, 5 s timeout, which also bounds the handshake) and retries connect + DBSIZE every 200 ms until a 30 s deadline, failing with the last exception. The `DBSIZE = 0` check (D-138) is unchanged.
+  - `RedisClientSmokeTest.raw()` uses the same patient URI with the gateway's `clientOptions()`. A one-off probe showed the handshake is bounded by the URI timeout, not `TimeoutOptions`: patient URI (5 s) + `clientOptions()` (`TimeoutOptions` 100 ms) waited out a 500 ms pause and connected (`PING PONG; DBSIZE 0`), so the RESP3 assertion still exercises the gateway's real client options. Recorded in docs/design/cache-invalidation.md §2.3.
+  - `RedisTestSupport.awaitGatewayReady(gateway)` polls a gateway read until it's available, bounded at 10 s (riding out bypass windows), failing with "gateway never connected"; `RedisClientSmokeTest` calls it in a `@BeforeEach`. T4's cache-on tests reuse it.
+  - **Commits:** on `m5/bug-016-empty-redis-probe` (squash SHA to follow after merge).
+- **Regression test:** `EmptyRedisProbeTest.emptyCheckWaitsOutASlowFirstConnection` (`services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/`).
+  - **Red before:** the full local verify above (`RedisClientSmokeTest` context, 7 errors), and the reproduction on `main`'s `EmptyRedis` (above).
+  - **Green after:** `EMPTY_REDIS_PROBE paused 500 ms, check passed after 548 ms`; `RedisClientSmokeTest` 7 of 7. The gateway warm-up has no red of its own beyond this one.
+- **Decision Log impact:** none. D-137's 100 ms budget stays a production choice; the harness no longer borrows it.
+- **Summary (one sentence):** the test Redis's empty check borrowed the gateway's 100 ms production timeout for its first handshake and failed the context when that handshake was slow; harness connections now use a patient 5 s URI with retries, and gateway-based tests warm the gateway first.
+- **Notes:**
+  - **Diagnosis:** "Connection initialization timed out" means TCP had connected; Lettuce starts that timer only once the channel is active. A `localhost` → `::1` failure would show as connection refused, not this, and the reproduction gives the same signature on the connected path, so the probe keeps `getHost()` and doesn't switch to 127.0.0.1.
