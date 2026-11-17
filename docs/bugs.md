@@ -849,8 +849,10 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 - **Time to diagnose:** see the times under How detected; the local reproduction and the comparison against other CI runs were done before this entry was opened.
 - **Root cause:** a floor taken from a 35-observation minimum (11) isn't a lower bound on a shared 4-CPU runner. The miss is a timing tail, not a harness or code defect: the correctness assertions all held, and the same round's requests did reach the server concurrently (clientSentBeforeFirst=47), they just reached the server's arrival filter after the owner had finished.
 - **Why it wasn't caught earlier:** D-106 derives each floor from that test's CI minimum, which can only rise as a calibration until a run goes lower. This test's 35 calibration observations and every later run stayed at or above 11; the first value below 6 is this one.
-- **Fix:** re-derive the floor per D-106 from the test's full retained CI history plus this observation: max(2, ⌊0.6 × min⌋). With min 2 the floor is 2. The other three tripwire tests' floors are unchanged (D-106 re-derives only the test that missed).
-  - **Commits:** (PR to follow on branch `m5/bug-014-payment-overlap-floor`)
+- **Fix:** re-derive the floor per D-106 from the test's full retained CI history plus this observation: max(2, ⌊0.6 × min⌋). The other three tripwire tests' floors are unchanged (D-106 re-derives only the test that missed).
+  - **History:** 125 observations, every retained run attempt from run 39212739781 (2026-10-19, the test's first CI run) to 2026-11-17, 94 runs, read per attempt (`gh run view <run> --attempt <n> --log`, BUG-013). min 2 (this run), then 6 (run 41762981604 attempt 1, main `72e2829`, 2026-11-04, which met the old floor exactly), 7, 7, 8; median 18; max 67. The 80 earlier run attempts predate the test; every attempt since has an observation. Per-attempt list: `docs/evidence/bug-014-payment-overlap-history.txt`.
+  - **Floor:** max(2, ⌊0.6 × 2⌋) = 2, recorded with n, the minimum and the runs beside the constant.
+  - **Commits:** branch `m5/bug-014-payment-overlap-floor` (squash SHA to follow after merge)
 - **Regression test:** `ConcurrentIdempotentPaymentTest` (`services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/`).
   - **Red before:** CI run 43970789309 attempt 1 (`8d7e4b0`): overlap 2 < floor 6.
   - **Green after:** the re-derived floor's CI runs (to be filled in after merge). No synthetic test.

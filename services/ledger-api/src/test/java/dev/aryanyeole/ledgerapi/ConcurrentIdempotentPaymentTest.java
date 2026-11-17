@@ -41,10 +41,13 @@ import dev.aryanyeole.ledgerapi.api.EdgeProbe;
 class ConcurrentIdempotentPaymentTest {
 
 	// D-106 tripwire floor = max(2, floor(0.6 x CI min)) over this test's own CI history, 4-processor
-	// ubuntu-24.04 runners: n = 35, i.e. 25 observations from 21 retained runs (2026-10-19..20) plus
-	// 10 fresh (PR #37: run 39383847328 attempts 1-6, run 39493178184 attempts 1-4). Minimum 11 (run 39388756885 attempt 2, run 39383847328 attempt 6), so 6. A miss is
-	// logged as a bug and the floor re-derived from the full history.
-	private static final int MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION = 6;
+	// ubuntu-24.04 runners. Re-derived after BUG-014 (a miss at 2 against the earlier floor of 6, which
+	// came from n = 35, minimum 11, PR #37): n = 125, every retained run attempt from run 39212739781
+	// (2026-10-19, the test's first CI run) to 2026-11-17, 94 runs. Minimum 2 (run 43970789309
+	// attempt 1, BUG-014), next lowest 6 (run 41762981604 attempt 1), so 2. The per-attempt history is
+	// docs/evidence/bug-014-payment-overlap-history.txt. A miss is logged as a bug and the floor
+	// re-derived from the full history.
+	private static final int MIN_SERVER_ARRIVED_BEFORE_FIRST_COMPLETION = 2;
 
 	@LocalServerPort
 	int port;
