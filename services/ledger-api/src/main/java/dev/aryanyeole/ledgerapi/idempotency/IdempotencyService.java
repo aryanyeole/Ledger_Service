@@ -5,6 +5,7 @@ import java.security.MessageDigest;
 import java.util.Optional;
 import java.util.function.Supplier;
 
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.dao.DataAccessException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -36,6 +37,13 @@ import dev.aryanyeole.ledgerapi.db.WriteTransactions;
 //     verbatim; the transaction wrote nothing and is rolled back.
 // Owner and replays send the same bytes because both come from response_body::text: JSONB
 // normalizes key order and whitespace, so the app's own serialization would differ (D-044).
+//
+// The Redis fast path (D-139), only when the IdempotencyCache bean exists: a cache read after the
+// fingerprint and before the transaction (a hit with a matching fingerprint returns the stored
+// status and text, no DB access); after the transaction has ended normally, the owner's and a
+// replay's text is cached if the DB says the row outlives ttl + margin. An exception out of the
+// transaction caches nothing. Both Redis calls run outside any transaction (invariant 5); the
+// gateway refuses otherwise (D-149). Without the bean there is no Redis call at all.
 @Service
 public class IdempotencyService {
 
@@ -43,37 +51,68 @@ public class IdempotencyService {
 
 	private static final MediaType PROBLEM_JSON = MediaType.APPLICATION_PROBLEM_JSON;
 
+	// The row outlives the fast-path TTL plus its margin, measured by the DB in the statement that
+	// returns the text (D-139): durations only, so no clock is compared across hosts.
+	private static final String CACHEABLE = "(expires_at - clock_timestamp()) > (:minLifeMs * interval '1 millisecond') AS cacheable";
+
 	private final WriteTransactions transactions;
 
 	private final JdbcClient jdbc;
 
 	private final JsonMapper json;
 
-	IdempotencyService(WriteTransactions transactions, JdbcClient jdbc, JsonMapper json) {
+	private final IdempotencyCache cache;
+
+	private final IdempotencyFaultHook faultHook;
+
+	private final long minLifeMillis;
+
+	IdempotencyService(WriteTransactions transactions, JdbcClient jdbc, JsonMapper json,
+			ObjectProvider<IdempotencyCache> cache, IdempotencyFaultHook faultHook,
+			LedgerIdempotencyCacheProperties cacheProperties) {
 		this.transactions = transactions;
 		this.jdbc = jdbc;
 		this.json = json;
+		this.cache = cache.getIfAvailable();
+		this.faultHook = faultHook;
+		this.minLifeMillis = cacheProperties.minLifeMillis();
 	}
 
 	/** What an owning request decided: the status and the body to store. */
 	public record Outcome(HttpStatus status, Object body) {
 	}
 
-	private record Stored(int status, String body) {
+	// cacheable: the DB found expires_at - clock_timestamp() > ttl + margin in the statement that
+	// returned the text (no clock is read here).
+	private record Stored(int status, String body, byte[] requestHash, boolean cacheable) {
 	}
 
-	private record KeyRow(byte[] requestHash, int status, String body) {
+	private record KeyRow(byte[] requestHash, int status, String body, boolean cacheable) {
 	}
 
 	public ResponseEntity<String> execute(String clientId, String key, String method, String route, Object request,
 			Supplier<Outcome> operation) {
 		byte[] requestHash = Fingerprint.of(method, route, request);
+		if (this.cache != null) {
+			IdempotencyCache.Lookup lookup = this.cache.read(clientId, key, requestHash);
+			if (lookup.result() == IdempotencyCache.ReadResult.HIT) {
+				return response(lookup.status(), lookup.text());
+			}
+		}
 		Stored stored = this.transactions
 			.execute((status) -> claimOrReplay(status, clientId, key, route, requestHash, operation));
-		HttpStatus httpStatus = HttpStatus.valueOf(stored.status());
+		if (this.cache != null) {
+			this.cache.populate(clientId, key, stored.requestHash(), stored.status(), stored.body(),
+					stored.cacheable());
+		}
+		return response(stored.status(), stored.body());
+	}
+
+	private static ResponseEntity<String> response(int status, String body) {
+		HttpStatus httpStatus = HttpStatus.valueOf(status);
 		return ResponseEntity.status(httpStatus)
 			.contentType(httpStatus.is2xxSuccessful() ? JSON : PROBLEM_JSON)
-			.body(stored.body());
+			.body(body);
 	}
 
 	private Stored claimOrReplay(TransactionStatus status, String clientId, String key, String route,
@@ -81,14 +120,15 @@ public class IdempotencyService {
 		// One retry: the conflicting row can only vanish once M4 purges expired keys (D-020).
 		for (int attempt = 0; attempt < 2; attempt++) {
 			if (claim(clientId, key, requestHash)) {
-				return runAndStore(status, clientId, key, route, operation);
+				return runAndStore(status, clientId, key, route, requestHash, operation);
 			}
 			Optional<KeyRow> row = this.jdbc
-				.sql("SELECT request_hash, status_code, response_body::text FROM idempotency_keys "
-						+ "WHERE client_id = :client AND key = :key")
+				.sql("SELECT request_hash, status_code, response_body::text, " + CACHEABLE
+						+ " FROM idempotency_keys WHERE client_id = :client AND key = :key")
 				.param("client", clientId)
 				.param("key", key)
-				.query((rs, rowNum) -> new KeyRow(rs.getBytes(1), rs.getInt(2), rs.getString(3)))
+				.param("minLifeMs", this.minLifeMillis)
+				.query((rs, rowNum) -> new KeyRow(rs.getBytes(1), rs.getInt(2), rs.getString(3), rs.getBoolean(4)))
 				.optional();
 			if (row.isEmpty()) {
 				continue;
@@ -98,7 +138,7 @@ public class IdempotencyService {
 						"This Idempotency-Key was already used with a different request.");
 			}
 			status.setRollbackOnly();
-			return new Stored(row.get().status(), row.get().body());
+			return new Stored(row.get().status(), row.get().body(), requestHash, row.get().cacheable());
 		}
 		throw new IllegalStateException("idempotency key conflicted but its row was missing twice");
 	}
@@ -123,7 +163,7 @@ public class IdempotencyService {
 	}
 
 	private Stored runAndStore(TransactionStatus status, String clientId, String key, String route,
-			Supplier<Outcome> operation) {
+			byte[] requestHash, Supplier<Outcome> operation) {
 		Object savepoint = status.createSavepoint();
 		HttpStatus outcomeStatus;
 		String body;
@@ -140,16 +180,19 @@ public class IdempotencyService {
 			outcomeStatus = ex.status();
 			body = this.json.writeValueAsString(problem);
 		}
-		String text = this.jdbc
+		int storedStatus = outcomeStatus.value();
+		Stored stored = this.jdbc
 			.sql("UPDATE idempotency_keys SET status_code = :status, response_body = :body::jsonb "
-					+ "WHERE client_id = :client AND key = :key RETURNING response_body::text")
-			.param("status", outcomeStatus.value())
+					+ "WHERE client_id = :client AND key = :key RETURNING response_body::text, " + CACHEABLE)
+			.param("status", storedStatus)
 			.param("body", body)
 			.param("client", clientId)
 			.param("key", key)
-			.query(String.class)
+			.param("minLifeMs", this.minLifeMillis)
+			.query((rs, rowNum) -> new Stored(storedStatus, rs.getString(1), requestHash, rs.getBoolean(2)))
 			.single();
-		return new Stored(outcomeStatus.value(), text);
+		this.faultHook.afterStoreBeforeCommit(clientId, key);
+		return stored;
 	}
 
 }

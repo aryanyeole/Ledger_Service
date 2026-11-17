@@ -80,7 +80,7 @@ commands across connections. Both orders are safe for the compare-and-set (§4.2
 late worker invalidation serves the old value: the ordinary commit-to-invalidation window, stretched by the pause and
 bounded by the value TTL (§5 row 2c).
 
-### 1.6 Never inside a DB transaction (CLAUDE.md invariant 5, D-147)
+### 1.6 Never inside a DB transaction (CLAUDE.md invariant 5, D-147, D-149)
 
 Redis is a network call, and invariant 5 names it: "In ledger-api, Redis calls run only outside a transaction: on a
 write path, before WriteTransactions opens one or after its TransactionTemplate.execute has returned (D-147)."
@@ -92,8 +92,18 @@ Placement in ledger-api:
   (committed, connection back in the pool), never after a rollback, with no transaction synchronization active (D-147).
 - The idempotency populate runs after `WriteTransactions.execute` has returned.
 
-Spring runs `TransactionSynchronization.afterCommit` before it releases the connection **(verify in T6)**, which is why
-D-147 rejects it: a Redis call there would hold a pooled connection for up to the command timeout on every posting.
+Spring runs `TransactionSynchronization.afterCommit` before it releases the connection, which is why D-147 rejects it:
+a Redis call there would hold a pooled connection for up to the command timeout on every posting. Verified in T4 from
+the spring-tx 7.0.9 source (`AbstractPlatformTransactionManager.processCommit`): `triggerAfterCommit` and
+`triggerAfterCompletion` run first, and only the outer `finally`'s `cleanupAfterCompletion` calls
+`TransactionSynchronizationManager.clear()` (which removes the actual-transaction-active flag) and then
+`doCleanupAfterCompletion` (which releases the connection).
+
+**Enforced in code (D-149):** `RedisGateway.optional()` and `always()` throw `IllegalStateException` while
+`TransactionSynchronizationManager.isActualTransactionActive()` is true, before any Redis call and outside the
+failure-to-miss handling. Because that flag stays set through `afterCommit`, the guard rejects the afterCommit placement
+too. T6's and T7's afterCommit check is therefore the gateway's guard (`RedisGatewayTest` runs a real
+`TransactionTemplate` and its `afterCommit`); T7 can still assert it end to end.
 
 In the worker: the invalidation runs after the settle transaction's `async with conn.transaction()` block has exited;
 the lease `SET` runs before the snapshot transaction opens.
@@ -618,10 +628,10 @@ docker compose exec redis redis-cli --scan --pattern "ledger:v1:bal:*" | Select-
 
 | # | Claim | Where | Task |
 |---|---|---|---|
-| 1 | Spring runs `TransactionSynchronization.afterCommit` before it releases the connection (quote `AbstractPlatformTransactionManager` from the Spring Framework 7 source jar) | §1.6 | T6 |
 | 6 | k6 2.3.0 supports BigInt | §8.3 | T14 |
 
-Claims 2–5 were verified in T2 (PR body): `RedisClient.connect()` throws while Redis is down (§5 row 6); Lettuce's
+Claim 1 (Spring runs `afterCommit` before it releases the connection, and the actual-transaction-active flag is still
+set there) was verified in T4 from the spring-tx 7.0.9 source (§1.6, D-149). Claims 2–5 were verified in T2 (PR body): `RedisClient.connect()` throws while Redis is down (§5 row 6); Lettuce's
 reference guide on shared connections and transactions (§2.2); the invalidation script under `noeviction` (§2.1,
 §5 row 12); redis-py 8.1.0 retries `ConnectionError` and `TimeoutError` 10 times with exponential backoff by default,
 so the worker's client sets retries to 0 (D-137, `test_redis_client.py`).

@@ -12,6 +12,7 @@ import java.util.function.Supplier;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import io.lettuce.core.ClientOptions;
 import io.lettuce.core.KeyValue;
@@ -38,6 +39,10 @@ import io.lettuce.core.api.sync.RedisCommands;
 //    populates and the lease. always() never bypasses on an established connection: invalidations.
 //  - Nothing escapes: every exception becomes Reply.unavailable(), logged as a WARN once per entry
 //    into the bypass, with the command name and exception type only, never a key or value.
+//  - Never inside a DB transaction (invariant 5, D-149): optional() and always() throw
+//    IllegalStateException while a Spring transaction is active, before any Redis call and outside
+//    the failure-to-miss handling, so a misplaced call fails loudly. Spring keeps the flag set until
+//    cleanup after completion, so this also rejects TransactionSynchronization.afterCommit (D-147).
 public class RedisGateway implements AutoCloseable {
 
 	private static final Logger log = LoggerFactory.getLogger(RedisGateway.class);
@@ -129,6 +134,7 @@ public class RedisGateway implements AutoCloseable {
 
 	/** Reads, populates and the lease: unavailable while the bypass is active. */
 	public <T> Reply<T> optional(String command, Function<RedisOps, T> call) {
+		refuseInsideTransaction();
 		if (bypassing(this.nanoClock.getAsLong())) {
 			return Reply.unavailable();
 		}
@@ -137,7 +143,14 @@ public class RedisGateway implements AutoCloseable {
 
 	/** Invalidations: never bypassed on an established connection. */
 	public <T> Reply<T> always(String command, Function<RedisOps, T> call) {
+		refuseInsideTransaction();
 		return run(command, call);
+	}
+
+	private static void refuseInsideTransaction() {
+		if (TransactionSynchronizationManager.isActualTransactionActive()) {
+			throw new IllegalStateException("Redis call inside a DB transaction (invariant 5, D-149)");
+		}
 	}
 
 	private <T> Reply<T> run(String command, Function<RedisOps, T> call) {
