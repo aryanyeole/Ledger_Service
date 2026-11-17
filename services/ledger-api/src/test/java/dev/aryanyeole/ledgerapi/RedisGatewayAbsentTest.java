@@ -19,10 +19,11 @@ import io.lettuce.core.api.StatefulRedisConnection;
 
 import dev.aryanyeole.ledgerapi.cache.LedgerRedisProperties;
 import dev.aryanyeole.ledgerapi.cache.RedisGateway;
+import dev.aryanyeole.ledgerapi.idempotency.IdempotencyCache;
 
 // No test context has a Redis client unless it opts in (D-137, D-138): the test
-// application.properties turns both cache switches off, so there is no gateway and ledger.redis.url
-// isn't bound. Same annotations as OutboxRelayAbsentTest, so this reuses that cached context. The
+// application.properties turns both cache switches off, so there is no gateway, no idempotency
+// cache (every existing test stays on the DB path, D-139) and ledger.redis.url isn't bound. Same annotations as OutboxRelayAbsentTest, so this reuses that cached context. The
 // main config, read directly, turns both caches on and reads the URL from REDIS_URL.
 @Import(TestcontainersConfiguration.class)
 @SpringBootTest
@@ -37,7 +38,7 @@ class RedisGatewayAbsentTest {
 	@Test
 	void noRedisBeansWithoutOptIn() {
 		for (Class<?> type : List.of(RedisGateway.class, LedgerRedisProperties.class, RedisClient.class,
-				StatefulRedisConnection.class)) {
+				StatefulRedisConnection.class, IdempotencyCache.class)) {
 			assertThat(this.context.getBeanNamesForType(type)).as("beans of type %s", type.getSimpleName()).isEmpty();
 		}
 		assertThat(this.environment.getProperty("ledger.cache.idempotency.enabled")).isEqualTo("false");

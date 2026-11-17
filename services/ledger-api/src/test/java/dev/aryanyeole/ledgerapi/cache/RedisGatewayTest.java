@@ -1,6 +1,8 @@
 package dev.aryanyeole.ledgerapi.cache;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -13,6 +15,12 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.AbstractPlatformTransactionManager;
+import org.springframework.transaction.support.DefaultTransactionStatus;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import dev.aryanyeole.ledgerapi.cache.RedisGateway.Reply;
 
@@ -186,6 +194,73 @@ class RedisGatewayTest {
 		assertThat(holder[0].always("EVAL", (r) -> "ok")).isEqualTo(Reply.of("ok"));
 		assertThat(nested).containsExactly(Reply.unavailable(), Reply.unavailable());
 		assertThat(attempts).hasValue(1);
+	}
+
+	// D-149: no Redis call while a Spring transaction is active, checked before any Redis work and
+	// outside the failure-to-miss handling; afterCommit still counts as inside (Spring clears the flag
+	// only in cleanup after completion).
+	@Test
+	void optionalAndAlwaysRefuseWhileATransactionIsActiveAndMakeNoRedisCall() {
+		RedisGateway gateway = connectedGateway();
+		TransactionSynchronizationManager.setActualTransactionActive(true);
+		try {
+			assertThatIllegalStateException().isThrownBy(() -> gateway.optional("GET", (r) -> r.get("k")))
+				.withMessage("Redis call inside a DB transaction (invariant 5, D-149)");
+			assertThatIllegalStateException().isThrownBy(() -> gateway.always("EVAL", (r) -> r.get("k")))
+				.withMessage("Redis call inside a DB transaction (invariant 5, D-149)");
+		}
+		finally {
+			TransactionSynchronizationManager.clear();
+		}
+		assertThat(this.connects).as("no connect attempt").hasValue(0);
+		assertThat(this.ops.calls).as("no Redis call").isZero();
+		assertThat(gateway.optional("GET", (r) -> r.get("k")).available()).as("outside a transaction").isTrue();
+	}
+
+	@Test
+	void aRealTransactionAndItsAfterCommitCallbackAreRefusedAndTheCallAfterExecuteRuns() {
+		RedisGateway gateway = connectedGateway();
+		TransactionTemplate template = new TransactionTemplate(new StubTransactionManager());
+		List<Throwable> refused = new ArrayList<>();
+		template.executeWithoutResult((status) -> {
+			refused.add(catchThrowable(() -> gateway.optional("GET", (r) -> r.get("k"))));
+			TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+
+				@Override
+				public void afterCommit() {
+					refused.add(catchThrowable(() -> gateway.always("EVAL", (r) -> r.get("k"))));
+				}
+
+			});
+		});
+		assertThat(refused).hasSize(2).allSatisfy((thrown) -> assertThat(thrown)
+			.isInstanceOf(IllegalStateException.class)
+			.hasMessage("Redis call inside a DB transaction (invariant 5, D-149)"));
+		assertThat(this.ops.calls).as("no Redis call inside the transaction or its afterCommit").isZero();
+		assertThat(gateway.always("EVAL", (r) -> r.get("k")).available()).as("after execute has returned").isTrue();
+	}
+
+	// A transaction manager with no resource: enough for TransactionTemplate to run Spring's real
+	// begin/commit/synchronization sequence in a unit test.
+	private static final class StubTransactionManager extends AbstractPlatformTransactionManager {
+
+		@Override
+		protected Object doGetTransaction() {
+			return new Object();
+		}
+
+		@Override
+		protected void doBegin(Object transaction, TransactionDefinition definition) {
+		}
+
+		@Override
+		protected void doCommit(DefaultTransactionStatus status) {
+		}
+
+		@Override
+		protected void doRollback(DefaultTransactionStatus status) {
+		}
+
 	}
 
 	private static final class FakeOps implements RedisOps {
