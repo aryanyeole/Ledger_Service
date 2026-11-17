@@ -30,6 +30,7 @@
 | BUG-011 | 2026-11-02 16:12 | M4 | Failure-mode setups that publish until a payment lands on a chosen partition give up after a fixed 12 or 15 tries, so a correct run fails about 0.7% of the time | none (component: settlement-worker tests) | fixed | 873c84e (PR #57) |
 | BUG-012 | 2026-11-02 18:51 | M4 | ledger-api's startup hung after "Root WebApplicationContext: initialization completed", before Flyway's first database line, through a 120 s health wait | none observed (component: ledger-api startup; seen through the settlement-worker test stack) | fixed | 5d7e331 (PR #59) |
 | BUG-013 | 2026-11-03 19:23 | M4 | CheckThenInsertIdempotencyTest's round produced one transfer on CI, so the D-017 control failed its overlap check against a correct system | P2 proof evidence, D-067 (component: ledger-api tests) | fixed | d1a787e (PR #64; squash SHA to follow) |
+| BUG-014 | 2026-11-16 15:33 | M5 | ConcurrentIdempotentPaymentTest misses its D-106 server-overlap floor on CI | P2 proof evidence, D-067/D-106 (component: ledger-api tests) | open | — |
 
 ---
 
@@ -814,3 +815,45 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
     Attempts 1–3 and 5 of that run passed. It is the same defect, recorded here rather than as a separate entry.
   - **A collection error, corrected.** The first pass over the history used `gh run view --job <id> --log`. That reads the run's latest attempt's log archive, so every attempt of a re-run run showed its last attempt's line: for example, attempts 1–9 of `41610244246` all showed attempt 10's n = 1. Per-attempt logs need `gh run view <run> --attempt <n> --log`. The tables above and the evidence file come from that second pass.
   - **After the fix, locally** (on `f35d42c`; `d1a787e` changes only the armed key's signal, and the control's rounds arm no key): 200 rounds plus the regression test, `Tests run: 201, Failures: 0` (i5-1240P, 16 logical CPUs, Windows 11). n per round: min 2, median 11, max 26. One round had n = 2: `round=31 … serverArrivedBeforeFirstCompletion=89 arrivalSpreadMs=151 … transactions=2 distinctBodies=3`.
+
+---
+
+### BUG-014 — ConcurrentIdempotentPaymentTest misses its D-106 server-overlap floor on CI
+
+- **Found:** 2026-11-16 15:33 · M5 · Task T3 · branch `m5/t3-idempotency-immutable`
+- **Status:** open
+- **Component:** ledger-api tests (`ConcurrentIdempotentPaymentTest.hundredIdenticalAuthorizesCreateOnePayment`)
+- **Property / invariant touched:** P2's proof evidence (the D-067/D-106 tripwire against a serialized harness). Production behaviour is not implicated: in the failing round all 100 authorizes returned 201, there was exactly 1 payment and 1 authorize posting, and every response body was identical.
+- **Symptom:** ledger-api CI failed on PR #68 head `8d7e4b0` (run 43970789309, attempt 1, job 133662081245): ConcurrentIdempotentPaymentTest round 1, server overlap 2 < floor 6. 626 of 627 tests passed; the settlement-worker job passed. The same CI run's warm-up round reached 11. The failure is in the overlap tripwire only; every correctness assertion of the round held.
+  ```
+  CONCURRENCY payments warmup serverArrivedBeforeFirstCompletion=11 connections=32
+  CONCURRENCY payments round=1 processors=4 serverArrivedBeforeFirstCompletion=2 arrivalSpreadMs=77 clientSentBeforeFirst=47 payments=1 authorizes=1 distinctBodies=1 statuses={201=100}
+  [ERROR] dev.aryanyeole.ledgerapi.ConcurrentIdempotentPaymentTest.hundredIdenticalAuthorizesCreateOnePayment()[1] -- Time elapsed: 0.145 s <<< FAILURE!
+  java.lang.AssertionError:
+  [round 1: requests that arrived at the server before the first completed (was 2)]
+  Expecting actual:
+    2
+  to be greater than or equal to:
+    6
+  	at dev.aryanyeole.ledgerapi.ConcurrentIdempotentPaymentTest.round(ConcurrentIdempotentPaymentTest.java:139)
+  [ERROR] Tests run: 627, Failures: 1, Errors: 0, Skipped: 0
+  ```
+- **How detected:** CI on PR #68 (T3, V16 `idempotency_keys_immutable`): https://github.com/aryanyeole/Ledger_Service/actions/runs/43970789309/job/133662081245. Runner: GitHub-hosted `ubuntu-24.04`, image version 20261111.370.1 (runner 20261103.629), `processors=4` from the test's config line; the ledger-api job doesn't log the CPU model (open issue). The time above is the failed job's completion (22:33:21 UTC); the log was read and this entry opened at 2026-11-17 00:24.
+  - It was first treated as T3's own defect (D-131). It isn't: the failing line is the floor in a test already on `main`, and D-106 says a floor miss is logged. T3's change (one trigger call on the owner's key store) costs microseconds against a 77 ms arrival spread; recent CI runs of this test without V16 reached 13–41, including 26 on the same image (run 43957357015) and 13 and 20 on image 20261111.127.1 (runs 43960810566, 43983586424).
+- **Reproduction:**
+  ```powershell
+  # Not reproduced locally (the floor is a CI-runner calibration). On 8d7e4b0, i5-1240P (16 logical CPUs), 20 rounds: overlap 66-100, all green.
+  cd services\ledger-api
+  .\mvnw.cmd test "-Dtest=ConcurrentIdempotentPaymentTest" "-Dledger.test.concurrency.rounds=20"
+  ```
+- **Time to diagnose:** see the times under How detected; the local reproduction and the comparison against other CI runs were done before this entry was opened.
+- **Root cause:** a floor taken from a 35-observation minimum (11) isn't a lower bound on a shared 4-CPU runner. The miss is a timing tail, not a harness or code defect: the correctness assertions all held, and the same round's requests did reach the server concurrently (clientSentBeforeFirst=47), they just reached the server's arrival filter after the owner had finished.
+- **Why it wasn't caught earlier:** D-106 derives each floor from that test's CI minimum, which can only rise as a calibration until a run goes lower. This test's 35 calibration observations and every later run stayed at or above 11; the first value below 6 is this one.
+- **Fix:** re-derive the floor per D-106 from the test's full retained CI history plus this observation: max(2, ⌊0.6 × min⌋). With min 2 the floor is 2. The other three tripwire tests' floors are unchanged (D-106 re-derives only the test that missed).
+  - **Commits:** (PR to follow on branch `m5/bug-014-payment-overlap-floor`)
+- **Regression test:** `ConcurrentIdempotentPaymentTest` (`services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/`).
+  - **Red before:** CI run 43970789309 attempt 1 (`8d7e4b0`): overlap 2 < floor 6.
+  - **Green after:** the re-derived floor's CI runs (to be filled in after merge). No synthetic test.
+- **Decision Log impact:** none (D-106 covers re-deriving a floor after a miss). Measured numbers' floors row changes at closeout.
+- **Summary (one sentence):** ConcurrentIdempotentPaymentTest's server overlap reached 2 on a shared 4-CPU runner against a floor of 6 taken from a 35-observation minimum of 11; the floor is re-derived from the full history per D-106.
+- **Notes:** none yet.
