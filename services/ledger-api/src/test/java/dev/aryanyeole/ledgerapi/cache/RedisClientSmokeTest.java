@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.function.Function;
 
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -21,6 +22,7 @@ import io.lettuce.core.SetArgs;
 import io.lettuce.core.api.StatefulRedisConnection;
 import io.lettuce.core.api.sync.RedisCommands;
 
+import dev.aryanyeole.ledgerapi.RedisTestSupport;
 import dev.aryanyeole.ledgerapi.RedisTestcontainersConfiguration;
 import dev.aryanyeole.ledgerapi.TestcontainersConfiguration;
 import dev.aryanyeole.ledgerapi.cache.RedisGateway.Reply;
@@ -40,9 +42,16 @@ class RedisClientSmokeTest {
 	@Autowired
 	GenericContainer<?> redisTestContainer;
 
+	@BeforeEach
+	void warmGateway() {
+		RedisTestSupport.awaitGatewayReady(this.gateway);
+	}
+
+	// A raw client for INFO, CLIENT INFO and the noeviction case: the harness's patient URI, which
+	// bounds the first connection's handshake at 5 s (BUG-016), with the gateway's real client options,
+	// so the protocol it negotiates is the one the gateway uses.
 	private static <T> T raw(GenericContainer<?> redis, Function<RedisCommands<String, String>, T> call) {
-		RedisClient client = RedisClient.create(RedisGateway.redisUri(redis.getHost(),
-				redis.getMappedPort(RedisTestcontainersConfiguration.PORT)));
+		RedisClient client = RedisClient.create(RedisTestcontainersConfiguration.patientUri(redis));
 		client.setOptions(RedisGateway.clientOptions());
 		try (StatefulRedisConnection<String, String> connection = client.connect()) {
 			return call.apply(connection.sync());
