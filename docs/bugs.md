@@ -31,6 +31,7 @@
 | BUG-012 | 2026-11-02 18:51 | M4 | ledger-api's startup hung after "Root WebApplicationContext: initialization completed", before Flyway's first database line, through a 120 s health wait | none observed (component: ledger-api startup; seen through the settlement-worker test stack) | fixed | 5d7e331 (PR #59) |
 | BUG-013 | 2026-11-03 19:23 | M4 | CheckThenInsertIdempotencyTest's round produced one transfer on CI, so the D-017 control failed its overlap check against a correct system | P2 proof evidence, D-067 (component: ledger-api tests) | fixed | d1a787e (PR #64; squash SHA to follow) |
 | BUG-014 | 2026-11-16 15:33 | M5 | ConcurrentIdempotentPaymentTest misses its D-106 server-overlap floor on CI | P2 proof evidence, D-067/D-106 (component: ledger-api tests) | open | — |
+| BUG-015 | 2026-11-16 17:44 | M5 | CheckThenInsertIdempotencyTest's BUG-013 regression test counted one server arrival, not two, on main | P2 proof evidence, D-133 (component: ledger-api tests, `ServerArrivals`) | open | — |
 
 ---
 
@@ -858,4 +859,36 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
   - **Green after:** the re-derived floor's CI runs (to be filled in after merge). No synthetic test.
 - **Decision Log impact:** none (D-106 covers re-deriving a floor after a miss). Measured numbers' floors row changes at closeout.
 - **Summary (one sentence):** ConcurrentIdempotentPaymentTest's server overlap reached 2 on a shared 4-CPU runner against a floor of 6 taken from a 35-observation minimum of 11; the floor is re-derived from the full history per D-106.
+- **Notes:** none yet.
+
+---
+
+### BUG-015 — CheckThenInsertIdempotencyTest's BUG-013 regression test counted one server arrival, not two, on main
+
+- **Found:** 2026-11-16 17:44 · M5 · after PR #68 (T3) merged · branch `main`
+- **Status:** open
+- **Component:** ledger-api tests (`negativecontrols/CheckThenInsertIdempotencyTest.twoRequestsInTheHandlerAtOnceAlwaysDuplicate`; the arrival recorder `ServerArrivals` it reads)
+- **Property / invariant touched:** P2's proof evidence (D-133's deterministic regression test for BUG-013). Production behaviour is not implicated: both requests returned 201 and the naive controller produced 2 TRANSFER transactions, which is the duplicate the control exists to show. Only the server-arrival count was wrong.
+- **Symptom:** ledger-api CI failed on `main` at `7753dda` (PR #68's squash; run 43989828650, CI #156, attempt 1, job 133727272163). 626 of 627 tests passed; the settlement-worker job passed. The same test passed on every earlier retained CI run since PR #64 added it. In the same class, `naiveIdempotencyLetsDuplicatesThrough` passed (round 1: overlap 12, 7 transactions).
+  ```
+  CONCURRENCY control regression serverArrivedBeforeFirstCompletion=1 transactions=2
+  CONCURRENCY control round=1 processors=4 serverArrivedBeforeFirstCompletion=12 arrivalSpreadMs=113 reusedConnections=78/78 clientSentBeforeFirst=41 peakInFlight=45 transactions=7 distinctBodies=8 statuses={201=100}
+  [ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 1.700 s <<< FAILURE! -- in dev.aryanyeole.ledgerapi.negativecontrols.CheckThenInsertIdempotencyTest
+  [ERROR] dev.aryanyeole.ledgerapi.negativecontrols.CheckThenInsertIdempotencyTest.twoRequestsInTheHandlerAtOnceAlwaysDuplicate -- Time elapsed: 0.079 s <<< FAILURE!
+  org.opentest4j.AssertionFailedError:
+  [both arrived before the first completed]
+  expected: 2
+   but was: 1
+  	at dev.aryanyeole.ledgerapi.negativecontrols.CheckThenInsertIdempotencyTest.twoRequestsInTheHandlerAtOnceAlwaysDuplicate(CheckThenInsertIdempotencyTest.java:99)
+  [ERROR] Tests run: 627, Failures: 1, Errors: 0, Skipped: 0
+  ```
+- **How detected:** CI on the push to `main` after PR #68 merged: https://github.com/aryanyeole/Ledger_Service/actions/runs/43989828650/job/133727272163. Runner: GitHub-hosted `ubuntu-24.04`, image version 20261111.127.1 (runner 20261103.629), `processors=4` from the control's config line. The time above is the failed job's completion (00:44:48 UTC); the log was read and this entry opened at 2026-11-17 01:00. The next push to `main` (`d71035f`, PR #70, run 43990876717) passed. `7753dda` changes no test or harness code that this test uses (V16 and DbRolePrivilegesTest / IdempotencyKeyCompletenessTest only), and the naive controller doesn't go through IdempotencyService.
+- **Reproduction:** not attempted yet.
+- **Time to diagnose:** open.
+- **Root cause:** not yet established. Hypothesis to test (unverified): `ServerArrivals`' filter records a request's arrival in a `finally` block after `chain.doFilter` returns, so the record lands after the response has been written to the client. The test reads `arrivals.overlap(key, …)` right after `first.get()` returns A's response; if A's filter hasn't run its `finally` yet, only B's arrival is in the list, and "arrived before the first completion" counts 1. The printed line doesn't include the round's request count, which would show this directly.
+- **Why it wasn't caught earlier:** open.
+- **Fix:** open.
+- **Regression test:** open.
+- **Decision Log impact:** open.
+- **Summary (one sentence):** open.
 - **Notes:** none yet.
