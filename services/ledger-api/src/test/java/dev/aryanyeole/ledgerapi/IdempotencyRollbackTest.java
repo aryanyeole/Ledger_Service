@@ -12,6 +12,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import javax.sql.DataSource;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
@@ -31,6 +32,8 @@ import dev.aryanyeole.ledgerapi.LedgerTestSupport.Totals;
 import dev.aryanyeole.ledgerapi.api.ApiKeyFilter;
 import dev.aryanyeole.ledgerapi.api.EdgeProbe;
 import dev.aryanyeole.ledgerapi.api.ProblemCode;
+import dev.aryanyeole.ledgerapi.db.WriteTransactions;
+import dev.aryanyeole.ledgerapi.posting.BalanceCacheInvalidator;
 import dev.aryanyeole.ledgerapi.posting.PostingService;
 
 // The key and the effect roll back together (invariant 7). A test override of PostingService
@@ -56,8 +59,9 @@ class IdempotencyRollbackTest {
 
 		@Bean
 		@Primary
-		FailingPostingService failingPostingService(JdbcClient jdbc) {
-			return new FailingPostingService(jdbc);
+		FailingPostingService failingPostingService(JdbcClient jdbc, WriteTransactions transactions,
+				ObjectProvider<BalanceCacheInvalidator> invalidator) {
+			return new FailingPostingService(jdbc, transactions, invalidator);
 		}
 
 	}
@@ -66,8 +70,9 @@ class IdempotencyRollbackTest {
 
 		final AtomicBoolean failNext = new AtomicBoolean();
 
-		FailingPostingService(JdbcClient jdbc) {
-			super(jdbc);
+		FailingPostingService(JdbcClient jdbc, WriteTransactions transactions,
+				ObjectProvider<BalanceCacheInvalidator> invalidator) {
+			super(jdbc, transactions, invalidator);
 		}
 
 		@Override

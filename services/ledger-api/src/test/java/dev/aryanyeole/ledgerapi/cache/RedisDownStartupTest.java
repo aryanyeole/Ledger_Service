@@ -214,7 +214,7 @@ class RedisDownStartupTest {
 					start.await();
 					long started = System.nanoTime();
 					Reply<Long> reply = gateway.always("EVAL",
-							(r) -> r.eval(DesignDocScripts.INVALIDATE, List.of("ledger:v1:bal:1", "ledger:v1:bal-gen:1"),
+							(r) -> r.eval(BalanceCacheScripts.INVALIDATE, List.of("ledger:v1:bal:1", "ledger:v1:bal-gen:1"),
 									List.of("token")));
 					assertThat(reply.available()).isFalse();
 					return (System.nanoTime() - started) / 1_000_000;

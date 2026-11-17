@@ -10,6 +10,7 @@ import java.util.Map;
 import java.util.TreeMap;
 import java.util.TreeSet;
 
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.dao.DataAccessException;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -19,6 +20,7 @@ import dev.aryanyeole.ledgerapi.api.ProblemCode;
 import dev.aryanyeole.ledgerapi.api.StoredOutcomeException;
 import dev.aryanyeole.ledgerapi.db.DbErrors;
 import dev.aryanyeole.ledgerapi.db.LockContention;
+import dev.aryanyeole.ledgerapi.db.WriteTransactions;
 
 // Ledger postings (spec §6.1 steps 4-6). Callers run inside WriteTransactions: lock first,
 // check what they need on the locked rows, then post. Invariants:
@@ -31,13 +33,26 @@ import dev.aryanyeole.ledgerapi.db.LockContention;
 // A lock timeout on the account lock is contention: 503 lock_contention, not stored (D-050).
 // 40P01 and 23514 (no_overdraft, the balance trigger) are never caught or retried: both are
 // bugs and surface as 500 (D-007, D-058).
+// Balance cache (D-142, D-147, D-151): with an invalidator present (balance cache on, invalidation
+// on), every posting registers one invalidation of the accounts it touched as a WriteTransactions
+// post-commit action; it runs only if the transaction commits, after the connection is back in the
+// pool. A D-064 rollback to the savepoint after the posting still invalidates: one harmless miss.
 @Service
 public class PostingService {
 
+	static final String INVALIDATION_ACTION = "balance-invalidation";
+
 	private final JdbcClient jdbc;
 
-	public PostingService(JdbcClient jdbc) {
+	private final WriteTransactions transactions;
+
+	private final BalanceCacheInvalidator invalidator;
+
+	public PostingService(JdbcClient jdbc, WriteTransactions transactions,
+			ObjectProvider<BalanceCacheInvalidator> invalidator) {
 		this.jdbc = jdbc;
+		this.transactions = transactions;
+		this.invalidator = invalidator.getIfAvailable();
 	}
 
 	public record LockedAccount(long id, String type, BigDecimal balance, boolean allowNegative) {
@@ -150,6 +165,10 @@ public class PostingService {
 			.param("correlation", correlationId)
 			.query((rs, rowNum) -> new Posted(rs.getLong("id"), rs.getObject("created_at", OffsetDateTime.class)))
 			.single();
+		if (this.invalidator != null) {
+			List<Long> touched = List.copyOf(deltas.keySet());
+			this.transactions.afterCommit(INVALIDATION_ACTION, () -> this.invalidator.invalidate(touched));
+		}
 
 		legs.stream().sorted(Comparator.comparingLong(Leg::accountId)).forEach((leg) -> this.jdbc
 			.sql("INSERT INTO entries (transaction_id, account_id, amount) VALUES (:transaction, :account, :amount)")

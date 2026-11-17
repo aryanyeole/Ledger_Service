@@ -32,6 +32,9 @@ A fingerprint mismatch goes to the DB path, and only the DB answers 422 (§3.4).
 
 Postings read balances only from rows they hold `FOR UPDATE` (`PostingService` in Java, the settle transaction's
 ascending lock in Python). The cache is injected only into the balance endpoint, and the worker has no read path at all.
+In ledger-api (D-151): `BalanceCache` (the read side: `MGET`, parse, compare-and-set populate) is injected only into
+`BalanceController`, which serves `GET /v1/accounts/{id}/balance` and holds no `WriteTransactions`;
+`BalanceCacheInvalidator` (the write side, no read method) is injected only into `PostingService`.
 
 ### 1.3 Reconciliation lease
 
@@ -49,9 +52,9 @@ D-107 classifier, so it can't cause a worker retry or a dead letter.
 |---|---|
 | Idempotency fast path read | DB path (counter `result=bypass`) |
 | Idempotency populate | Skipped; the next request reads the DB |
-| Balance read | DB read, `X-Cache: bypass`, no populate |
-| Balance populate (CAS) | Skipped |
-| Invalidation (API or worker) | Logged without keys or bodies, counted (`cache_invalidation_failed` in the worker); the stale value lives at most the value TTL |
+| Balance read | DB read, `X-Cache: bypass`, no populate (`ledger.balance.cache.read{result=bypass}`) |
+| Balance populate (CAS) | Skipped (`ledger.balance.cache.populate{result=unavailable}`) |
+| Invalidation (API or worker) | Logged without keys or bodies, counted (`ledger.balance.cache.invalidation{result=failed}` in ledger-api, `cache_invalidation_failed` in the worker); the stale value lives at most the value TTL |
 | Reconciliation lease | The tick runs (`reconciliation_lock_unavailable`, WARNING) |
 
 After any failure, a 1 s in-process bypass skips reads, populates and the lease. It never skips an invalidation sent on
@@ -90,6 +93,12 @@ Placement in ledger-api:
   transaction at all.
 - Invalidations are post-commit actions: `WriteTransactions` runs them after `TransactionTemplate.execute` has returned
   (committed, connection back in the pool), never after a rollback, with no transaction synchronization active (D-147).
+  Code inside the transaction registers `WriteTransactions.afterCommit(name, action)`; the name appears only in the
+  failure log and `ledger.db.post_commit_action{result=ok|failed}`. Returning isn't proof of a commit
+  (`TransactionTemplate.execute` also returns normally after `status.setRollbackOnly()`), so `WriteTransactions` learns
+  the outcome from a `TransactionSynchronization.afterCompletion` it registers inside the callback, which only records
+  the status. Actions run only on `STATUS_COMMITTED`. A commit whose outcome is unknown throws, so no action runs (§5
+  row 16).
 - The idempotency populate runs after `WriteTransactions.execute` has returned.
 
 Spring runs `TransactionSynchronization.afterCommit` before it releases the connection, which is why D-147 rejects it:
@@ -139,6 +148,11 @@ to completion. The script's first command is a DEL, so the whole invalidation ru
 and memory can end above maxmemory. A script whose first write is a SET, like the populate script, is refused before it
 changes anything (observed in T2).
 
+The markers around each script are load-bearing: `BalanceCacheScriptsTest` (ledger-api) asserts the fenced block
+between them equals `BalanceCacheScripts.INVALIDATE` / `POPULATE` exactly, and the worker's Python pin (T8) reads the
+same markers.
+
+<!-- script:invalidate -->
 ```lua
 -- ledger:v1 balance invalidation (D-142). KEYS: ledger:v1:bal:{id}, ledger:v1:bal-gen:{id} per account.
 -- ARGV[1]: a fresh token for this call.
@@ -148,10 +162,12 @@ for i = 1, #KEYS, 2 do
 end
 return #KEYS
 ```
+<!-- /script:invalidate -->
 
 **Compare-and-set populate script** (ledger-api only). `ARGV[1]` is the token the `MGET` saw, or the empty string if
 it saw none. An empty string can't equal a UUID, so "absent" is compared exactly.
 
+<!-- script:populate -->
 ```lua
 -- ledger:v1 balance populate (D-142). KEYS[1]: ledger:v1:bal:{id}; KEYS[2]: ledger:v1:bal-gen:{id}.
 -- ARGV[1]: token seen by the MGET ('' if absent); ARGV[2]: the value; ARGV[3]: the value TTL in ms.
@@ -161,6 +177,7 @@ if token ~= ARGV[1] then return 0 end
 redis.call('SET', KEYS[1], ARGV[2], 'PX', ARGV[3])
 return 1
 ```
+<!-- /script:populate -->
 
 ### 2.2 Who reads and writes what
 
@@ -188,7 +205,7 @@ is the lease.
 | Fast-path TTL | 10 min | > 0 (validated at startup); TTL + margin < 24 h, the DB's `expires_at` default (D-043) | Bounds how long an entry lives once written. If TTL + margin ≥ 24 h, no row ever has enough remaining life to be cached: safe, but the fast path never hits (counter `skipped_short_life`). |
 | Fast-path margin | 1 h | > 0 (validated at startup); > any delay between the DB measuring remaining life and Redis executing the `SET` (end of transaction, transit, a Redis pause) | An entry is written only if `expires_at − clock_timestamp()` > TTL + margin, so it expires at least one margin before its row can be purged (D-020, D-119). Durations only: clock skew between hosts doesn't matter (§5 row 10). A longer delay is the residual (§5 rows 2a, 11). |
 | Balance value TTL | 60 s (benchmark mode B: 1 s) | > 0 | The worst-case staleness after anything the token can't cover: a failed invalidation, an evicted token, a JVM pause or a Redis pause longer than the token PX (§4.3). A product choice, measured in T15. |
-| Token PX | 300 000 ms, a literal in the invalidation script | > a reader's `MGET`→CAS window = Hikari `connectionTimeout` (effective value; default 30 s) + `socketTimeout` (60 s, D-132) + 2 × command timeout ≈ 90.2 s | A token must outlive any reader that saw the token before it. Fixed in the contract so neither service needs the other's config. ledger-api refuses to start if the bound fails (T6), so raising a pool timeout can't silently break it. |
+| Token PX | 300 000 ms, a literal in the invalidation script | > a reader's `MGET`→CAS window = Hikari `connectionTimeout` (effective value; default 30 s) + `socketTimeout` (60 s, D-132) + 2 × command timeout ≈ 90.2 s | A token must outlive any reader that saw the token before it. Fixed in the contract so neither service needs the other's config. ledger-api refuses to start if the bound fails while the balance cache is on (`TokenBound`, D-151), so raising a pool timeout can't silently break it. `connectionTimeout` is read from the running `HikariDataSource`; `socketTimeout` is resolved as pgjdbc resolves it (`driverconfig.properties` < Hikari data-source properties < JDBC URL), and a missing or 0 value (pgjdbc's "unbounded") fails startup rather than being assumed. |
 | Hikari `connectionTimeout` (input) | effective value read from the pool; not set in `application.yml` today, so 30 s | Input to the token bound | Bounds the wait for a pooled connection on a cache miss. |
 | `socketTimeout` (input) | 60 s (D-132) | Input to the token bound | Bounds the miss's DB read. |
 | Lease PX (`RECONCILE_LOCK_TTL_MS`) | default = `RECONCILE_INTERVAL_MS`; Compose 60 000 | ≥ 2 × `WORKER_DB_COMMAND_TIMEOUT_MS` + `RECONCILE_STATEMENT_TIMEOUT_MS` (50 000 with defaults) while the lease is active, else `config_invalid` naming both values, exit 2 | The longest run is connect (command timeout) + statement + client slack (command timeout, D-114). A live run ends, or is cut off, before its lease expires, so runs don't overlap while the DB timeouts work. |
@@ -332,7 +349,8 @@ sequenceDiagram
 ```
 
 A D-064 rollback to the savepoint still runs the action (the outer transaction committed): one extra miss, harmless.
-A rollback of the whole transaction runs no actions.
+A rollback of the whole transaction runs no actions. The action is `PostingService`'s `balance-invalidation`, counted in
+`ledger.db.post_commit_action` (an exception) and `ledger.balance.cache.invalidation{result=sent|failed}` (the `EVAL`).
 
 ### 3.7 Worker settle
 
@@ -454,6 +472,7 @@ value TTL (60 s), because the stale value is written with `PX` = the value TTL.
 | 13 | A single blip trips the bypass while Redis is healthy | 1 s of DB reads and skipped populates; invalidations are still sent | None: latency only | 1 s | Argued |
 | 14 | Worker crash between the settle commit and its invalidation | Redelivery → `duplicate_skipped` → invalidation | Stale reads until the redelivered record is processed | Redelivery time, and value TTL | T9 `test_balance_invalidation.py` (D-148) |
 | 15 | ledger-api crash between commit and its post-commit invalidation | No redelivery exists. A client retry with the same key replays without posting, so it doesn't invalidate either | Stale reads only | Value TTL | Argued; residual |
+| 16 | API commit outcome unknown (connection lost during COMMIT) | The exception reaches the caller (500) and no post-commit action runs, so no invalidation; if it committed, stale up to the value TTL. `WriteTransactions` runs actions only on `STATUS_COMMITTED` because its actions are generic and a future one may not be safe on an uncommitted outcome (D-147) | Stale reads only | Value TTL | Residual, argued. The worker has no such gap: it retries the record and invalidates on `duplicate_skipped` (D-148) |
 
 ---
 

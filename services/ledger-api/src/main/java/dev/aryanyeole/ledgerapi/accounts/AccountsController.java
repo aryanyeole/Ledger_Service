@@ -27,10 +27,10 @@ import dev.aryanyeole.ledgerapi.db.WriteTransactions;
 import dev.aryanyeole.ledgerapi.idempotency.IdempotencyKeyHeader;
 import dev.aryanyeole.ledgerapi.idempotency.IdempotencyService;
 import dev.aryanyeole.ledgerapi.idempotency.IdempotencyService.Outcome;
-import dev.aryanyeole.ledgerapi.money.Money;
 
-// POST /v1/accounts, GET /v1/accounts/{id} and GET /v1/accounts/{id}/balance (spec §7,
-// D-048, D-057). Create and read return the same representation.
+// POST /v1/accounts and GET /v1/accounts/{id} (spec §7, D-048, D-057). Create and read return the
+// same representation. GET /v1/accounts/{id}/balance is BalanceController's, so the balance cache is
+// never reachable from a class that holds WriteTransactions (D-151).
 @RestController
 @RequestMapping("/v1/accounts")
 class AccountsController {
@@ -68,9 +68,6 @@ class AccountsController {
 	}
 
 	record AccountResponse(long accountId, String name, String type, OffsetDateTime createdAt) {
-	}
-
-	record BalanceResponse(long accountId, Money balance, OffsetDateTime asOf) {
 	}
 
 	// Idempotency-Key is optional here (D-054). Without one, the insert runs in its own write
@@ -123,14 +120,6 @@ class AccountsController {
 	AccountResponse get(@PathVariable long id) {
 		AccountRepository.Account account = this.accounts.find(id).orElseThrow(AccountsController::notFound);
 		return new AccountResponse(account.id(), account.name(), account.type(), account.createdAt());
-	}
-
-	// The balance goes through Money: a stored value with non-zero digits past 2 dp throws
-	// and becomes a 500, never a rounded number (D-056).
-	@GetMapping("/{id}/balance")
-	BalanceResponse balance(@PathVariable long id) {
-		AccountRepository.Balance balance = this.accounts.balance(id).orElseThrow(AccountsController::notFound);
-		return new BalanceResponse(id, new Money(balance.balance()), balance.asOf());
 	}
 
 	private static ApiException notFound() {
