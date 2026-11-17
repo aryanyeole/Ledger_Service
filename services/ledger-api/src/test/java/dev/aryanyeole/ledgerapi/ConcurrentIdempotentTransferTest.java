@@ -88,9 +88,9 @@ class ConcurrentIdempotentTransferTest {
 		byte[] body = ("{\"from_account_id\": " + a + ", \"to_account_id\": " + b + ", \"amount\": \"10.00\"}")
 			.getBytes(StandardCharsets.UTF_8);
 		Run run = harness.fire(() -> harness.post("/v1/transfers", key, body));
-		ServerArrivals.Overlap server = this.arrivals.overlap(key, seenPorts);
+		ServerArrivals.Overlap server = this.arrivals.overlap(key, ConcurrentRequestHarness.THREADS, seenPorts);
 		System.out.println("CONCURRENCY real warmup serverArrivedBeforeFirstCompletion="
-				+ server.arrivedBeforeFirstCompletion() + " arrivalSpreadMs=" + server.spreadMillis()
+				+ server.arrivedBeforeFirstCompletion() + " requests=" + server.requests() + " arrivalSpreadMs=" + server.spreadMillis()
 				+ " connections=" + server.connections() + " clientSentBeforeFirst=" + run.sentBeforeFirstResponse()
 				+ " peakInFlight=" + run.peakInFlight());
 		assertThat(run.responses().stream().filter((r) -> r.exception() != null).map(Response::exception).toList())
@@ -119,9 +119,9 @@ class ConcurrentIdempotentTransferTest {
 		List<Long> transfersB = LedgerTestSupport.transactionIds(this.dataSource, b, "TRANSFER");
 		Map<Integer, Long> statuses = responses.stream()
 			.collect(Collectors.groupingBy(Response::status, Collectors.counting()));
-		ServerArrivals.Overlap server = this.arrivals.overlap(key, seenPorts);
+		ServerArrivals.Overlap server = this.arrivals.overlap(key, ConcurrentRequestHarness.THREADS, seenPorts);
 		System.out.println("CONCURRENCY real round=" + round + " processors=" + ConcurrentRequestHarness.processors()
-				+ " serverArrivedBeforeFirstCompletion=" + server.arrivedBeforeFirstCompletion() + " arrivalSpreadMs="
+				+ " serverArrivedBeforeFirstCompletion=" + server.arrivedBeforeFirstCompletion() + " requests=" + server.requests() + " arrivalSpreadMs="
 				+ server.spreadMillis() + " reusedConnections=" + server.reusedConnections() + "/" + server.connections()
 				+ " clientSentBeforeFirst=" + run.sentBeforeFirstResponse() + " peakInFlight=" + run.peakInFlight()
 				+ " transactions=" + transfersA.size() + " distinctBodies=" + bodies.size() + " statuses=" + statuses);

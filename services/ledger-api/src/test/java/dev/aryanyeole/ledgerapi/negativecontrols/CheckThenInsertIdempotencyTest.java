@@ -92,9 +92,9 @@ class CheckThenInsertIdempotencyTest {
 			Response owner = first.get(30, TimeUnit.SECONDS);
 
 			int n = LedgerTestSupport.transactionIds(this.dataSource, a, "TRANSFER").size();
-			ServerArrivals.Overlap server = this.arrivals.overlap(key, new HashSet<>());
+			ServerArrivals.Overlap server = this.arrivals.overlap(key, 2, new HashSet<>());
 			System.out.println("CONCURRENCY control regression serverArrivedBeforeFirstCompletion="
-					+ server.arrivedBeforeFirstCompletion() + " transactions=" + n);
+					+ server.arrivedBeforeFirstCompletion() + " requests=" + server.requests() + " transactions=" + n);
 			assertThat(List.of(owner.status(), second.status())).as("statuses").containsExactly(201, 201);
 			assertThat(server.arrivedBeforeFirstCompletion()).as("both arrived before the first completed").isEqualTo(2);
 			assertThat(n).as("two requests in the handler at once: new TRANSFER transactions").isEqualTo(2);
@@ -129,9 +129,9 @@ class CheckThenInsertIdempotencyTest {
 		byte[] body = ("{\"from_account_id\": " + a + ", \"to_account_id\": " + b + ", \"amount\": \"10.00\"}")
 			.getBytes(StandardCharsets.UTF_8);
 		Run run = harness.fire(() -> harness.post(NaiveTransferController.ROUTE, key, body));
-		ServerArrivals.Overlap server = this.arrivals.overlap(key, seenPorts);
+		ServerArrivals.Overlap server = this.arrivals.overlap(key, ConcurrentRequestHarness.THREADS, seenPorts);
 		System.out.println("CONCURRENCY control warmup serverArrivedBeforeFirstCompletion="
-				+ server.arrivedBeforeFirstCompletion() + " arrivalSpreadMs=" + server.spreadMillis()
+				+ server.arrivedBeforeFirstCompletion() + " requests=" + server.requests() + " arrivalSpreadMs=" + server.spreadMillis()
 				+ " connections=" + server.connections() + " clientSentBeforeFirst=" + run.sentBeforeFirstResponse()
 				+ " peakInFlight=" + run.peakInFlight());
 		assertThat(run.responses().stream().filter((r) -> r.exception() != null).map(Response::exception).toList())
@@ -158,9 +158,9 @@ class CheckThenInsertIdempotencyTest {
 		int n = transfers.size();
 		Map<Integer, Long> statuses = responses.stream()
 			.collect(Collectors.groupingBy(Response::status, Collectors.counting()));
-		ServerArrivals.Overlap server = this.arrivals.overlap(key, seenPorts);
+		ServerArrivals.Overlap server = this.arrivals.overlap(key, ConcurrentRequestHarness.THREADS, seenPorts);
 		System.out.println("CONCURRENCY control round=" + round + " processors=" + ConcurrentRequestHarness.processors()
-				+ " serverArrivedBeforeFirstCompletion=" + server.arrivedBeforeFirstCompletion() + " arrivalSpreadMs="
+				+ " serverArrivedBeforeFirstCompletion=" + server.arrivedBeforeFirstCompletion() + " requests=" + server.requests() + " arrivalSpreadMs="
 				+ server.spreadMillis() + " reusedConnections=" + server.reusedConnections() + "/" + server.connections()
 				+ " clientSentBeforeFirst=" + run.sentBeforeFirstResponse() + " peakInFlight=" + run.peakInFlight()
 				+ " transactions=" + n + " distinctBodies=" + bodies.size() + " statuses=" + statuses);

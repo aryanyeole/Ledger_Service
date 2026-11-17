@@ -95,9 +95,9 @@ class OppositeTransfersNoDeadlockTest {
 		long b = funded(harness);
 		List<Planned> planned = plan(harness, a, b, baseSeed);
 		Run run = harness.fire(planned.stream().map(Planned::request).toList());
-		ServerArrivals.Overlap server = this.arrivals.overlap(keys(planned), seenPorts);
+		ServerArrivals.Overlap server = this.arrivals.overlap(keys(planned), planned.size(), seenPorts);
 		System.out.println("DEADLOCK warmup seed=" + baseSeed + " serverArrivedBeforeFirstCompletion="
-				+ server.arrivedBeforeFirstCompletion() + " connections=" + server.connections() + " statuses="
+				+ server.arrivedBeforeFirstCompletion() + " requests=" + server.requests() + " connections=" + server.connections() + " statuses="
 				+ statuses(run));
 		assertThat(run.responses().stream().filter((r) -> r.exception() != null).map(Response::exception).toList())
 			.as("warm-up client exceptions")
@@ -116,7 +116,7 @@ class OppositeTransfersNoDeadlockTest {
 		List<Planned> planned = plan(harness, a, b, seed);
 		Run run = harness.fire(planned.stream().map(Planned::request).toList());
 
-		ServerArrivals.Overlap server = this.arrivals.overlap(keys(planned), seenPorts);
+		ServerArrivals.Overlap server = this.arrivals.overlap(keys(planned), planned.size(), seenPorts);
 		Set<Long> newTransfers = difference(transactionsOn(a, b, "TRANSFER"), transfersBefore);
 		Set<Long> newDeposits = difference(transactionsOn(a, b, "DEPOSIT"), depositsBefore);
 		Totals aTotals = LedgerTestSupport.totals(this.dataSource, a);
@@ -124,7 +124,7 @@ class OppositeTransfersNoDeadlockTest {
 		Map<Integer, Long> statuses = statuses(run);
 		System.out.println("DEADLOCK round=" + round + " seed=" + seed + " processors="
 				+ ConcurrentRequestHarness.processors() + " serverArrivedBeforeFirstCompletion="
-				+ server.arrivedBeforeFirstCompletion() + " arrivalSpreadMs=" + server.spreadMillis()
+				+ server.arrivedBeforeFirstCompletion() + " requests=" + server.requests() + " arrivalSpreadMs=" + server.spreadMillis()
 				+ " reusedConnections=" + server.reusedConnections() + "/" + server.connections()
 				+ " clientSentBeforeFirst=" + run.sentBeforeFirstResponse() + " peakInFlight=" + run.peakInFlight()
 				+ " statuses=" + statuses + " newTransfers=" + newTransfers.size() + " newDeposits=" + newDeposits.size()
