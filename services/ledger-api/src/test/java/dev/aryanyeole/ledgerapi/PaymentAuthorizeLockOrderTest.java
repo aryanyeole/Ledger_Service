@@ -94,9 +94,9 @@ class PaymentAuthorizeLockOrderTest {
 	private void warmUp(ConcurrentRequestHarness harness, Set<Integer> seenPorts, long baseSeed) throws Exception {
 		List<Planned> planned = plan(harness, accounts(harness), baseSeed);
 		Run run = harness.fire(planned.stream().map(Planned::request).toList());
-		ServerArrivals.Overlap server = this.arrivals.overlap(keys(planned), seenPorts);
+		ServerArrivals.Overlap server = this.arrivals.overlap(keys(planned), planned.size(), seenPorts);
 		System.out.println("PAYLOCK warmup seed=" + baseSeed + " serverArrivedBeforeFirstCompletion="
-				+ server.arrivedBeforeFirstCompletion() + " connections=" + server.connections() + " statuses="
+				+ server.arrivedBeforeFirstCompletion() + " requests=" + server.requests() + " connections=" + server.connections() + " statuses="
 				+ statusesByKind(planned, run));
 		assertThat(run.responses().stream().filter((r) -> r.exception() != null).map(Response::exception).toList())
 			.as("warm-up client exceptions")
@@ -115,7 +115,7 @@ class PaymentAuthorizeLockOrderTest {
 		List<Planned> planned = plan(harness, accounts, seed);
 		Run run = harness.fire(planned.stream().map(Planned::request).toList());
 
-		ServerArrivals.Overlap server = this.arrivals.overlap(keys(planned), seenPorts);
+		ServerArrivals.Overlap server = this.arrivals.overlap(keys(planned), planned.size(), seenPorts);
 		Map<String, Map<Integer, Long>> byKind = statusesByKind(planned, run);
 		Set<Long> newTransfers = new HashSet<>(LedgerTestSupport.transactionIds(this.dataSource, c, "TRANSFER"));
 		newTransfers.removeAll(transfersBefore);
@@ -130,7 +130,7 @@ class PaymentAuthorizeLockOrderTest {
 		Totals escrowDelta = LedgerTestSupport.totals(this.dataSource, escrow).minus(escrowBefore);
 		System.out.println("PAYLOCK round=" + round + " seed=" + seed + " processors="
 				+ ConcurrentRequestHarness.processors() + " serverArrivedBeforeFirstCompletion="
-				+ server.arrivedBeforeFirstCompletion() + " arrivalSpreadMs=" + server.spreadMillis()
+				+ server.arrivedBeforeFirstCompletion() + " requests=" + server.requests() + " arrivalSpreadMs=" + server.spreadMillis()
 				+ " clientSentBeforeFirst=" + run.sentBeforeFirstResponse() + " statusesByKind=" + byKind
 				+ " authorizes=" + authorizes.size() + " newTransfers=" + newTransfers.size() + " payments=" + payments
 				+ " outboxRows=" + outboxRows + " C=" + cTotals.balance() + "/" + cTotals.entrySum() + " M="

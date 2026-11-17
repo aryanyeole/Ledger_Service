@@ -29,8 +29,10 @@
 | BUG-010 | 2026-11-02 13:37 | M4 | A Kafka container whose startup wait fails is never stopped | none (component: settlement-worker tests, `support/stack.py`) | fixed | 7562fc0 (PR #56) |
 | BUG-011 | 2026-11-02 16:12 | M4 | Failure-mode setups that publish until a payment lands on a chosen partition give up after a fixed 12 or 15 tries, so a correct run fails about 0.7% of the time | none (component: settlement-worker tests) | fixed | 873c84e (PR #57) |
 | BUG-012 | 2026-11-02 18:51 | M4 | ledger-api's startup hung after "Root WebApplicationContext: initialization completed", before Flyway's first database line, through a 120 s health wait | none observed (component: ledger-api startup; seen through the settlement-worker test stack) | fixed | 5d7e331 (PR #59) |
-| BUG-013 | 2026-11-03 19:23 | M4 | CheckThenInsertIdempotencyTest's round produced one transfer on CI, so the D-017 control failed its overlap check against a correct system | P2 proof evidence, D-067 (component: ledger-api tests) | fixed | d1a787e (PR #64; squash SHA to follow) |
-| BUG-014 | 2026-11-16 15:33 | M5 | ConcurrentIdempotentPaymentTest misses its D-106 server-overlap floor on CI | P2 proof evidence, D-067/D-106 (component: ledger-api tests) | open | — |
+| BUG-013 | 2026-11-03 19:23 | M4 | CheckThenInsertIdempotencyTest's round produced one transfer on CI, so the D-017 control failed its overlap check against a correct system | P2 proof evidence, D-067 (component: ledger-api tests) | fixed | c1aaf55 (PR #64) |
+| BUG-014 | 2026-11-16 15:33 | M5 | ConcurrentIdempotentPaymentTest misses its D-106 server-overlap floor on CI | P2 proof evidence, D-067/D-106 (component: ledger-api tests) | fixed | d71035f (PR #70) |
+| BUG-015 | 2026-11-16 17:44 | M5 | CheckThenInsertIdempotencyTest's BUG-013 regression test counted one server arrival, not two, on main | P2 proof evidence, D-133 (component: ledger-api tests, `ServerArrivals`) | open | — |
+| BUG-016 | 2026-11-16 19:05 | M5 | RedisClientSmokeTest's context fails to start: the test Redis's empty check times out connecting | none (component: ledger-api tests, `RedisTestcontainersConfiguration`) | open | — |
 
 ---
 
@@ -767,7 +769,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
   - **Concurrent requests:** two requests in the handler at once always both post, so n ≥ 2.
   - **A serialized harness:** it never sends a second request while the first waits, so the first goes on alone after 10 s, n = 1, and the overlap assertion fails as before.
   - **The bodies assertion is now exact:** `distinctBodies == n + (replays > 0 ? 1 : 0)`, with a D-044 comment.
-  - **Commits:** `f35d42c` (the barrier) and `d1a787e` (the regression hook signals at the barrier only when the owner really waits) on `m4/t16b-fix-bug-013` · PR #64 (squash SHA to follow).
+  - **Commits:** `f35d42c` (the barrier) and `d1a787e` (the regression hook signals at the barrier only when the owner really waits) on `m4/t16b-fix-bug-013` · PR #64, squash-merged to `main` as `c1aaf55`.
 - **Regression test:** `services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/negativecontrols/CheckThenInsertIdempotencyTest.java::twoRequestsInTheHandlerAtOnceAlwaysDuplicate`, with test-only hooks in `NaiveTransferController`.
   - **The hooks:** `arm(key)` makes the key's first owner hold after its claim until released. Its `blocked` signal fires when the owner really waits, at the barrier or in that hold.
   - **The test:**
@@ -821,7 +823,7 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 ### BUG-014 — ConcurrentIdempotentPaymentTest misses its D-106 server-overlap floor on CI
 
 - **Found:** 2026-11-16 15:33 · M5 · Task T3 · branch `m5/t3-idempotency-immutable`
-- **Status:** open
+- **Status:** fixed
 - **Component:** ledger-api tests (`ConcurrentIdempotentPaymentTest.hundredIdenticalAuthorizesCreateOnePayment`)
 - **Property / invariant touched:** P2's proof evidence (the D-067/D-106 tripwire against a serialized harness). Production behaviour is not implicated: in the failing round all 100 authorizes returned 201, there was exactly 1 payment and 1 authorize posting, and every response body was identical.
 - **Symptom:** ledger-api CI failed on PR #68 head `8d7e4b0` (run 43970789309, attempt 1, job 133662081245): ConcurrentIdempotentPaymentTest round 1, server overlap 2 < floor 6. 626 of 627 tests passed; the settlement-worker job passed. The same CI run's warm-up round reached 11. The failure is in the overlap tripwire only; every correctness assertion of the round held.
@@ -852,10 +854,92 @@ Copy below the line for each new bug. IDs are sequential: `BUG-001`, `BUG-002`, 
 - **Fix:** re-derive the floor per D-106 from the test's full retained CI history plus this observation: max(2, ⌊0.6 × min⌋). The other three tripwire tests' floors are unchanged (D-106 re-derives only the test that missed).
   - **History:** 125 observations, every retained run attempt from run 39212739781 (2026-10-19, the test's first CI run) to 2026-11-17, 94 runs, read per attempt (`gh run view <run> --attempt <n> --log`, BUG-013). min 2 (this run), then 6 (run 41762981604 attempt 1, main `72e2829`, 2026-11-04, which met the old floor exactly), 7, 7, 8; median 18; max 67. The 80 earlier run attempts predate the test; every attempt since has an observation. Per-attempt list: `docs/evidence/bug-014-payment-overlap-history.txt`.
   - **Floor:** max(2, ⌊0.6 × 2⌋) = 2, recorded with n, the minimum and the runs beside the constant.
-  - **Commits:** branch `m5/bug-014-payment-overlap-floor` (squash SHA to follow after merge)
+  - **Commits:** `b418996` (floor and history) and `51c1020` (root-cause wording) on `m5/bug-014-payment-overlap-floor` · PR #70, squash-merged to `main` as `d71035f`.
 - **Regression test:** `ConcurrentIdempotentPaymentTest` (`services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/`).
   - **Red before:** CI run 43970789309 attempt 1 (`8d7e4b0`): overlap 2 < floor 6.
-  - **Green after:** the re-derived floor's CI runs (to be filled in after merge). No synthetic test.
+  - **Green after:** PR #70's CI (run 43988919154 on `b418996`: overlap 17; run 43989321669 on `51c1020`: 10) and `main` run 43990876717 on `d71035f`: overlap 25, all ≥ the floor of 2. No synthetic test.
 - **Decision Log impact:** none (D-106 covers re-deriving a floor after a miss). Measured numbers' floors row changes at closeout.
 - **Summary (one sentence):** ConcurrentIdempotentPaymentTest's server overlap reached 2 on a shared 4-CPU runner against a floor of 6 taken from a 35-observation minimum of 11; the floor is re-derived from the full history per D-106.
+- **Notes:**
+  - `main` run 43989828650 (`7753dda`, PR #68's squash, still on the old floor of 6) read 17 for this test; that run failed on BUG-015, not here.
+  - BUG-015 (overlap readers could run before every arrival record existed) can only undercount overlap; whether it touched this run's 2 is unverified. Its fix makes every reader wait for the full count and print `requests=<n>`, which settles any future low reading.
+
+---
+
+### BUG-015 — CheckThenInsertIdempotencyTest's BUG-013 regression test counted one server arrival, not two, on main
+
+- **Found:** 2026-11-16 17:44 · M5 · after PR #68 (T3) merged · branch `main`
+- **Status:** open
+- **Component:** ledger-api tests (`negativecontrols/CheckThenInsertIdempotencyTest.twoRequestsInTheHandlerAtOnceAlwaysDuplicate`; the arrival recorder `ServerArrivals` it reads)
+- **Property / invariant touched:** P2's proof evidence (D-133's deterministic regression test for BUG-013). Production behaviour is not implicated: both requests returned 201 and the naive controller produced 2 TRANSFER transactions, which is the duplicate the control exists to show. Only the server-arrival count was wrong.
+- **Symptom:** ledger-api CI failed on `main` at `7753dda` (PR #68's squash; run 43989828650, CI #156, attempt 1, job 133727272163). 626 of 627 tests passed; the settlement-worker job passed. The same test passed on every earlier retained CI run since PR #64 added it. In the same class, `naiveIdempotencyLetsDuplicatesThrough` passed (round 1: overlap 12, 7 transactions).
+  ```
+  CONCURRENCY control regression serverArrivedBeforeFirstCompletion=1 transactions=2
+  CONCURRENCY control round=1 processors=4 serverArrivedBeforeFirstCompletion=12 arrivalSpreadMs=113 reusedConnections=78/78 clientSentBeforeFirst=41 peakInFlight=45 transactions=7 distinctBodies=8 statuses={201=100}
+  [ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 1.700 s <<< FAILURE! -- in dev.aryanyeole.ledgerapi.negativecontrols.CheckThenInsertIdempotencyTest
+  [ERROR] dev.aryanyeole.ledgerapi.negativecontrols.CheckThenInsertIdempotencyTest.twoRequestsInTheHandlerAtOnceAlwaysDuplicate -- Time elapsed: 0.079 s <<< FAILURE!
+  org.opentest4j.AssertionFailedError:
+  [both arrived before the first completed]
+  expected: 2
+   but was: 1
+  	at dev.aryanyeole.ledgerapi.negativecontrols.CheckThenInsertIdempotencyTest.twoRequestsInTheHandlerAtOnceAlwaysDuplicate(CheckThenInsertIdempotencyTest.java:99)
+  [ERROR] Tests run: 627, Failures: 1, Errors: 0, Skipped: 0
+  ```
+- **How detected:** CI on the push to `main` after PR #68 merged: https://github.com/aryanyeole/Ledger_Service/actions/runs/43989828650/job/133727272163. Runner: GitHub-hosted `ubuntu-24.04`, image version 20261111.127.1 (runner 20261103.629), `processors=4` from the control's config line. The time above is the failed job's completion (00:44:48 UTC); the log was read and this entry opened at 2026-11-17 01:00. The next push to `main` (`d71035f`, PR #70, run 43990876717) passed. `7753dda` changes no test or harness code that this test uses (V16 and DbRolePrivilegesTest / IdempotencyKeyCompletenessTest only), and the naive controller doesn't go through IdempotencyService.
+- **Reproduction:** deterministic, with a local mutation (never committed): `Thread.sleep(200)` in `ServerArrivals`' filter `finally`, before `record()`.
+  ```powershell
+  cd services\ledger-api
+  .\mvnw.cmd test "-Dtest=CheckThenInsertIdempotencyTest#twoRequestsInTheHandlerAtOnceAlwaysDuplicate"
+  ```
+  ```
+  CONCURRENCY control regression serverArrivedBeforeFirstCompletion=0 transactions=2
+  [both arrived before the first completed]
+  expected: 2
+   but was: 0
+  ```
+  The prediction was 1 (only A's record late); with a 200 ms delay B's record was late too, so neither existed when the test read them. Same mechanism, a wider window.
+- **Time to diagnose:** the entry was opened at 01:00 with the mechanism as a hypothesis; the reproduction above confirmed it the same night.
+- **Root cause:** `ServerArrivals`' filter writes each request's record in its `finally`, after `chain.doFilter` returns, by which time the response can already have reached the client. The test read `arrivals.overlap(key, …)` as soon as A's response arrived; A's `finally` hadn't run yet, so only B's record existed and "arrived before the first completion" counted 1. Every overlap reader in the harness had the same race; the 100-request rounds just made a missing record rarer to matter.
+- **Why it wasn't caught earlier:** the `finally` almost always wins the race against the client's next statement: 26 of 27 retained CI attempts of this test recorded both arrivals. Nothing checked that a reader saw a record for every request it sent, and the summary lines didn't print the record count.
+- **Fix:** in the readers, not the record point (completion is stamped after the response is written, so an earlier record would only trade missing entries for half-done ones). `overlap(keys, expectedRequests, seenPorts)` waits, bounded at 5 s (Awaitility, already on the test classpath through spring-boot-starter-test), until exactly `expectedRequests` records carry those keys; too few fails with "arrival records missing: got X of Y", too many fails too (a request recorded twice is a harness bug). Every caller passes the count it sent: ConcurrentIdempotentTransferTest, OppositeTransfersNoDeadlockTest, ConcurrentIdempotentPaymentTest, PaymentAuthorizeLockOrderTest and CheckThenInsertIdempotencyTest (rounds, warm-ups and the regression test). Every overlap summary line prints `requests=<n>`.
+  - **Commits:** on `m5/bug-015-arrival-recorded-late` (squash SHA to follow after merge).
+- **Regression test:** `CheckThenInsertIdempotencyTest.twoRequestsInTheHandlerAtOnceAlwaysDuplicate` (`services/ledger-api/src/test/java/dev/aryanyeole/ledgerapi/negativecontrols/`).
+  - **Red before:** CI run 43989828650 (`7753dda`): 1 of 2; locally with the 200 ms mutation: 0 of 2 (above).
+  - **Green after:** with the mutation still in place and the fix applied: `CONCURRENCY control regression serverArrivedBeforeFirstCompletion=2 requests=2 transactions=2`, passing (the reader waited). Mutation removed: the five overlap classes at default rounds all pass with `requests=` equal to the number sent (100, 100, 2, 60, 75). CI evidence to follow after merge.
+- **Decision Log impact:** none (D-067's instrument, fixed). Published overlap figures can only have been undercounted by a missing record, so no Measured-numbers change; the calibrated floors stay conservative (D-106).
+- **Summary (one sentence):** the arrival recorder writes each record after the response can reach the client, so a reader that ran right after its last response could miss a record; readers now wait for exactly the number of requests they sent and print it.
+- **Notes:**
+  - **Every retained CI attempt of this test** (read per attempt, `gh run view <run> --attempt <n> --log`; 27 attempts, from PR #64's run 41768685461 attempts 1-10 on `cc5408c` to `d71035f`): 26 printed `serverArrivedBeforeFirstCompletion=2 transactions=2`; only run 43989828650 attempt 1 (`7753dda`) printed `=1 transactions=2`. Run 43987278998 on `359b28e`, PR #68's head after main was merged in, has the same tree as the squash `7753dda` and printed `=2 transactions=2`, so the same code passed once and failed once.
+  - **Link to BUG-014:** unverified. A missing record can only lower an overlap count, so it could have contributed to BUG-014's 2; the new `requests=<n>` print and the expected-count wait settle any future low reading.
+
+---
+
+### BUG-016 — RedisClientSmokeTest's context fails to start: the test Redis's empty check times out connecting
+
+- **Found:** 2026-11-16 19:05 · M5 · while verifying BUG-015's fix · branch `m5/bug-015-arrival-recorded-late` (the failing code is on `main`, from PR #67)
+- **Status:** open
+- **Component:** ledger-api tests (`RedisTestcontainersConfiguration.EmptyRedis`, the D-138 `DBSIZE = 0` check run at context start; seen through `cache/RedisClientSmokeTest`)
+- **Property / invariant touched:** none. No production code is involved: the failing call is the test configuration's own readiness check, before any test ran. D-138's "every test Redis starts empty" guard couldn't run, so the context refused to start.
+- **Symptom:** a local full `.\mvnw.cmd -B verify` (working tree = `main` `d71035f` plus BUG-015's uncommitted test-only changes to `ServerArrivals` and its five callers) failed: `Tests run: 627, Failures: 0, Errors: 7`. All 7 errors are RedisClientSmokeTest's tests: its context failed once and the other six were skipped by the context failure threshold. The Redis container had started (Testcontainers' log wait for "Ready to accept connections" passed) about half a second before the check ran.
+  ```
+  19:05:26.020  tc.redis:7.4.11 : Creating container for image: redis:7.4.11
+  19:05:26.667  tc.redis:7.4.11 : Container redis:7.4.11 started in PT0.6469841S
+  Caused by: org.springframework.beans.BeanInstantiationException: Failed to instantiate [dev.aryanyeole.ledgerapi.RedisTestcontainersConfiguration$EmptyRedis]: Factory method 'emptyRedis' threw exception with message: Unable to connect to localhost/<unresolved>:64531
+  Caused by: io.lettuce.core.RedisConnectionException: Unable to connect to localhost/<unresolved>:64531
+  	at io.lettuce.core.RedisClient.connect(RedisClient.java:205)
+  	at dev.aryanyeole.ledgerapi.RedisTestcontainersConfiguration$EmptyRedis.<init>(RedisTestcontainersConfiguration.java:60)
+  Caused by: io.lettuce.core.RedisCommandTimeoutException: Connection initialization timed out after 100 millisecond(s)
+  	at io.lettuce.core.protocol.RedisHandshakeHandler.lambda$channelRegistered$0(RedisHandshakeHandler.java:52)
+  java.lang.IllegalStateException: ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [... testClass = dev.aryanyeole.ledgerapi.cache.RedisClientSmokeTest ...]
+  [ERROR] Tests run: 627, Failures: 0, Errors: 7, Skipped: 0
+  ```
+- **How detected:** the full local verify for BUG-015 (i5-1240P, 16 logical CPUs, Windows 11, Docker Desktop), run in the background; log read and this entry opened at 2026-11-17 02:10. RedisClientSmokeTest passed in every earlier run: the local verifies for T2, T3 and the BUG-014 branch, and every CI run since PR #67.
+- **Reproduction:** not attempted yet.
+- **Time to diagnose:** open.
+- **Root cause:** not yet established. Hypothesis to test (unverified): `EmptyRedis` builds its client with `RedisGateway.redisUri(...)`, so its handshake is bounded by the production 100 ms command timeout (D-137). That bound is meant for request paths that must never wait on Redis, not for a harness readiness probe run right after the container starts. The first connection through Docker Desktop's published port on Windows, under a full verify's load, can take longer than 100 ms. `localhost` may also resolve to `::1` first on Windows (the worker harness maps it to 127.0.0.1 for that reason; `support/stack.py` `_host`).
+- **Why it wasn't caught earlier:** open.
+- **Fix:** open.
+- **Regression test:** open.
+- **Decision Log impact:** open.
+- **Summary (one sentence):** open.
 - **Notes:** none yet.

@@ -79,9 +79,9 @@ class ConcurrentIdempotentPaymentTest {
 		String key = ConcurrentRequestHarness.newKey();
 		byte[] body = body(customer, merchant);
 		Run run = harness.fire(() -> harness.post("/v1/payments", key, body));
-		ServerArrivals.Overlap server = this.arrivals.overlap(key, seenPorts);
+		ServerArrivals.Overlap server = this.arrivals.overlap(key, ConcurrentRequestHarness.THREADS, seenPorts);
 		System.out.println("CONCURRENCY payments warmup serverArrivedBeforeFirstCompletion="
-				+ server.arrivedBeforeFirstCompletion() + " connections=" + server.connections());
+				+ server.arrivedBeforeFirstCompletion() + " requests=" + server.requests() + " connections=" + server.connections());
 		assertThat(run.responses().stream().filter((r) -> r.exception() != null).map(Response::exception).toList())
 			.as("warm-up client exceptions")
 			.isEmpty();
@@ -105,10 +105,10 @@ class ConcurrentIdempotentPaymentTest {
 		List<Long> authorizes = LedgerTestSupport.transactionIds(this.dataSource, customer, "PAYMENT_AUTHORIZE");
 		long payments = LedgerTestSupport.queryLong(this.dataSource,
 				"SELECT count(*) FROM payments WHERE customer_account_id = ?", customer);
-		ServerArrivals.Overlap server = this.arrivals.overlap(key, seenPorts);
+		ServerArrivals.Overlap server = this.arrivals.overlap(key, ConcurrentRequestHarness.THREADS, seenPorts);
 		System.out.println("CONCURRENCY payments round=" + round + " processors="
 				+ ConcurrentRequestHarness.processors() + " serverArrivedBeforeFirstCompletion="
-				+ server.arrivedBeforeFirstCompletion() + " arrivalSpreadMs=" + server.spreadMillis()
+				+ server.arrivedBeforeFirstCompletion() + " requests=" + server.requests() + " arrivalSpreadMs=" + server.spreadMillis()
 				+ " clientSentBeforeFirst=" + run.sentBeforeFirstResponse() + " payments=" + payments
 				+ " authorizes=" + authorizes.size() + " distinctBodies=" + bodies.size() + " statuses=" + statuses);
 
