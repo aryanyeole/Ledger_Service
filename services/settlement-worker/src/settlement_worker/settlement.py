@@ -169,6 +169,12 @@ def _check_matches(event: AuthorizedEvent, payment: PaymentRow) -> None:
         )
 
 
+async def system_account_ids(conn: asyncpg.Connection) -> tuple[int, int]:
+    """(ESCROW, PLATFORM_FEES), read without a lock and outside any transaction: the balance invalidation memoizes
+    them at startup (D-048: seeded by V4, never change; D-152). MissingAccount if either is gone."""
+    return await _system_account(conn, ESCROW_NAME), await _system_account(conn, PLATFORM_FEES_NAME)
+
+
 async def _system_account(conn: asyncpg.Connection, name: str) -> int:
     account_id = await conn.fetchval("SELECT id FROM accounts WHERE name = $1", name)
     if account_id is None:

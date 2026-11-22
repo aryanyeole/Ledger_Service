@@ -10,8 +10,10 @@ Records are processed one at a time, in partition order. For each record:
   3. payment.authorized: processor.call on every delivery, before the dedup check (its
      idempotency stays visible to the crash test), outside any DB transaction and under
      WORKER_PROCESSOR_TIMEOUT_MS (D-112) -> settlement.handle, which commits its own
-     transaction (D-082) -> commit offset+1. Committing the offset only after the DB commit means
-     a crash between them redelivers the record, and the dedup row absorbs it (invariant 6).
+     transaction (D-082) -> the balance invalidation, outside any transaction, bounded, never raising
+     (D-148, D-152; only while Redis is configured and invalidation is on) -> commit offset+1.
+     Committing the offset only after the DB commit means a crash between them redelivers the
+     record, and the dedup row absorbs it (invariant 6); its duplicate_skipped invalidates again.
 A failure is classified (failures.classify, D-107). Transient (indefinitely) and Unclassified (up
 to WORKER_MAX_ATTEMPTS Unclassified failures; transient ones don't count, D-112) are retried in
 place (D-108): a redelivery to self that seeks the
@@ -28,8 +30,8 @@ partition is paused, and the worker keeps polling while it recommits on the D-10
 Records fetched but not processed stay uncommitted and are redelivered. A stop request is honoured
 between records, during a backoff and while a commit is pending (within one getmany wait), never
 between the DB commit and the offset commit.
-Faults (tests only), for FAULT_PAYMENT_ID only: at AFTER_PROCESSOR_BEFORE_DB / AFTER_DB_BEFORE_OFFSET
-log fault_injected, flush stdout and os._exit(86): no finally blocks, no LeaveGroup, no offset
+Faults (tests only), for FAULT_PAYMENT_ID only: at AFTER_PROCESSOR_BEFORE_DB / AFTER_DB_BEFORE_INVALIDATION
+(D-148, with or without Redis) / AFTER_DB_BEFORE_OFFSET log fault_injected, flush stdout and os._exit(86): no finally blocks, no LeaveGroup, no offset
 commit, exactly like a crash. RAISE_BEFORE_COMMIT logs fault_injected and raises a RuntimeError
 inside the settle transaction on every attempt (D-125). FAIL_OFFSET_COMMIT logs fault_injected and
 fails the first two offset commits of the payment's record (D-129).
@@ -49,10 +51,13 @@ import structlog
 from aiokafka import AIOKafkaConsumer, ConsumerRebalanceListener, TopicPartition
 from aiokafka.errors import KafkaError
 
-from settlement_worker import dead_letter, db, envelope, events, failures, metrics, processor, reconcile, settlement
+from settlement_worker import balance_cache, dead_letter, db, envelope, events, failures, metrics, processor
+from settlement_worker import reconcile, redis_client, settlement
 from settlement_worker import dlq as dlq_module
 from settlement_worker.config import (
+    AFTER_DB_BEFORE_INVALIDATION,
     AFTER_DB_BEFORE_OFFSET,
+    INVALIDATION_OFF,
     AFTER_PROCESSOR_BEFORE_DB,
     FAIL_OFFSET_COMMIT,
     RAISE_BEFORE_COMMIT,
@@ -230,9 +235,19 @@ async def _call_processor(event: AuthorizedEvent, attempt: int, config: Config) 
 
 
 async def process_record(
-    record, *, session: db.DbSession, consumer, config: Config, commits: Commits, attempt: int
+    record,
+    *,
+    session: db.DbSession,
+    consumer,
+    config: Config,
+    commits: Commits,
+    attempt: int,
+    invalidator: balance_cache.BalanceInvalidator | None = None,
 ) -> None:
-    """attempt: this run's number (D-108, D-112), passed to the processor."""
+    """attempt: this run's number (D-108, D-112), passed to the processor. invalidator: present while Redis is
+    configured and invalidation is on (D-148, D-152). After settlement.handle returns (a committed outcome for a
+    known payment: every exception path leaves before this point), in this order: AFTER_DB_BEFORE_INVALIDATION,
+    the invalidation (never raises, bounded), AFTER_DB_BEFORE_OFFSET, the offset commit."""
     event = classify(record)
     tp = TopicPartition(record.topic, record.partition)
     if isinstance(event, OwnResultEvent):
@@ -255,6 +270,9 @@ async def process_record(
         if failure is ex:
             raise
         raise failure from ex
+    _fault(config, AFTER_DB_BEFORE_INVALIDATION, event)
+    if invalidator is not None:
+        await invalidator.after_commit(event)
     _fault(config, AFTER_DB_BEFORE_OFFSET, event)
     commits.arm(tp, record.offset, event)
     await commits.commit(tp, record.offset)
@@ -278,6 +296,7 @@ async def _step(
     commits,
     dlq,
     rng,
+    invalidator: balance_cache.BalanceInvalidator | None = None,
 ) -> Step:
     """One record: reconnect if the connection was lost, process it; on failure, classify it and
     dead-letter it, schedule a retry in place, or fail."""
@@ -287,7 +306,7 @@ async def _step(
             await session.reconnect()
         await process_record(
             record, session=session, consumer=consumer, config=config, commits=commits,
-            attempt=state.attempts(tp, record.offset) + 1,
+            attempt=state.attempts(tp, record.offset) + 1, invalidator=invalidator,
         )
     except db.WorkerRoleError as ex:
         events.emit(log, events.CONFIG_INVALID, level="error", error=str(ex), correlation_id=None)
@@ -441,15 +460,19 @@ def _wait_ms(now_ns: int, *deadlines: int | None) -> int:
 
 
 def announce_start(log, config: Config) -> None:
-    """worker_started; WARNING when a fault is armed (D-085) or the processor outage is on (D-112)."""
+    """worker_started; WARNING when a fault is armed (D-085), the processor outage is on (D-112) or balance
+    invalidation is off (the benchmark's TTL-only mode, D-152). no_redis stays INFO."""
+    invalidation = config.balance_invalidation_status
+    warn = config.fault_armed or config.processor_outage or invalidation == INVALIDATION_OFF
     events.emit(
         log,
         events.WORKER_STARTED,
-        level="warning" if config.fault_armed or config.processor_outage else "info",
+        level="warning" if warn else "info",
         consumer_group=config.consumer_group,
         fault_point=config.fault_point,
         processor_outage=config.processor_outage,
         reconcile_interval_ms=config.reconcile_interval_ms,
+        balance_invalidation=invalidation,
         correlation_id=None,
     )
 
@@ -495,6 +518,23 @@ async def run(config: Config, stop: asyncio.Event, stop_reason: dict) -> int:
         events.emit(log, events.WORKER_STOPPED, level="error", reason=reason, correlation_id=None)
         return EXIT_PROCESSING_ERROR
 
+    # Balance invalidation (D-148, D-152): ESCROW's and PLATFORM_FEES' ids are read once, here, and only when
+    # invalidation is active, so no DB call ever sits between a settle's commit and its offset commit. An
+    # unreachable DB is db_unavailable (exit 1); a missing seeded account is a broken ledger: fatal (exit 1).
+    system_ids = None
+    if config.invalidates:
+        try:
+            system_ids = await settlement.system_account_ids(session.conn)
+        except settlement.MissingAccount as ex:
+            await session.close()
+            _startup_fatal(log, ex)
+            return EXIT_PROCESSING_ERROR
+        except (OSError, asyncio.TimeoutError, asyncpg.PostgresError) as ex:
+            await session.close()
+            reason = f"db_unavailable: {type(ex).__name__}: {ex}"
+            events.emit(log, events.WORKER_STOPPED, level="error", reason=reason, correlation_id=None)
+            return EXIT_PROCESSING_ERROR
+
     try:
         server = metrics.start(config.metrics_host, config.metrics_port)
     except metrics.MetricsBindError as ex:
@@ -503,13 +543,18 @@ async def run(config: Config, stop: asyncio.Event, stop_reason: dict) -> int:
         return EXIT_CONFIG
     events.emit(log, events.METRICS_LISTENING, host=server.host, port=server.port, correlation_id=None)
 
+    # One client for the process (D-137), created without connecting and closed on the way out.
+    redis = redis_client.create(config.redis_url) if config.redis_url is not None else None
+    invalidator = balance_cache.BalanceInvalidator(redis, *system_ids) if system_ids is not None else None
     reconciler = reconcile.Reconciler(config) if config.reconcile_interval_ms is not None else None
     task = asyncio.create_task(reconciler.run_forever()) if reconciler is not None else None
     try:
-        code, reason = await _consume(config, stop, session, reconciler)
+        code, reason = await _consume(config, stop, session, reconciler, invalidator)
     finally:
         if task is not None:
             await reconcile.stop(task)
+        if redis is not None:
+            await redis.aclose()
         await asyncio.to_thread(server.close)
     events.emit(
         log,
@@ -521,8 +566,28 @@ async def run(config: Config, stop: asyncio.Event, stop_reason: dict) -> int:
     return code
 
 
+def _startup_fatal(log, ex: BaseException) -> None:
+    """A broken ledger at startup (a missing seeded system account, D-107): the existing fatal event shape,
+    with no record, then worker_stopped."""
+    events.emit(
+        log,
+        events.PROCESSING_FAILED,
+        level="error",
+        topic=None,
+        partition=None,
+        offset=None,
+        error=f"{type(ex).__name__}: {ex}",
+        correlation_id=None,
+    )
+    events.emit(log, events.WORKER_STOPPED, level="error", reason="processing_failed", correlation_id=None)
+
+
 async def _consume(
-    config: Config, stop: asyncio.Event, session: db.DbSession, reconciler: reconcile.Reconciler | None = None
+    config: Config,
+    stop: asyncio.Event,
+    session: db.DbSession,
+    reconciler: reconcile.Reconciler | None = None,
+    invalidator: balance_cache.BalanceInvalidator | None = None,
 ) -> tuple[int, str | None]:
     """Runs the consumer until a stop request, a processing error or a role refusal (its own, or the
     reconciler's, D-114); closes the DB connection (bounded). Returns the exit code and the reason
@@ -593,7 +658,7 @@ async def _consume(
                         break
                     result = await _step(
                         record, tp, session=session, consumer=consumer, config=config, state=state, commits=commits,
-                        dlq=dlq, rng=rng,
+                        dlq=dlq, rng=rng, invalidator=invalidator,
                     )
                     if result is Step.FATAL:
                         code, reason = EXIT_PROCESSING_ERROR, "processing_failed"

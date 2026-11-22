@@ -201,6 +201,7 @@ def test_worker_started_warns_when_a_fault_is_armed(armed, level):
             "fault_point": "AFTER_DB_BEFORE_OFFSET" if armed else None,
             "processor_outage": False,
             "reconcile_interval_ms": None,
+            "balance_invalidation": "no_redis",
             "correlation_id": None,
         }
     ]
@@ -252,6 +253,7 @@ def test_worker_started_warns_when_the_processor_outage_is_on(outage, level):
             "fault_point": None,
             "processor_outage": outage == "1",
             "reconcile_interval_ms": None,
+            "balance_invalidation": "no_redis",
             "correlation_id": None,
         }
     ]
@@ -302,6 +304,60 @@ def test_worker_started_reports_the_reconcile_interval():
     with capture_logs() as logs:
         consumer.announce_start(structlog.get_logger(), config)
     assert [(log["reconcile_interval_ms"], log["log_level"]) for log in logs] == [(60000, "info")]
+
+
+# WORKER_BALANCE_INVALIDATION (D-142, D-152): 0 or 1, default 1.
+def test_balance_invalidation_defaults_to_on():
+    assert Config.from_env(_env()).balance_invalidation is True
+    assert Config.from_env(_env(WORKER_BALANCE_INVALIDATION="1")).balance_invalidation is True
+    assert Config.from_env(_env(WORKER_BALANCE_INVALIDATION="0")).balance_invalidation is False
+
+
+@pytest.mark.parametrize("raw", ["", "2", "true", "on", " 1"])
+def test_invalid_balance_invalidation_is_refused(raw):
+    with pytest.raises(ConfigError, match="WORKER_BALANCE_INVALIDATION must be 0 or 1"):
+        Config.from_env(_env(WORKER_BALANCE_INVALIDATION=raw))
+
+
+def test_invalid_balance_invalidation_exits_2():
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("FAULT_", "FAKE_", "WORKER_", "REDIS_"))}
+    env.update(_env(WORKER_METRICS_PORT="0", WORKER_BALANCE_INVALIDATION="yes"))
+    result = subprocess.run([sys.executable, "-m", "settlement_worker"], capture_output=True, text=True, env=env, timeout=30)
+    assert result.returncode == 2, result.stdout + result.stderr
+    lines = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [line["event"] for line in lines] == ["config_invalid"], lines
+    assert "WORKER_BALANCE_INVALIDATION" in lines[0]["error"]
+
+
+# worker_started.balance_invalidation (D-152): no_redis and on are INFO; off (TTL-only) warns like an armed fault.
+@pytest.mark.parametrize(
+    "overrides, status, level, invalidates",
+    [
+        ({}, "no_redis", "info", False),
+        ({"WORKER_BALANCE_INVALIDATION": "0"}, "no_redis", "info", False),
+        ({"REDIS_URL": "redis://localhost:6379"}, "on", "info", True),
+        ({"REDIS_URL": "redis://localhost:6379", "WORKER_BALANCE_INVALIDATION": "0"}, "off", "warning", False),
+    ],
+)
+def test_worker_started_reports_balance_invalidation(overrides, status, level, invalidates):
+    config = Config.from_env(_env(WORKER_CONSUMER_GROUP="g", **overrides))
+    assert config.balance_invalidation_status == status
+    assert config.invalidates is invalidates
+    with capture_logs() as logs:
+        consumer.announce_start(structlog.get_logger(), config)
+    assert [(log["balance_invalidation"], log["log_level"]) for log in logs] == [(status, level)]
+
+
+# D-148: the new fault point follows the D-085 arming rules.
+def test_after_db_before_invalidation_is_a_fault_point():
+    config = Config.from_env(_env(FAULT_POINT="AFTER_DB_BEFORE_INVALIDATION", FAULT_PAYMENT_ID=PAYMENT))
+    assert config.fault_point == "AFTER_DB_BEFORE_INVALIDATION"
+    assert config.fault_armed
+    with capture_logs() as logs:
+        consumer.announce_start(structlog.get_logger(), config)
+    assert [(log["fault_point"], log["log_level"]) for log in logs] == [("AFTER_DB_BEFORE_INVALIDATION", "warning")]
+    with pytest.raises(ConfigError, match="FAULT_POINT is set but FAULT_PAYMENT_ID is not"):
+        Config.from_env(_env(FAULT_POINT="AFTER_DB_BEFORE_INVALIDATION"))
 
 
 # REDIS_URL (D-137): ledger-api's rule for ledger.redis.url, the same cases as LedgerRedisPropertiesTest.

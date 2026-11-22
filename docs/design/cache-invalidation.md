@@ -195,8 +195,9 @@ reference guide (Transactions/Multi): "Transactional use requires external synch
 is used by multiple threads/processes." … "Lettuce itself does not synchronize transactional/non-transactional
 invocations regardless of the used API facade." So commands other threads send between `MULTI` and `EXEC` would join
 the transaction, which is why invalidation is one `EVAL`, not a `MULTI`. The worker uses
-redis-py's asyncio connection pool. Order across its own calls doesn't matter: each invalidation is one command, and so
-is the lease.
+redis-py's asyncio connection pool: one client per process, created at startup with `redis_client.create(REDIS_URL)`
+(no retries) and closed on stop, whose pool hands each command a connection. Order across its own calls doesn't
+matter: each invalidation is one command, and so is the lease.
 
 ### 2.3 Constants
 
@@ -373,6 +374,18 @@ sequenceDiagram
 
 The ids come from the event (customer, merchant) and from system ids memoized after the first lookup (D-048: they
 never change), so the `duplicate_skipped` path, which reads no payment row, can still invalidate.
+
+In code (D-152): `settlement_worker/balance_cache.py` holds `INVALIDATE` (pinned against the §2.1 markers by
+`tests/unit/test_balance_cache_script.py`, D-143), `keys()`, `invalidate()` (one `EVAL`, bounded by
+`INVALIDATION_BOUND_MS` = connect 200 + command 100, never raising) and `BalanceInvalidator`, whose `after_commit`
+the consumer calls after `settlement.handle` returns a committed outcome. ESCROW's and PLATFORM_FEES' ids are read
+once at startup, only while invalidation is active, so no DB call sits between the commit and the offset commit. A
+failure emits `cache_invalidation_failed` (WARNING: `payment_id`, `correlation_id`, `error_class`) and counts
+`settlement_balance_invalidations_total{result="failed"}`; a success counts `{result="sent"}`. `after_commit` catches
+everything, its own logging and metrics included, so nothing reaches the D-107 classifier. It runs only while
+`REDIS_URL` is set and `WORKER_BALANCE_INVALIDATION=1`; `worker_started.balance_invalidation` reports `on`, `off`
+(WARNING, the benchmark's TTL-only mode) or `no_redis`. `FAULT_POINT=AFTER_DB_BEFORE_INVALIDATION` fires whether or
+not Redis is configured.
 
 ### 3.8 Reconciliation tick
 

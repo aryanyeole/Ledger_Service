@@ -1,5 +1,5 @@
 """The worker's configuration, from the environment (D-081, D-085, D-091, D-108, D-109, D-111, D-112, D-113,
-D-114, D-125, D-129, D-137).
+D-114, D-125, D-129, D-137, D-148, D-152).
 
 Names follow .env.example where it has them. Anything invalid is a ConfigError, and the worker
 refuses to start (exit 2). The password is never part of an error message or the repr.
@@ -19,7 +19,21 @@ AFTER_DB_BEFORE_OFFSET = "AFTER_DB_BEFORE_OFFSET"
 RAISE_BEFORE_COMMIT = "RAISE_BEFORE_COMMIT"
 # Not a crash: the first two offset commits of the payment's record fail, then commits are real (D-129).
 FAIL_OFFSET_COMMIT = "FAIL_OFFSET_COMMIT"
-FAULT_POINTS = (AFTER_PROCESSOR_BEFORE_DB, AFTER_DB_BEFORE_OFFSET, RAISE_BEFORE_COMMIT, FAIL_OFFSET_COMMIT)
+# A crash after the settle transaction commits and before the balance invalidation (D-148), whether or not
+# Redis is configured: it marks the place, not the call (D-152).
+AFTER_DB_BEFORE_INVALIDATION = "AFTER_DB_BEFORE_INVALIDATION"
+FAULT_POINTS = (
+    AFTER_PROCESSOR_BEFORE_DB,
+    AFTER_DB_BEFORE_OFFSET,
+    RAISE_BEFORE_COMMIT,
+    FAIL_OFFSET_COMMIT,
+    AFTER_DB_BEFORE_INVALIDATION,
+)
+
+# worker_started.balance_invalidation (D-152).
+INVALIDATION_ON = "on"
+INVALIDATION_OFF = "off"
+INVALIDATION_NO_REDIS = "no_redis"
 
 _TOPIC_NAME = re.compile(r"[a-zA-Z0-9._-]{1,249}")
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -88,10 +102,24 @@ class Config:
     reconcile_statement_timeout_ms: int
     # Redis (D-137): None when REDIS_URL is unset, so the worker has no Redis client.
     redis_url: str | None
+    # WORKER_BALANCE_INVALIDATION (D-142, D-152): False only for the benchmark's TTL-only mode (D-146).
+    balance_invalidation: bool = True
 
     @property
     def fault_armed(self) -> bool:
         return self.fault_point is not None
+
+    @property
+    def balance_invalidation_status(self) -> str:
+        """worker_started.balance_invalidation: no_redis without REDIS_URL, else on or off (D-152)."""
+        if self.redis_url is None:
+            return INVALIDATION_NO_REDIS
+        return INVALIDATION_ON if self.balance_invalidation else INVALIDATION_OFF
+
+    @property
+    def invalidates(self) -> bool:
+        """A Redis client exists and invalidation is on: every committed settle invalidates (D-148)."""
+        return self.balance_invalidation_status == INVALIDATION_ON
 
     def db_params(self) -> dict:
         return {
@@ -181,6 +209,10 @@ class Config:
         redis_url = (env.get("REDIS_URL") or "").strip() or None
         if redis_url is not None:
             redis_address(redis_url)
+        # Balance invalidation (D-142, D-152): 0 is the benchmark's TTL-only mode, announced like an armed fault.
+        invalidation = env.get("WORKER_BALANCE_INVALIDATION", "1")
+        if invalidation not in ("0", "1"):
+            raise ConfigError(f"WORKER_BALANCE_INVALIDATION must be 0 or 1, was {invalidation!r}")
 
         return cls(
             postgres_host=text("POSTGRES_HOST", "localhost"),
@@ -215,4 +247,5 @@ class Config:
             reconcile_interval_ms=reconcile_interval,
             reconcile_statement_timeout_ms=integer("RECONCILE_STATEMENT_TIMEOUT_MS", "30000", 1, 600_000),
             redis_url=redis_url,
+            balance_invalidation=invalidation == "1",
         )

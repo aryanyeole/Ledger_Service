@@ -15,18 +15,13 @@ import uuid
 import pytest
 import redis.exceptions
 
-from settlement_worker import redis_client
+from settlement_worker import balance_cache, redis_client
 from support import stack
 
-INVALIDATE = """-- ledger:v1 balance invalidation (D-142). KEYS: ledger:v1:bal:{id}, ledger:v1:bal-gen:{id} per account.
--- ARGV[1]: a fresh token for this call.
-for i = 1, #KEYS, 2 do
-  redis.call('DEL', KEYS[i])
-  redis.call('SET', KEYS[i + 1], ARGV[1], 'PX', 300000)
-end
-return #KEYS
-"""
+# The worker's own copy since T8, pinned against the design doc by tests/unit/test_balance_cache_script.py (D-143).
+INVALIDATE = balance_cache.INVALIDATE
 
+# ledger-api's populate script (the worker never populates), verbatim from the design doc §2.1.
 POPULATE = """-- ledger:v1 balance populate (D-142). KEYS[1]: ledger:v1:bal:{id}; KEYS[2]: ledger:v1:bal-gen:{id}.
 -- ARGV[1]: token seen by the MGET ('' if absent); ARGV[2]: the value; ARGV[3]: the value TTL in ms.
 local token = redis.call('GET', KEYS[2])

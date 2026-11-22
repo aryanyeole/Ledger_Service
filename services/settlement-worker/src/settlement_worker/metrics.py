@@ -2,7 +2,7 @@
 
 prometheus_client's own HTTP server, on its default registry, in a daemon thread. Application
 metrics are module-level collectors on that registry: RETRIES (D-108), DEAD_LETTERS (D-111),
-RECONCILE (D-116). The host and port reported are the ones the server actually bound
+RECONCILE (D-116), BALANCE_INVALIDATIONS (D-152). The host and port reported are the ones the server actually bound
 (server_address), so port 0 works. Any OSError while binding, an unresolvable host included, is a
 MetricsBindError: the worker treats it as invalid configuration (exit 2).
 """
@@ -18,6 +18,10 @@ from prometheus_client import REGISTRY, CollectorRegistry, Counter, Gauge, start
 RETRIES = Counter("settlement_retries", "Records scheduled for a retry in place (D-108)", ["error_class", "sqlstate"])
 # Exposed as settlement_dead_letters_total (D-111).
 DEAD_LETTERS = Counter("settlement_dead_letters", "Records dead-lettered to the DLQ topic (D-111)", ["error_class"])
+# Exposed as settlement_balance_invalidations_total; result is sent or failed (D-142, D-152).
+BALANCE_INVALIDATIONS = Counter(
+    "settlement_balance_invalidations", "Balance invalidations after a committed settle (D-148)", ["result"]
+)
 
 
 class ReconcileMetrics:

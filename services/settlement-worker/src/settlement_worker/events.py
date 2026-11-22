@@ -28,6 +28,7 @@ PROCESSOR_TIMEOUT = "processor_timeout"
 RECONCILIATION_COMPLETED = "reconciliation_completed"
 DRIFT_DETECTED = "drift_detected"
 RECONCILIATION_FAILED = "reconciliation_failed"
+CACHE_INVALIDATION_FAILED = "cache_invalidation_failed"
 
 EVENT_KEYS: dict[str, frozenset[str]] = {
     FAULT_INJECTED: frozenset({"point", "payment_id", "correlation_id"}),
@@ -37,7 +38,14 @@ EVENT_KEYS: dict[str, frozenset[str]] = {
     PAYMENT_SETTLED: frozenset({"event_id", "payment_id", "transaction_id", "lock_wait_ms", "correlation_id"}),
     PAYMENT_RELEASED: frozenset({"event_id", "payment_id", "transaction_id", "lock_wait_ms", "correlation_id"}),
     WORKER_STARTED: frozenset(
-        {"consumer_group", "fault_point", "processor_outage", "reconcile_interval_ms", "correlation_id"}
+        {
+            "consumer_group",
+            "fault_point",
+            "processor_outage",
+            "reconcile_interval_ms",
+            "balance_invalidation",
+            "correlation_id",
+        }
     ),
     PARTITIONS_ASSIGNED: frozenset({"partitions", "correlation_id"}),
     PROCESSING_FAILED: frozenset({"topic", "partition", "offset", "error", "correlation_id"}),
@@ -64,6 +72,8 @@ EVENT_KEYS: dict[str, frozenset[str]] = {
          "first_drift_as_of", "correlation_id"}
     ),
     RECONCILIATION_FAILED: frozenset({"run_id", "error_class", "error", "correlation_id"}),
+    # Balance invalidation (D-142, D-152): never keys, account ids or values.
+    CACHE_INVALIDATION_FAILED: frozenset({"payment_id", "error_class", "correlation_id"}),
 }
 
 LEVELS = frozenset({"info", "warning", "error"})
