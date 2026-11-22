@@ -24,6 +24,8 @@ import io.lettuce.core.SocketOptions;
 import io.lettuce.core.TimeoutOptions;
 import io.lettuce.core.api.StatefulRedisConnection;
 import io.lettuce.core.api.sync.RedisCommands;
+import io.lettuce.core.resource.ClientResources;
+import io.lettuce.core.resource.Delay;
 
 // The only class in ledger-api that touches Lettuce (D-135, D-137, docs/design/cache-invalidation.md).
 //  - One shared connection, no pool, no MULTI (RedisOps has none), so commands execute in the order
@@ -34,7 +36,8 @@ import io.lettuce.core.api.sync.RedisCommands;
 //    connect attempt is in flight (a flag, never a lock anyone waits on) and at most one starts per
 //    bypass window; every other caller, invalidations included, gets Reply.unavailable() at once.
 //    Lettuce's auto-reconnect covers only a connection that was once established, so a failed
-//    first connect is retried here, by the next caller after the window.
+//    first connect is retried here, by the next caller after the window. Auto-reconnect waits
+//    RECONNECT_DELAY between attempts, capped at 1 s, not Lettuce's 30 s default (D-153).
 //  - After any failure, optional() returns unavailable for BYPASS without touching Redis: reads,
 //    populates and the lease. always() never bypasses on an established connection: invalidations.
 //  - Nothing escapes: every exception becomes Reply.unavailable(), logged as a WARN once per entry
@@ -52,6 +55,15 @@ public class RedisGateway implements AutoCloseable {
 	public static final Duration CONNECT_TIMEOUT = Duration.ofMillis(200);
 
 	public static final Duration BYPASS = Duration.ofSeconds(1);
+
+	/**
+	 * Auto-reconnect's delay between attempts (D-153): Delay.exponential's 2^(attempt-1) ms, floored at 10 ms and
+	 * capped at 1 s, so 10, 10, 10, 10, 16, 32, ..., 512, 1000, 1000 ms. Lettuce's default caps at 30 s, so a
+	 * restarted Redis could be ignored for up to 30 s; this costs at most one connect attempt per second while it's
+	 * down.
+	 */
+	public static final Delay RECONNECT_DELAY = Delay.exponential(Duration.ofMillis(10), Duration.ofSeconds(1), 2,
+			TimeUnit.MILLISECONDS);
 
 	/** A command's outcome: available with a value (null for an absent key), or unavailable. */
 	public record Reply<T>(boolean available, T value) {
@@ -93,11 +105,30 @@ public class RedisGateway implements AutoCloseable {
 	private volatile Session session;
 
 	public RedisGateway(LedgerRedisProperties properties) {
-		this(RedisClient.create(redisUri(properties.host(), properties.port())), System::nanoTime);
+		this(clientResources(), properties);
 	}
 
-	private RedisGateway(RedisClient client, LongSupplier nanoClock) {
-		this(lettuceConnector(configured(client)), () -> client.shutdown(0, 2, TimeUnit.SECONDS), nanoClock);
+	private RedisGateway(ClientResources resources, LedgerRedisProperties properties) {
+		this(resources, RedisClient.create(resources, redisUri(properties.host(), properties.port())), System::nanoTime);
+	}
+
+	// Close order: the connection (close()), then the client, then the resources it was given (a RedisClient shuts
+	// down only resources it created itself).
+	private RedisGateway(ClientResources resources, RedisClient client, LongSupplier nanoClock) {
+		this(lettuceConnector(configured(client)), () -> {
+			try {
+				client.shutdown(0, 2, TimeUnit.SECONDS);
+			}
+			finally {
+				// Unlike RedisClient.shutdown, this returns a future: wait for it, bounded.
+				resources.shutdown(0, 2, TimeUnit.SECONDS).awaitUninterruptibly(3, TimeUnit.SECONDS);
+			}
+		}, nanoClock);
+	}
+
+	/** The gateway's client resources: Lettuce's defaults except the reconnect delay (D-153). */
+	static ClientResources clientResources() {
+		return ClientResources.builder().reconnectDelay(RECONNECT_DELAY).build();
 	}
 
 	// Package-private for RedisGatewayTest: a fake connector and clock.
