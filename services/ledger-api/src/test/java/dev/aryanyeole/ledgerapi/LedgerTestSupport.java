@@ -12,11 +12,13 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 
 import javax.sql.DataSource;
 
 // Direct database reads for API tests, each on a fresh app-role connection that asserts
-// current_user (D-036). Read-only: every connection is rolled back on close.
+// current_user (D-036). Read-only: every connection is rolled back on close. The one exception is
+// directDeposit, a balanced posting that commits (the D-056 sub-cent fixture).
 public final class LedgerTestSupport {
 
 	public static final String APP = "ledger_api_app";
@@ -48,6 +50,54 @@ public final class LedgerTestSupport {
 		catch (SQLException | RuntimeException | Error e) {
 			conn.close();
 			throw e;
+		}
+	}
+
+	// EXTERNAL -amount -> account +amount, one transaction, balances updated, accounts locked
+	// in ascending id order (invariants 1 and 4), explicit commit. Bypasses the API, so it can post
+	// amounts the API refuses (sub-cent, D-056). Moved unchanged from AccountsApiTest.postDeposit.
+	public static void directDeposit(DataSource dataSource, long accountId, String amount) throws SQLException {
+		long external = SystemAccountFixture.external(dataSource);
+		try (Connection conn = connectApp(dataSource)) {
+			try {
+				long txId;
+				try (PreparedStatement ps = conn.prepareStatement(
+						"INSERT INTO transactions (kind, reference) VALUES ('DEPOSIT', ?) RETURNING id")) {
+					ps.setString(1, "t2-" + UUID.randomUUID());
+					try (ResultSet rs = ps.executeQuery()) {
+						assertThat(rs.next()).isTrue();
+						txId = rs.getLong(1);
+					}
+				}
+				try (PreparedStatement ps = conn
+					.prepareStatement("INSERT INTO entries (transaction_id, account_id, amount) VALUES (?, ?, ?)")) {
+					for (Object[] leg : List.of(new Object[] { external, new BigDecimal(amount).negate() },
+							new Object[] { accountId, new BigDecimal(amount) })) {
+						ps.setLong(1, txId);
+						ps.setLong(2, (Long) leg[0]);
+						ps.setBigDecimal(3, (BigDecimal) leg[1]);
+						assertThat(ps.executeUpdate()).isEqualTo(1);
+					}
+				}
+				try (PreparedStatement ps = conn
+					.prepareStatement("SELECT id FROM accounts WHERE id = ANY (?) ORDER BY id FOR UPDATE")) {
+					ps.setArray(1, conn.createArrayOf("bigint", new Object[] { external, accountId }));
+					ps.executeQuery().close();
+				}
+				try (PreparedStatement ps = conn
+					.prepareStatement("UPDATE accounts SET balance = balance + ? WHERE id = ?")) {
+					for (long id : new long[] { Math.min(external, accountId), Math.max(external, accountId) }) {
+						BigDecimal delta = new BigDecimal(amount);
+						ps.setBigDecimal(1, (id == external) ? delta.negate() : delta);
+						ps.setLong(2, id);
+						assertThat(ps.executeUpdate()).isEqualTo(1);
+					}
+				}
+				conn.commit();
+			}
+			finally {
+				conn.rollback();
+			}
 		}
 	}
 
