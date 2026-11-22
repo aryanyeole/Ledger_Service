@@ -83,6 +83,13 @@ commands across connections. Both orders are safe for the compare-and-set (§4.2
 late worker invalidation serves the old value: the ordinary commit-to-invalidation window, stretched by the pause and
 bounded by the value TTL (§5 row 2c).
 
+**Most worker invalidations sent during a pause are lost, not late** (T11). The worker uses redis-py's pool: during a
+pause, the first invalidation's `EVAL` reaches the server and times out only if the pool already had an open connection;
+redis-py drops that connection, and every later invalidation opens a new connection whose handshake (`HELLO`) hangs, so
+its `EVAL` is never sent. On resume at most one worker invalidation executes; the others are lost, and those balances
+stay stale up to the value TTL (§5 row 5). In T11 (b2) a worker with no open connection lost all five. ledger-api
+differs: its single Lettuce connection stays open, so its invalidations execute in order on resume (§5 row 2b, T10).
+
 ### 1.6 Never inside a DB transaction (CLAUDE.md invariant 5, D-147, D-149)
 
 Redis is a network call, and invariant 5 names it: "In ledger-api, Redis calls run only outside a transaction: on a
@@ -467,7 +474,7 @@ value TTL (60 s), because the stale value is written with `PX` = the value TTL.
 | 2 | Redis paused (the server accepts bytes but doesn't answer) | Each call waits the 100 ms command timeout; then 1 s of bypass for reads, populates and the lease; every posting's invalidation still waits up to 100 ms | None | 100 ms per call; about one read timeout per second per process | T10 (paused); T11 (paused) |
 | 2a | Paused: an idempotency `SET NX PX` executes late on resume | The entry appears on resume with its 10 min PX starting then; its bytes are the DB's text | None while the delay before execution < margin. **Residual:** a longer delay lets the entry outlive its row's purge, so a purged key could replay | Margin (1 h) | T10 paused characterization: pause, an owner request completes (its `SET NX` times out), unpause → the entry exists, its bytes equal `response_body::text`, `PTTL` > TTL − 5 s (the TTL started at resume) |
 | 2b | Paused: a populate `EVAL` executes late | Nothing visible: on the same connection, a later invalidation executes after it and deletes what it wrote; the token comparison still applies | None. Cross-connection order (a worker invalidation): both orders safe (§4.2) | Token PX, then §4.3 | T10 deterministic paused case: late populate `EVAL`, then the transfer's invalidation on the same connection → the next GET equals the DB (mutation: invalidation honours the bypass → stale hit). Cross-connection orders: argued (§4.2) |
-| 2c | Paused: an invalidation `EVAL` executes late | Values are deleted on resume. The API's own: same connection, so read-your-writes holds. A worker's: an API `MGET` that executes before it serves the old value | Stale reads only: the commit-to-invalidation window stretched by the pause | Value TTL | T11 paused, plus a post-unpause check that every account touched during the pause reads equal to the DB once settled |
+| 2c | Paused: invalidations sent during the pause | The API's own: its single Lettuce connection stays open, so they execute in order on resume and read-your-writes holds (§5 row 2b). The worker's: redis-py drops the connection on the first timeout and every later invalidation's new connection hangs in its handshake (`HELLO`), so at most one worker `EVAL` (the first, and only if a connection was already open) executes on resume; the others are lost (§1.5) | Stale reads only: values a lost worker invalidation should have deleted stay stale | Value TTL (§5 row 5) | T11 (b2): primed balances, a pause, five settles; merchant and fees stale right after the unpause (the API's invalidations had changed customer's and ESCROW's tokens), all four equal to the DB past the 3 s TTL. T11 (b1): with nothing cached during the outage, every value present afterwards equals the DB |
 | 2d | Paused: a lease `SET` executes late | The instance already treated the lease as unavailable and ran; on resume a lease appears that nobody is running under, so other instances skip | None: up to one extra skipped period | One lease period | Argued |
 | 2e | Redis paused longer than the token PX | A token set before the pause expires during it; a queued CAS from a reader that saw "absent" writes a pre-commit value | Stale reads only | Value TTL | Argued (§4.3) |
 | 3 | `FLUSHALL` mid-run | Misses: idempotency replays come from the DB (byte-identical) and repopulate; balances are read from the DB. A reader that saw token T and CASes after the flush fails (T ≠ absent). The lease is gone, so another instance may run early | None for idempotency. A reader that saw "absent" before the flush and CASes after a writer's token was flushed can write a stale value (the §4.3 shape). A double reconciliation run is harmless (D-115) | Value TTL | T10 (flushed mid-run) |
@@ -561,6 +568,9 @@ The lease stays in Redis to save scans; fencing would make it a correctness mech
 | C | As A | Stopped, then paused |
 
 Same seed and the same k6 mix in every mode; 3 runs per mode.
+
+Mode C paused will show stale hits, up to the value TTL, from lost worker invalidations (§1.5, §5 row 2c). That is
+expected, not a defect: D-146 asserts stale misses = 0 only.
 
 ### 8.2 Stack and mode guard
 

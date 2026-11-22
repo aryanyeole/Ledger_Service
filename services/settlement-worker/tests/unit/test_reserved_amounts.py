@@ -38,6 +38,8 @@ CENTS_13 = {
     ("e2e/test_crash_recovery.py", "113.13"): 1,
     # The cross-language invalidation proof's declined release, case (b) (T9).
     ("cache/test_balance_invalidation.py", "10.13"): 1,
+    # The Redis outage proof's declined payments (T11): DECLINED, reused for every decline.
+    ("cache/test_redis_outage.py", "10.13"): 1,
     # Every other authorize is a decline, so the worker releases as well as settles.
     ("e2e/test_cross_operation_lock_order.py", "10.13"): 1,
     # The smoke test's release case and its expected legs.
