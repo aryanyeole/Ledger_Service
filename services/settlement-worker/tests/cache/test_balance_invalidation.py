@@ -23,20 +23,18 @@ not a third copy. Each case has a fresh consumer group committed at the topic's 
 import asyncio
 import re
 import time
-import urllib.request
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-from settlement_worker import redis_client
+from support import cache_kit
 from support.failure_kit import fresh_group
 from support.worker_process import start_worker
 
 DOC = Path(__file__).resolve().parents[4] / "docs" / "design" / "cache-invalidation.md"
 CANONICAL_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 ROLES = ("customer", "merchant", "escrow", "fees")
-TERMINAL = ("SETTLED", "FAILED")
 SENT_TIMEOUT_SECONDS = 30
 FORBIDDEN = ("retry_scheduled", "message_dead_lettered", "processing_failed")
 
@@ -100,15 +98,7 @@ async def _payment(cs, payment_id: uuid.UUID) -> tuple[Decimal, Decimal]:
 
 def _redis(cs, body):
     """A raw redis-py client on this stack's Redis (never through the worker); body(client) is a coroutine fn."""
-
-    async def main():
-        client = redis_client.create(cs.redis.url)
-        try:
-            return await body(client)
-        finally:
-            await client.aclose()
-
-    return run(main())
+    return cache_kit.raw_redis(cs.redis.url, body)
 
 
 def _raw(cs, accounts: Accounts) -> dict[str, tuple[str | None, str | None, int]]:
@@ -176,25 +166,12 @@ def _start(cs, group: str, **fault):
 
 
 def _wait_status(cs, payment_id: uuid.UUID, expected: str, timeout: float = 60) -> None:
-    deadline = time.monotonic() + timeout
-    status = None
-    while time.monotonic() < deadline:
-        status = cs.api.payment_status(payment_id)
-        if status in TERMINAL:
-            break
-        time.sleep(0.2)
-    assert status == expected, f"payment {payment_id} is {status}, expected {expected}"
+    cache_kit.wait_status(cs.api, payment_id, expected, timeout)
 
 
 def _counter(worker, result: str) -> Decimal:
     """settlement_balance_invalidations_total{result} from the worker's /metrics, 0 before its first increment."""
-    with urllib.request.urlopen(f"http://127.0.0.1:{worker.metrics_port()}/metrics", timeout=10) as response:
-        text = response.read().decode()
-    prefix = f'settlement_balance_invalidations_total{{result="{result}"}} '
-    for line in text.splitlines():
-        if line.startswith(prefix):
-            return Decimal(line[len(prefix):])
-    return Decimal(0)
+    return cache_kit.invalidations(worker, result)
 
 
 def _wait_sent(cs, worker, accounts: Accounts) -> None:

@@ -44,3 +44,27 @@ def cs(tmp_path_factory) -> CacheStack:
         ) as api:
             stack.wait_for_topics(broker.bootstrap_servers, {stack.TOPIC: {0, 1, 2}, stack.DLQ_TOPIC: {0}})
             yield CacheStack(database, broker, redis, api, stack.AppDb(database), log_dir)
+
+
+# The Redis outage proof's stack (T11): the same shape, its own Redis (stack.redis() binds an explicit free host
+# port, so a stop/start keeps REDIS_URL valid), and a 3 s balance TTL, so (b2) can show that values a lost worker
+# invalidation left stale live at most the TTL (§5 row 5).
+OUTAGE_BALANCE_TTL_ARG = "--ledger.cache.balance.ttl=3s"
+
+
+@pytest.fixture(scope="module")
+def outage_cs(tmp_path_factory) -> CacheStack:
+    jar = stack.find_jar()
+    log_dir = tmp_path_factory.mktemp("cache-outage")
+    with stack.postgres() as database, stack.kafka() as broker, stack.redis() as redis:
+        stack.migrate(database, jar)
+        with stack.ledger_api(
+            database,
+            jar,
+            log_dir,
+            relay_bootstrap=broker.bootstrap_servers,
+            redis_url=redis.url,
+            extra_args=[OUTAGE_BALANCE_TTL_ARG],
+        ) as api:
+            stack.wait_for_topics(broker.bootstrap_servers, {stack.TOPIC: {0, 1, 2}, stack.DLQ_TOPIC: {0}})
+            yield CacheStack(database, broker, redis, api, stack.AppDb(database), log_dir)
