@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.TreeMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -24,17 +25,23 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 import javax.sql.DataSource;
 
+import org.assertj.core.api.SoftAssertions;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.SpringBootTest.WebEnvironment;
+import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
+import org.springframework.context.annotation.Primary;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.testcontainers.containers.GenericContainer;
 
@@ -66,12 +73,14 @@ import dev.aryanyeole.ledgerapi.cache.RedisGateway;
 // BalanceCache's own read and populate: an invalidation between MGET and the compare-and-set makes it
 // write nothing (§4.2); (e) a planted value never reaches the funds check; (f) a 404 isn't cached; (g)
 // sub-cent balances are a 500 on the miss path (and not cached) and on the hit path (D-056); (h) a
-// storm of readers and writers ends with every cached value equal to the DB and the sum unchanged.
+// storm of readers and writers ends with every cached value equal to the DB and the sum unchanged; (i)
+// the controller notes the token before its DB read (§4.2): a transfer committed during that read (the
+// @Primary ArmedAccounts wrapper runs it, for one armed account) makes the populate write nothing.
 // Values are planted with a raw Lettuce client on the patient URI (RedisClientSmokeTest's pattern),
 // never through the gateway. Its own context and Postgres: (g) commits a sub-cent deposit, which
 // leaves EXTERNAL sub-cent too; no case here reads EXTERNAL's balance. The gateway is warmed first
 // (BUG-016).
-@Import({ TestcontainersConfiguration.class, RedisTestcontainersConfiguration.class })
+@Import({ TestcontainersConfiguration.class, RedisTestcontainersConfiguration.class, BalanceCacheTest.Wrapper.class })
 @SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT,
 		properties = { EdgeProbe.API_KEYS_PROPERTY, "ledger.cache.balance.enabled=true" })
 class BalanceCacheTest {
@@ -108,6 +117,9 @@ class BalanceCacheTest {
 	@Autowired
 	MeterRegistry meters;
 
+	@Autowired
+	ArmedAccounts armedAccounts;
+
 	private ConcurrentRequestHarness harness;
 
 	private final HttpClient client = HttpClient.newHttpClient();
@@ -127,8 +139,45 @@ class BalanceCacheTest {
 
 	@AfterEach
 	void tearDown() {
+		this.armedAccounts.disarm();
 		this.rawConnection.close();
 		this.rawClient.shutdown();
+	}
+
+	// (i) §4.2 through the controller: MGET (miss, token T1) -> DB read, during which a transfer commits and
+	// invalidates (T2) -> the compare-and-set with T1 writes nothing. (d) drives BalanceCache directly with a token
+	// it picks, so only this case sees the controller's order (T10's 2b couldn't either).
+	@Test
+	void theControllerNotesTheTokenBeforeItsDbRead() throws Exception {
+		long a = funded("100.00");
+		long b = this.harness.createAccount("CUSTOMER");
+		assertThat(rawValue(a)).as("A starts uncached: the GET takes the miss path").isNull();
+		this.armedAccounts.arm(a, () -> transfer(a, b, "30.00"));
+		double stale = populates("stale_token");
+		double written = populates("written");
+
+		HttpResponse<byte[]> during = get(a);
+
+		Response armed = this.armedAccounts.transferResponse();
+		assertThat(armed).as("the wrapper fired and ran the transfer during the DB read").isNotNull();
+		assertThat(armed.status()).as("the armed transfer: %s", armed.exception()).isEqualTo(201);
+		assertThat(xCache(during)).isEqualTo("miss");
+		assertThat(balanceOf(during)).as("the pre-transfer balance the wrapper returned").isEqualTo("100.00");
+
+		// Soft: a broken order fails several of these at once, and each failure is reported.
+		double staleDelta = populates("stale_token") - stale;
+		double writtenDelta = populates("written") - written;
+		String value = rawValue(a);
+		HttpResponse<byte[]> next = get(a);
+		SoftAssertions soft = new SoftAssertions();
+		soft.assertThat(staleDelta).as("populate{stale_token}").isEqualTo(1);
+		soft.assertThat(writtenDelta).as("populate{written}").isZero();
+		soft.assertThat(value).as("no value written").isNull();
+		soft.assertThat(xCache(next)).as("the next read's X-Cache").isEqualTo("miss");
+		soft.assertThat(balanceOf(next)).as("the next read's balance").isEqualTo("70.00");
+		soft.assertThat(balanceOf(next)).as("the next read = DB")
+			.isEqualTo(money(this.accounts.balance(a).orElseThrow().balance()));
+		soft.assertAll();
 	}
 
 	// (a)
@@ -529,6 +578,81 @@ class BalanceCacheTest {
 		Map<String, Long> d = new TreeMap<>();
 		after.forEach((name, value) -> d.put(name, Math.round(value - before.get(name))));
 		return d;
+	}
+
+	// (i)'s wrapper. For the one armed account, once: read the balance, run the armed transfer on another thread and
+	// wait for its response (bounded), then return the read from BEFORE the transfer. Every other call, and every
+	// call once disarmed, is the real read. The id is matched by value (AtomicLong): an AtomicReference<Long> would
+	// compare references, and a Long above 127 boxed separately never matches (T4's ArmableHook slip). No deadlock:
+	// the balance read runs outside any transaction, so the transfer's account locks never wait on it. Not final:
+	// AccountRepository is a @Repository, so Spring proxies it with a CGLIB subclass (exception translation).
+	static class ArmedAccounts extends AccountRepository {
+
+		private static final long DISARMED = -1;
+
+		private static final Duration TRANSFER_BOUND = Duration.ofSeconds(30);
+
+		private final AtomicLong armed = new AtomicLong(DISARMED);
+
+		private final AtomicReference<Supplier<Response>> transfer = new AtomicReference<>();
+
+		private final AtomicReference<Response> response = new AtomicReference<>();
+
+		ArmedAccounts(JdbcClient jdbc) {
+			super(jdbc);
+		}
+
+		void arm(long id, Supplier<Response> onRead) {
+			this.response.set(null);
+			this.transfer.set(onRead);
+			this.armed.set(id);
+		}
+
+		void disarm() {
+			this.armed.set(DISARMED);
+			this.transfer.set(null);
+		}
+
+		/** The armed transfer's response, or null if the wrapper never fired. */
+		Response transferResponse() {
+			return this.response.get();
+		}
+
+		@Override
+		Optional<Balance> balance(long id) {
+			if (!this.armed.compareAndSet(id, DISARMED)) {
+				return super.balance(id);
+			}
+			Optional<Balance> before = super.balance(id);
+			Supplier<Response> run = this.transfer.getAndSet(null);
+			ExecutorService other = Executors.newSingleThreadExecutor();
+			try {
+				this.response.set(other.submit(run::get).get(TRANSFER_BOUND.toMillis(), TimeUnit.MILLISECONDS));
+			}
+			catch (Exception ex) {
+				// Recorded, never thrown: the test asserts the 201, so a failed transfer is a clear assertion.
+				this.response.set(new Response(-1, null, null, ex, 0, 0));
+				if (ex instanceof InterruptedException) {
+					Thread.currentThread().interrupt();
+				}
+			}
+			finally {
+				other.shutdownNow();
+			}
+			return before;
+		}
+
+	}
+
+	@TestConfiguration(proxyBeanMethods = false)
+	static class Wrapper {
+
+		@Bean
+		@Primary
+		ArmedAccounts armedAccounts(JdbcClient jdbc) {
+			return new ArmedAccounts(jdbc);
+		}
+
 	}
 
 }
