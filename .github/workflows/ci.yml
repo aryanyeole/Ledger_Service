@@ -40,7 +40,9 @@ jobs:
     # Job durations over n = 14 warm-cache runs: min 6.48, median 7.47, max 8.05 min (runs 41601291439,
     # 41603867870, 41608478669, 41609616267, and 41610244246 attempts 1-10). Attempt 10 failed in its
     # ledger-api job (BUG-013); this job runs on its own runner and completed normally, so it counts.
-    timeout-minutes: 15
+    # Provisional for M5 T9 (D-134's method): the M5 stacks (tests/cache, then T11 and T13) add runtime before there
+    # are measured runs to calibrate from; 15 -> 20. T16 recalibrates from measured runs and records the value.
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: services/settlement-worker

@@ -13,7 +13,6 @@ first batch (D-080), the DLQ after every tick until it is verified, an empty one
 """
 
 import asyncio
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -49,17 +48,6 @@ def rs(tmp_path_factory) -> ReconciliationStack:
             yield ReconciliationStack(database, broker, api, stack.AppDb(database), stack.WorkerDb(database), log_dir)
 
 
-def _wait_for_topics(bootstrap: str, expected: dict[str, set[int]], timeout: float = 60) -> None:
-    deadline = time.monotonic() + timeout
-    found: dict = {}
-    while time.monotonic() < deadline:
-        found = {topic: asyncio.run(stack.topic_partitions(bootstrap, topic)) for topic in expected}
-        if found == expected:
-            return
-        time.sleep(0.25)
-    raise AssertionError(f"the relay did not create {expected} within {timeout} s: {found}")
-
-
 @pytest.fixture(scope="module")
 def relay_rs(tmp_path_factory) -> ReconciliationStack:
     jar = stack.find_jar()
@@ -67,5 +55,5 @@ def relay_rs(tmp_path_factory) -> ReconciliationStack:
     with stack.postgres() as database, stack.kafka() as broker:
         stack.migrate(database, jar)
         with stack.ledger_api(database, jar, log_dir, relay_bootstrap=broker.bootstrap_servers) as api:
-            _wait_for_topics(broker.bootstrap_servers, {stack.TOPIC: {0, 1, 2}, stack.DLQ_TOPIC: {0}})
+            stack.wait_for_topics(broker.bootstrap_servers, {stack.TOPIC: {0, 1, 2}, stack.DLQ_TOPIC: {0}})
             yield ReconciliationStack(database, broker, api, stack.AppDb(database), stack.WorkerDb(database), log_dir)
