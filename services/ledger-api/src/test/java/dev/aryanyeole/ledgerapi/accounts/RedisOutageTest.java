@@ -100,8 +100,15 @@ class RedisOutageTest {
 
 	private static final String TRANSFERS = "/v1/transfers";
 
-	// Lettuce's default reconnect delay doubles from 1 ms to a 30 s cap (finding, PR body); 45 s covers it.
-	private static final Duration STOPPED_RECOVERY_BOUND = Duration.ofSeconds(45);
+	// Stopped mode keeps Redis down at least this long from the stop. Under Lettuce's default reconnect delay
+	// (2^(n-1) ms, capped at 30 s) the attempts after a 20 s outage are ~8.2 s then ~16.4 s apart, so recovery
+	// takes ~12 s or more and the 5 s bound below fails; with RedisGateway.RECONNECT_DELAY (capped at 1 s, D-153)
+	// it takes about a second at most. A shorter outage wouldn't tell the two apart.
+	private static final Duration STOPPED_HOLD = Duration.ofSeconds(20);
+
+	// D-153's bound. ledger.test.outage.recovery-bound-seconds raises it for a diagnostic run only (T10b's red).
+	private static final Duration STOPPED_RECOVERY_BOUND = Duration
+		.ofSeconds(Long.getLong("ledger.test.outage.recovery-bound-seconds", 5));
 
 	private static final Duration PAUSED_REQUEST_BOUND = Duration.ofSeconds(2);
 
@@ -172,13 +179,18 @@ class RedisOutageTest {
 		try {
 			window(before, latencies, null);
 			assertOutageTripwires("stopped", start, counters());
+			long heldMillis = (System.nanoTime() - downAt) / 1_000_000;
+			if (heldMillis < STOPPED_HOLD.toMillis()) {
+				Thread.sleep(STOPPED_HOLD.toMillis() - heldMillis);
+			}
 		}
 		finally {
 			docker().startContainerCmd(containerId()).exec();
 		}
+		long downMillis = (System.nanoTime() - downAt) / 1_000_000;
 		long recoveryMillis = awaitRecovered(STOPPED_RECOVERY_BOUND);
-		System.out.printf("REDIS_OUTAGE stopped windowMs=%d timeToRecoverMs=%d dbsizeAfterStart=%d%n",
-				(System.nanoTime() - downAt) / 1_000_000, recoveryMillis, raw(RedisCommands::dbsize));
+		System.out.printf("REDIS_OUTAGE stopped downMs=%d timeToRecoverMs=%d boundMs=%d dbsizeAfterStart=%d%n",
+				downMillis, recoveryMillis, STOPPED_RECOVERY_BOUND.toMillis(), raw(RedisCommands::dbsize));
 		recover(before, "stopped", false);
 	}
 
