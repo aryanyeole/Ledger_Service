@@ -36,6 +36,8 @@ CENTS_13 = {
     ("e2e/test_crash_recovery.py", "0.13"): 1,
     ("e2e/test_crash_recovery.py", "10.13"): 1,
     ("e2e/test_crash_recovery.py", "113.13"): 1,
+    # The cross-language invalidation proof's declined release, case (b) (T9).
+    ("cache/test_balance_invalidation.py", "10.13"): 1,
     # Every other authorize is a decline, so the worker releases as well as settles.
     ("e2e/test_cross_operation_lock_order.py", "10.13"): 1,
     # The smoke test's release case and its expected legs.

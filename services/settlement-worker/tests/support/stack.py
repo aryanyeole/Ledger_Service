@@ -389,6 +389,19 @@ async def create_topics(bootstrap: str, topics: dict[str, tuple[int, dict[str, s
         await admin.close()
 
 
+def wait_for_topics(bootstrap: str, expected: dict[str, set[int]], timeout: float = 60) -> None:
+    """Until each topic has exactly the expected partitions: the relay creates both topics itself (D-080, D-110).
+    Moved unchanged from tests/reconciliation/conftest.py (T9), so every relay-on stack waits the same way."""
+    deadline = time.monotonic() + timeout
+    found: dict = {}
+    while time.monotonic() < deadline:
+        found = {topic: asyncio.run(topic_partitions(bootstrap, topic)) for topic in expected}
+        if found == expected:
+            return
+        time.sleep(0.25)
+    raise AssertionError(f"the relay did not create {expected} within {timeout} s: {found}")
+
+
 @contextmanager
 def kafka():
     """apache/kafka:4.3.1, single-node KRaft, auto-create off, mirroring Compose (D-080, D-084).
@@ -463,6 +476,7 @@ def server_command(
     key_hash: str,
     relay_bootstrap: str | None = None,
     redis_url: str | None = None,
+    extra_args: list[str] | None = None,
 ) -> list[str]:
     command = [
         java(),
@@ -492,18 +506,27 @@ def server_command(
             "--ledger.outbox.relay.poll-interval=200ms",
             f"--ledger.outbox.relay.bootstrap-servers={relay_bootstrap}",
         ]
+    # Last, so a caller's argument wins (e.g. T9's --ledger.cache.balance.ttl=10m).
+    command += extra_args or []
     return command
 
 
 @contextmanager
 def ledger_api(
-    database: Database, jar: Path, log_dir: Path, *, relay_bootstrap: str | None = None, redis_url: str | None = None
+    database: Database,
+    jar: Path,
+    log_dir: Path,
+    *,
+    relay_bootstrap: str | None = None,
+    redis_url: str | None = None,
+    extra_args: list[str] | None = None,
 ):
     """The jar in server mode on 127.0.0.1 with one test API key (D-103).
 
     relay_bootstrap None: the outbox relay is off. Otherwise it runs on its 200 ms schedule against
     that broker (D-104). redis_url None: both Redis caches are off; otherwise they use that Redis,
-    which must belong to this stack's database alone (D-138). Only the key's SHA-256 reaches the jar
+    which must belong to this stack's database alone (D-138). extra_args are appended to the command
+    line last. Only the key's SHA-256 reaches the jar
     (D-049); the key itself stays in this process and is never printed. The jar's output goes to a
     file, shown only on failure.
     """
@@ -511,7 +534,7 @@ def ledger_api(
     api_key = secrets.token_urlsafe(24)
     key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
     log_path = log_dir / "ledger-api.log"
-    command = server_command(database, jar, port, key_hash, relay_bootstrap, redis_url)
+    command = server_command(database, jar, port, key_hash, relay_bootstrap, redis_url, extra_args)
     with open(log_path, "wb") as log:
         process = subprocess.Popen(command, env=jar_env(), stdout=log, stderr=subprocess.STDOUT)
     base_url = f"http://127.0.0.1:{port}"
