@@ -36,7 +36,7 @@ from aiokafka import AIOKafkaConsumer, ConsumerRebalanceListener, TopicPartition
 from aiokafka.errors import KafkaError
 
 from settlement_worker import consumer, db, events, logging_setup, processor, settlement
-from settlement_worker.config import Config, ConfigError
+from settlement_worker.config import INVALIDATION_NO_REDIS, Config, ConfigError
 from settlement_worker.envelope import CANONICAL_UUID, FAILED, SETTLED, AuthorizedEvent, OwnResultEvent
 from settlement_worker.money import to_api_string
 from settlement_worker.processor import Decision
@@ -241,6 +241,7 @@ async def _run(config: Config, fault_id, skip_id) -> int:
             fault_point=FAULT_POINT if fault_id else None,
             processor_outage=config.processor_outage,
             reconcile_interval_ms=None,  # the naive worker never reconciles (D-114)
+            balance_invalidation=INVALIDATION_NO_REDIS,  # it refuses REDIS_URL and never invalidates (D-152)
             correlation_id=None,
         )
         while not stop.is_set() and code == consumer.EXIT_STOPPED:
@@ -283,6 +284,10 @@ def main() -> int:
             raise ConfigError(
                 f"the naive worker honours only {FAULT_ENV}, not FAULT_POINT={config.fault_point}"
             )
+        # It never invalidates balances: given a Redis URL it would silently leave every settle's balances
+        # stale (cache-invalidation.md §5 row 7), so it refuses one (D-152).
+        if config.redis_url is not None:
+            raise ConfigError("the naive worker never invalidates balances, so it refuses REDIS_URL")
         fault_id = _payment_id(FAULT_ENV)
         skip_id = _payment_id(SKIP_ENV)
     except ConfigError as ex:

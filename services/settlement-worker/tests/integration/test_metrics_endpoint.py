@@ -35,7 +35,10 @@ def test_metrics_endpoint(migrated_db, kafka, tmp_path):
     with start_worker(
         database=migrated_db, bootstrap_servers=kafka.bootstrap_servers, group="metrics-endpoint", log_dir=tmp_path
     ) as worker:
-        worker.wait_for("worker_started")
+        started = worker.wait_for("worker_started")
+        # The harness strips REDIS_ (D-137), so every existing stack runs without a Redis client (D-152).
+        assert started["balance_invalidation"] == "no_redis"
+        assert started["level"] == "info"
         listening = worker.wait_for("metrics_listening")
         assert listening["host"] == "127.0.0.1"
         assert listening["level"] == "info"

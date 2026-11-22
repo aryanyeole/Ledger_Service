@@ -18,13 +18,13 @@ from aiokafka import TopicPartition
 from aiokafka.errors import KafkaConnectionError
 from structlog.testing import capture_logs
 
-from settlement_worker import consumer
+from settlement_worker import balance_cache, consumer
 from settlement_worker.config import Config
 from settlement_worker.envelope import InvalidEvent
 from settlement_worker.dlq import DlqUnavailable
 from settlement_worker.processor import Decision, ProcessorUnavailable
 from settlement_worker.retry import RetryState
-from settlement_worker.settlement import EscrowShortfall
+from settlement_worker.settlement import EscrowShortfall, Outcome
 
 PAYMENT = "5b01a9e5-32ce-4c82-90b0-ac8c5143460c"
 OTHER = "0f1e2d3c-4b5a-4987-8a6b-5c4d3e2f1a0b"
@@ -509,3 +509,140 @@ def test_a_fatal_failure_is_processing_failed_with_no_dlq_and_no_commit(monkeypa
     assert failed["error"].startswith(f"{type(failure).__name__}: ")
     assert seq.calls == [], "no DLQ produce, no offset commit, no seek or pause"
     assert dlq.letters == []
+
+# --- Balance invalidation after a committed settle (D-142, D-148, D-152) ---
+# settlement.handle is replaced by a stand-in that returns each committed outcome; the invalidator is the real
+# BalanceInvalidator over a fake Redis client that writes into the same ordered log as the fake consumer.
+
+ESCROW_ID, FEES_ID = 2, 3
+
+
+class SeqRedis:
+    """A Redis client whose EVAL is recorded in the shared Sequence; raises `error` if given."""
+
+    def __init__(self, seq, error=None):
+        self.seq = seq
+        self.error = error
+
+    async def eval(self, script, numkeys, *args):
+        if self.error is not None:
+            self.seq.calls.append(("eval-failed",))
+            raise self.error
+        self.seq.calls.append(("eval", list(args[:numkeys])))
+        return numkeys
+
+
+def _run_step_invalidating(record, *, config, commits, fake, invalidator):
+    return asyncio.run(
+        consumer._step(
+            record, TopicPartition(record.topic, record.partition), session=LiveSession(), consumer=fake,
+            config=config, state=RetryState(), commits=commits, dlq=Untouchable("dlq"), rng=random.Random(0),
+            invalidator=invalidator,
+        )
+    )
+
+
+def _returning(outcome):
+    async def handle(*args, **kwargs):
+        return outcome
+
+    return handle
+
+
+# Each committed outcome invalidates customer (12), merchant (13), ESCROW and PLATFORM_FEES once, before the
+# offset commit.
+@pytest.mark.parametrize("outcome", list(Outcome), ids=[o.value for o in Outcome])
+def test_each_committed_outcome_invalidates_the_four_accounts_before_the_offset_commit(monkeypatch, outcome):
+    monkeypatch.setattr(consumer.settlement, "handle", _returning(outcome))
+    seq = Sequence()
+    fake = FakeConsumer(seq)
+    record = Record("ledger.payments.v1", 1, 12, PAYMENT.encode(), _value())
+    config = _config()
+    commits = consumer.Commits(fake, config, random.Random(0))
+    invalidator = balance_cache.BalanceInvalidator(SeqRedis(seq), ESCROW_ID, FEES_ID)
+    result = _run_step_invalidating(record, config=config, commits=commits, fake=fake, invalidator=invalidator)
+    assert result is consumer.Step.OK
+    assert seq.calls == [("eval", balance_cache.keys([12, 13, ESCROW_ID, FEES_ID])), ("commit", {1: 13})]
+
+
+# A failed invalidation is cache_invalidation_failed only: the record still reaches its offset commit, and
+# nothing reaches the D-107 classifier (no retry_scheduled, no message_dead_lettered).
+def test_a_failed_invalidation_still_commits_the_offset_with_no_retry_or_dead_letter(monkeypatch):
+    monkeypatch.setattr(consumer.settlement, "handle", _returning(Outcome.SETTLED))
+    seq = Sequence()
+    fake = FakeConsumer(seq)
+    record = Record("ledger.payments.v1", 1, 12, PAYMENT.encode(), _value())
+    config = _config()
+    commits = consumer.Commits(fake, config, random.Random(0))
+    invalidator = balance_cache.BalanceInvalidator(SeqRedis(seq, OSError("redis down")), ESCROW_ID, FEES_ID)
+    with capture_logs() as logs:
+        result = _run_step_invalidating(record, config=config, commits=commits, fake=fake, invalidator=invalidator)
+    assert result is consumer.Step.OK
+    assert seq.calls == [("eval-failed",), ("commit", {1: 13})]
+    assert [e["event"] for e in logs] == ["processor_called", "cache_invalidation_failed"]
+    assert (logs[1]["payment_id"], logs[1]["error_class"]) == (PAYMENT, "OSError")
+
+
+# D-152: after_commit never raises, even when its own logging does; otherwise the record would be Unclassified,
+# re-run, and dead-lettered after WORKER_MAX_ATTEMPTS.
+def test_an_invalidator_whose_emit_raises_still_commits_the_offset(monkeypatch):
+    def broken_event(*args, **kwargs):
+        raise RuntimeError("the invalidator's emit is broken")
+
+    monkeypatch.setattr(consumer.settlement, "handle", _returning(Outcome.RELEASED))
+    monkeypatch.setattr(balance_cache, "_failed_event", broken_event)
+    seq = Sequence()
+    fake = FakeConsumer(seq)
+    record = Record("ledger.payments.v1", 1, 12, PAYMENT.encode(), _value())
+    config = _config()
+    commits = consumer.Commits(fake, config, random.Random(0))
+    invalidator = balance_cache.BalanceInvalidator(SeqRedis(seq, OSError("redis down")), ESCROW_ID, FEES_ID)
+    with capture_logs() as logs:
+        result = _run_step_invalidating(record, config=config, commits=commits, fake=fake, invalidator=invalidator)
+    assert result is consumer.Step.OK
+    assert seq.calls == [("eval-failed",), ("commit", {1: 13})]
+    names = [e["event"] for e in logs]
+    assert "retry_scheduled" not in names and "message_dead_lettered" not in names, names
+
+
+# No committed transaction, nothing to invalidate: a failing settle never reaches the invalidator.
+def test_a_failed_settle_invalidates_nothing(monkeypatch):
+    async def broken_ledger(*args, **kwargs):
+        raise EscrowShortfall("escrow balance 0.0000 < 100.00")
+
+    monkeypatch.setattr(consumer.settlement, "handle", broken_ledger)
+    seq = Sequence()
+    fake = FakeConsumer(seq)
+    record = Record("ledger.payments.v1", 1, 12, PAYMENT.encode(), _value())
+    config = _config()
+    commits = consumer.Commits(fake, config, random.Random(0))
+    invalidator = balance_cache.BalanceInvalidator(SeqRedis(seq), ESCROW_ID, FEES_ID)
+    result = _run_step_invalidating(record, config=config, commits=commits, fake=fake, invalidator=invalidator)
+    assert result is consumer.Step.FATAL
+    assert seq.calls == []
+
+
+class _Exited(BaseException):
+    pass
+
+
+# D-148: AFTER_DB_BEFORE_INVALIDATION fires after the commit and before the invalidation, with or without Redis.
+@pytest.mark.parametrize("with_redis", [True, False], ids=["redis", "no-redis"])
+def test_the_fault_point_sits_between_the_commit_and_the_invalidation(monkeypatch, with_redis):
+    def exit_(code):
+        raise _Exited(code)
+
+    monkeypatch.setattr(consumer.settlement, "handle", _returning(Outcome.SETTLED))
+    monkeypatch.setattr(consumer.os, "_exit", exit_)
+    seq = Sequence()
+    fake = FakeConsumer(seq)
+    record = Record("ledger.payments.v1", 1, 12, PAYMENT.encode(), _value())
+    config = _config(FAULT_POINT="AFTER_DB_BEFORE_INVALIDATION", FAULT_PAYMENT_ID=PAYMENT)
+    commits = consumer.Commits(fake, config, random.Random(0))
+    invalidator = balance_cache.BalanceInvalidator(SeqRedis(seq), ESCROW_ID, FEES_ID) if with_redis else None
+    with capture_logs() as logs, pytest.raises(_Exited) as exited:
+        _run_step_invalidating(record, config=config, commits=commits, fake=fake, invalidator=invalidator)
+    assert exited.value.args == (consumer.EXIT_FAULT,)
+    assert seq.calls == [], "no invalidation and no offset commit"
+    faults = [e for e in logs if e["event"] == "fault_injected"]
+    assert [(e["point"], e["payment_id"]) for e in faults] == [("AFTER_DB_BEFORE_INVALIDATION", PAYMENT)]

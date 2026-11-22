@@ -304,6 +304,18 @@ def test_main_worker_rejects_the_naive_fault_point():
     assert result.stderr == ""
 
 
+def test_naive_worker_refuses_redis_url():
+    """It never invalidates balances, so a Redis URL would silently leave every settle stale (D-152)."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("FAULT_", "NAIVE_", "WORKER_", "REDIS_"))}
+    env.update(SETTLEMENT_WORKER_PASSWORD=WORKER_PASSWORD, REDIS_URL="redis://127.0.0.1:6390", WORKER_METRICS_PORT="0")
+    result = subprocess.run(NAIVE, env=env, capture_output=True, text=True, timeout=60, check=False)
+    assert result.returncode == 2, result
+    lines = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    assert [line["event"] for line in lines] == ["config_invalid"], lines
+    assert "REDIS_URL" in lines[0]["error"]
+    assert result.stderr == ""
+
+
 @pytest.mark.parametrize("main_point", FAULT_POINTS)
 def test_naive_worker_rejects_main_fault_points(main_point):
     """The naive entrypoint honours none of main's fault points, so it refuses an armed one (D-125)."""

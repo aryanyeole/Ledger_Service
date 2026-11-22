@@ -18,6 +18,7 @@ def test_contract():
         "payment_settled": ["correlation_id", "event_id", "lock_wait_ms", "payment_id", "transaction_id"],
         "payment_released": ["correlation_id", "event_id", "lock_wait_ms", "payment_id", "transaction_id"],
         "worker_started": [
+            "balance_invalidation",
             "consumer_group",
             "correlation_id",
             "fault_point",
@@ -78,6 +79,7 @@ def test_contract():
             "last_entry_id",
         ],
         "reconciliation_failed": ["correlation_id", "error", "error_class", "run_id"],
+        "cache_invalidation_failed": ["correlation_id", "error_class", "payment_id"],
     }
 
 
