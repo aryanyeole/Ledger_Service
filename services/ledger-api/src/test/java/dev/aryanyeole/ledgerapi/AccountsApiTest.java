@@ -268,7 +268,7 @@ class AccountsApiTest {
 	@Test
 	void balanceAfterPostingIsScale2String() throws Exception {
 		long id = createdAccountId("CUSTOMER");
-		postDeposit(id, "12.3");
+		LedgerTestSupport.directDeposit(this.dataSource, id, "12.3");
 		this.mvc.perform(authenticated(get("/v1/accounts/{id}/balance", id)))
 			.andExpect(status().isOk())
 			.andExpect(jsonPath("$.balance").value("12.30"));
@@ -278,7 +278,7 @@ class AccountsApiTest {
 	@Test
 	void subCentBalanceIs500NotRounded() throws Exception {
 		long id = createdAccountId("CUSTOMER");
-		postDeposit(id, "0.0050");
+		LedgerTestSupport.directDeposit(this.dataSource, id, "0.0050");
 		MvcResult result = this.mvc.perform(authenticated(get("/v1/accounts/{id}/balance", id)))
 			.andExpect(status().isInternalServerError())
 			.andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
@@ -345,53 +345,6 @@ class AccountsApiTest {
 
 	private static String uniqueName() {
 		return "t2-" + UUID.randomUUID();
-	}
-
-	// EXTERNAL -amount -> account +amount, one transaction, balances updated, accounts locked
-	// in ascending id order (invariants 1 and 4), explicit commit.
-	private void postDeposit(long accountId, String amount) throws SQLException {
-		long external = SystemAccountFixture.external(this.dataSource);
-		try (Connection conn = connectApp()) {
-			try {
-				long txId;
-				try (PreparedStatement ps = conn.prepareStatement(
-						"INSERT INTO transactions (kind, reference) VALUES ('DEPOSIT', ?) RETURNING id")) {
-					ps.setString(1, uniqueName());
-					try (ResultSet rs = ps.executeQuery()) {
-						assertThat(rs.next()).isTrue();
-						txId = rs.getLong(1);
-					}
-				}
-				try (PreparedStatement ps = conn
-					.prepareStatement("INSERT INTO entries (transaction_id, account_id, amount) VALUES (?, ?, ?)")) {
-					for (Object[] leg : List.of(new Object[] { external, new BigDecimal(amount).negate() },
-							new Object[] { accountId, new BigDecimal(amount) })) {
-						ps.setLong(1, txId);
-						ps.setLong(2, (Long) leg[0]);
-						ps.setBigDecimal(3, (BigDecimal) leg[1]);
-						assertThat(ps.executeUpdate()).isEqualTo(1);
-					}
-				}
-				try (PreparedStatement ps = conn
-					.prepareStatement("SELECT id FROM accounts WHERE id = ANY (?) ORDER BY id FOR UPDATE")) {
-					ps.setArray(1, conn.createArrayOf("bigint", new Object[] { external, accountId }));
-					ps.executeQuery().close();
-				}
-				try (PreparedStatement ps = conn
-					.prepareStatement("UPDATE accounts SET balance = balance + ? WHERE id = ?")) {
-					for (long id : new long[] { Math.min(external, accountId), Math.max(external, accountId) }) {
-						BigDecimal delta = new BigDecimal(amount);
-						ps.setBigDecimal(1, (id == external) ? delta.negate() : delta);
-						ps.setLong(2, id);
-						assertThat(ps.executeUpdate()).isEqualTo(1);
-					}
-				}
-				conn.commit();
-			}
-			finally {
-				conn.rollback();
-			}
-		}
 	}
 
 	private AccountRow accountRow(long id) throws SQLException {
