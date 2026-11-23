@@ -52,7 +52,7 @@ from aiokafka import AIOKafkaConsumer, ConsumerRebalanceListener, TopicPartition
 from aiokafka.errors import KafkaError
 
 from settlement_worker import balance_cache, dead_letter, db, envelope, events, failures, metrics, processor
-from settlement_worker import reconcile, redis_client, settlement
+from settlement_worker import reconcile, reconcile_lease, redis_client, settlement
 from settlement_worker import dlq as dlq_module
 from settlement_worker.config import (
     AFTER_DB_BEFORE_INVALIDATION,
@@ -473,6 +473,8 @@ def announce_start(log, config: Config) -> None:
         processor_outage=config.processor_outage,
         reconcile_interval_ms=config.reconcile_interval_ms,
         balance_invalidation=invalidation,
+        reconcile_lease="on" if config.reconcile_lease else "off",
+        reconcile_lock_ttl_ms=config.reconcile_lock_ttl_ms,
         correlation_id=None,
     )
 
@@ -546,7 +548,9 @@ async def run(config: Config, stop: asyncio.Event, stop_reason: dict) -> int:
     # One client for the process (D-137), created without connecting and closed on the way out.
     redis = redis_client.create(config.redis_url) if config.redis_url is not None else None
     invalidator = balance_cache.BalanceInvalidator(redis, *system_ids) if system_ids is not None else None
-    reconciler = reconcile.Reconciler(config) if config.reconcile_interval_ms is not None else None
+    # The reconciliation lease (D-144): only while a client exists and reconciliation is on.
+    lease = reconcile_lease.Lease(redis, config.reconcile_lock_ttl_ms) if config.reconcile_lease else None
+    reconciler = reconcile.Reconciler(config, lease=lease) if config.reconcile_interval_ms is not None else None
     task = asyncio.create_task(reconciler.run_forever()) if reconciler is not None else None
     try:
         code, reason = await _consume(config, stop, session, reconciler, invalidator)

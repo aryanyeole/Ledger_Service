@@ -50,7 +50,10 @@ def test_a_lost_reconciler_connection_fails_one_run_and_the_next_reconnects(fm):
         w.wait_for("payment_settled", payment_id=str(payment), timeout=60)
         assert w.stop() == 0, w.diagnostics()
 
-    assert w.wait_for("worker_started")["reconcile_interval_ms"] == 1000
+    started = w.wait_for("worker_started")
+    assert started["reconcile_interval_ms"] == 1000
+    # The harness strips REDIS_ (T2), so the M4 proofs run without the lease (D-144).
+    assert (started["reconcile_lease"], started["reconcile_lock_ttl_ms"]) == ("off", None)
     failures = w.events("reconciliation_failed")
     assert len(failures) == 1, w.diagnostics()
     assert failures[0]["level"] == "warning" and failures[0]["error_class"] == "Transient", failures

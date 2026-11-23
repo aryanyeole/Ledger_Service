@@ -1,5 +1,5 @@
 """The worker's configuration, from the environment (D-081, D-085, D-091, D-108, D-109, D-111, D-112, D-113,
-D-114, D-125, D-129, D-137, D-148, D-152).
+D-114, D-125, D-129, D-137, D-144, D-148, D-152).
 
 Names follow .env.example where it has them. Anything invalid is a ConfigError, and the worker
 refuses to start (exit 2). The password is never part of an error message or the repr.
@@ -104,6 +104,13 @@ class Config:
     redis_url: str | None
     # WORKER_BALANCE_INVALIDATION (D-142, D-152): False only for the benchmark's TTL-only mode (D-146).
     balance_invalidation: bool = True
+    # RECONCILE_LOCK_TTL_MS (D-144): set only while the lease is active, else None (never parsed then).
+    reconcile_lock_ttl_ms: int | None = None
+
+    @property
+    def reconcile_lease(self) -> bool:
+        """The reconciliation lease is active: a Redis client exists and reconciliation is on (D-144)."""
+        return self.redis_url is not None and self.reconcile_interval_ms is not None
 
     @property
     def fault_armed(self) -> bool:
@@ -213,6 +220,19 @@ class Config:
         invalidation = env.get("WORKER_BALANCE_INVALIDATION", "1")
         if invalidation not in ("0", "1"):
             raise ConfigError(f"WORKER_BALANCE_INVALIDATION must be 0 or 1, was {invalidation!r}")
+        # Reconciliation lease (D-144): only while it's active (REDIS_URL and RECONCILE_INTERVAL_MS both set) is
+        # RECONCILE_LOCK_TTL_MS read, defaulting to the interval, and it must outlive a run that the DB timeouts cut
+        # off: connect (command timeout) + statement + client slack (command timeout, D-114). Inactive, it's ignored.
+        lock_ttl = None
+        reconcile_statement_timeout = integer("RECONCILE_STATEMENT_TIMEOUT_MS", "30000", 1, 600_000)
+        if redis_url is not None and reconcile_interval is not None:
+            lock_ttl = integer("RECONCILE_LOCK_TTL_MS", str(reconcile_interval), 1, 86_400_000)
+            needed = 2 * command_timeout_ms + reconcile_statement_timeout
+            if lock_ttl < needed:
+                raise ConfigError(
+                    f"RECONCILE_LOCK_TTL_MS ({lock_ttl}) must be at least 2 x WORKER_DB_COMMAND_TIMEOUT_MS "
+                    f"({command_timeout_ms}) + RECONCILE_STATEMENT_TIMEOUT_MS ({reconcile_statement_timeout}) = {needed}"
+                )
 
         return cls(
             postgres_host=text("POSTGRES_HOST", "localhost"),
@@ -245,7 +265,8 @@ class Config:
             processor_timeout_ms=integer("WORKER_PROCESSOR_TIMEOUT_MS", "2000", 1, 60_000),
             processor_outage=outage == "1",
             reconcile_interval_ms=reconcile_interval,
-            reconcile_statement_timeout_ms=integer("RECONCILE_STATEMENT_TIMEOUT_MS", "30000", 1, 600_000),
+            reconcile_statement_timeout_ms=reconcile_statement_timeout,
             redis_url=redis_url,
             balance_invalidation=invalidation == "1",
+            reconcile_lock_ttl_ms=lock_ttl,
         )

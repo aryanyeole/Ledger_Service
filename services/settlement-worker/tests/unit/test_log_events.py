@@ -24,6 +24,8 @@ def test_contract():
             "fault_point",
             "processor_outage",
             "reconcile_interval_ms",
+            "reconcile_lease",
+            "reconcile_lock_ttl_ms",
         ],
         "partitions_assigned": ["correlation_id", "partitions"],
         "processing_failed": ["correlation_id", "error", "offset", "partition", "topic"],
@@ -80,6 +82,8 @@ def test_contract():
         ],
         "reconciliation_failed": ["correlation_id", "error", "error_class", "run_id"],
         "cache_invalidation_failed": ["correlation_id", "error_class", "payment_id"],
+        "reconciliation_skipped": ["correlation_id", "lease_ttl_ms", "run_id"],
+        "reconciliation_lock_unavailable": ["correlation_id", "error_class", "run_id"],
     }
 
 

@@ -29,6 +29,8 @@ RECONCILIATION_COMPLETED = "reconciliation_completed"
 DRIFT_DETECTED = "drift_detected"
 RECONCILIATION_FAILED = "reconciliation_failed"
 CACHE_INVALIDATION_FAILED = "cache_invalidation_failed"
+RECONCILIATION_SKIPPED = "reconciliation_skipped"
+RECONCILIATION_LOCK_UNAVAILABLE = "reconciliation_lock_unavailable"
 
 EVENT_KEYS: dict[str, frozenset[str]] = {
     FAULT_INJECTED: frozenset({"point", "payment_id", "correlation_id"}),
@@ -44,6 +46,8 @@ EVENT_KEYS: dict[str, frozenset[str]] = {
             "processor_outage",
             "reconcile_interval_ms",
             "balance_invalidation",
+            "reconcile_lease",
+            "reconcile_lock_ttl_ms",
             "correlation_id",
         }
     ),
@@ -74,6 +78,9 @@ EVENT_KEYS: dict[str, frozenset[str]] = {
     RECONCILIATION_FAILED: frozenset({"run_id", "error_class", "error", "correlation_id"}),
     # Balance invalidation (D-142, D-152): never keys, account ids or values.
     CACHE_INVALIDATION_FAILED: frozenset({"payment_id", "error_class", "correlation_id"}),
+    # Reconciliation lease (D-144): a skipped tick made no DB call; an unavailable lease runs anyway (fail open).
+    RECONCILIATION_SKIPPED: frozenset({"run_id", "lease_ttl_ms", "correlation_id"}),
+    RECONCILIATION_LOCK_UNAVAILABLE: frozenset({"run_id", "error_class", "correlation_id"}),
 }
 
 LEVELS = frozenset({"info", "warning", "error"})

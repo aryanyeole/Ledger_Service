@@ -202,6 +202,8 @@ def test_worker_started_warns_when_a_fault_is_armed(armed, level):
             "processor_outage": False,
             "reconcile_interval_ms": None,
             "balance_invalidation": "no_redis",
+            "reconcile_lease": "off",
+            "reconcile_lock_ttl_ms": None,
             "correlation_id": None,
         }
     ]
@@ -254,6 +256,8 @@ def test_worker_started_warns_when_the_processor_outage_is_on(outage, level):
             "processor_outage": outage == "1",
             "reconcile_interval_ms": None,
             "balance_invalidation": "no_redis",
+            "reconcile_lease": "off",
+            "reconcile_lock_ttl_ms": None,
             "correlation_id": None,
         }
     ]
@@ -424,3 +428,70 @@ def test_malformed_redis_url_exits_2():
     assert [line["event"] for line in lines] == ["config_invalid"]
     assert lines[0]["error"] == "REDIS_URL must not contain user info"
     assert "hunter2" not in result.stdout + result.stderr
+
+# RECONCILE_LOCK_TTL_MS (D-144): read only while the lease is active (REDIS_URL and RECONCILE_INTERVAL_MS both set),
+# default = the interval, and at least 2 x WORKER_DB_COMMAND_TIMEOUT_MS + RECONCILE_STATEMENT_TIMEOUT_MS.
+LEASE = {"REDIS_URL": "redis://localhost:6379", "RECONCILE_INTERVAL_MS": "60000"}
+
+
+def test_the_lock_ttl_defaults_to_the_interval_while_the_lease_is_active():
+    config = Config.from_env(_env(**LEASE))
+    assert (config.reconcile_lease, config.reconcile_lock_ttl_ms) == (True, 60000)
+    assert Config.from_env(_env(**LEASE, RECONCILE_LOCK_TTL_MS="90000")).reconcile_lock_ttl_ms == 90000
+
+
+def test_the_lock_ttl_bound_accepts_equality_and_refuses_one_below():
+    # 2 x 1000 + 1000 = 3000.
+    timeouts = {"WORKER_LOCK_TIMEOUT_MS": "500", "WORKER_DB_COMMAND_TIMEOUT_MS": "1000",
+                "RECONCILE_STATEMENT_TIMEOUT_MS": "1000"}
+    assert Config.from_env(_env(**LEASE, **timeouts, RECONCILE_LOCK_TTL_MS="3000")).reconcile_lock_ttl_ms == 3000
+    with pytest.raises(ConfigError) as caught:
+        Config.from_env(_env(**LEASE, **timeouts, RECONCILE_LOCK_TTL_MS="2999"))
+    message = str(caught.value)
+    assert "RECONCILE_LOCK_TTL_MS (2999)" in message
+    assert "WORKER_DB_COMMAND_TIMEOUT_MS (1000)" in message
+    assert "RECONCILE_STATEMENT_TIMEOUT_MS (1000)" in message
+
+
+def test_the_default_lock_ttl_below_the_bound_is_refused():
+    # Defaults: 2 x 10000 + 30000 = 50000 > a 1000 ms interval.
+    with pytest.raises(ConfigError, match=r"RECONCILE_LOCK_TTL_MS \(1000\)"):
+        Config.from_env(_env(REDIS_URL="redis://localhost:6379", RECONCILE_INTERVAL_MS="1000"))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"RECONCILE_INTERVAL_MS": "200"},  # no REDIS_URL: the M4 proofs' intervals
+        {"RECONCILE_INTERVAL_MS": "1000", "RECONCILE_LOCK_TTL_MS": "1"},
+        {"RECONCILE_INTERVAL_MS": "1000", "RECONCILE_LOCK_TTL_MS": "not-a-number"},
+        {"REDIS_URL": "redis://localhost:6379", "RECONCILE_LOCK_TTL_MS": "not-a-number"},  # no interval
+    ],
+)
+def test_the_lock_ttl_is_ignored_while_the_lease_is_inactive(overrides):
+    config = Config.from_env(_env(**overrides))
+    assert (config.reconcile_lease, config.reconcile_lock_ttl_ms) == (False, None)
+
+
+def test_an_invalid_lock_ttl_exits_2():
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("FAULT_", "FAKE_", "WORKER_", "RECONCILE_", "REDIS_"))}
+    env.update(_env(WORKER_METRICS_PORT="0", REDIS_URL="redis://localhost:6379", RECONCILE_INTERVAL_MS="1000"))
+    result = subprocess.run([sys.executable, "-m", "settlement_worker"], capture_output=True, text=True, env=env, timeout=30)
+    assert result.returncode == 2, result.stdout + result.stderr
+    lines = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [line["event"] for line in lines] == ["config_invalid"], lines
+    for name in ("RECONCILE_LOCK_TTL_MS", "WORKER_DB_COMMAND_TIMEOUT_MS", "RECONCILE_STATEMENT_TIMEOUT_MS"):
+        assert name in lines[0]["error"]
+
+
+@pytest.mark.parametrize(
+    "overrides, lease, ttl",
+    [({}, "off", None), ({"RECONCILE_INTERVAL_MS": "60000"}, "off", None), (LEASE, "on", 60000)],
+)
+def test_worker_started_reports_the_lease(overrides, lease, ttl):
+    config = Config.from_env(_env(WORKER_CONSUMER_GROUP="g", **overrides))
+    with capture_logs() as logs:
+        consumer.announce_start(structlog.get_logger(), config)
+    assert [(log["reconcile_lease"], log["reconcile_lock_ttl_ms"], log["log_level"]) for log in logs] == [
+        (lease, ttl, "info")
+    ]
