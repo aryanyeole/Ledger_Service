@@ -555,9 +555,13 @@ The lease stays in Redis to save scans; fencing would make it a correctness mech
 
 ### 7.3 What "only one runs" means (amends spec §6.5)
 
-- **Redis up:** at most one run starts per lease period across all instances. The lease is never released, so a dead
-  holder and a live one look the same: the lease expires after its PX and the next tick on any instance takes it.
-  Runs overlap only if one outlives the PX, which the startup bound prevents while the DB timeouts work.
+- **Redis up:** at most one lease-holding run per lease period across all instances, while Redis answers within the
+  bound (`LEASE_BOUND_MS`, 300 ms). The lease is never released, so a dead holder and a live one look the same: the
+  lease expires after its PX and the next tick on any instance takes it. Lease-holding runs overlap only if one outlives
+  the PX, which the startup bound prevents while the DB timeouts work. A stalled or unavailable Redis makes instances run
+  (fail open), which is harmless: each run is one read-only snapshot (D-114). Observed in T13: lease `SET`s timing out at
+  300 ms on a loaded machine; with a 200 ms interval, the 1 s bypass turned one stall into about 5 extra runs per
+  instance. At Compose's 60 s interval it's at most one.
 - **Redis down or bypassed:** every reconciling instance runs every tick. That's harmless.
 - **Scaling:** `docker compose up --scale settlement-worker=N` copies `RECONCILE_INTERVAL_MS` to every replica, so the
   lease is what makes scaling safe (amends D-115: the one-instance rule becomes a default).
