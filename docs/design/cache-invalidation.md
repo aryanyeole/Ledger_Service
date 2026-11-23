@@ -415,6 +415,15 @@ sequenceDiagram
     Note over W,R: The lease is never released, it expires after its PX
 ```
 
+In code (T12): `settlement_worker/reconcile_lease.py`'s `Lease.try_acquire()` returns acquired, held or unavailable,
+bounded by `LEASE_BOUND_MS` (connect 200 + command 100) and never raising. After an unavailable attempt, the worker's
+1 s bypass (D-137) makes further attempts unavailable without a Redis call; it is the lease's alone (invalidations never
+consult it). The `Reconciler` tries the lease at the top of each tick, before any DB call for that run: held emits
+`reconciliation_skipped` (`run_id`, `lease_ttl_ms`, INFO) and counts `ledger_reconciliation_runs_total{result="skipped"}`
+with no DB call at all; unavailable emits `reconciliation_lock_unavailable` (`run_id`, `error_class`, WARNING) and runs.
+`RECONCILE_LOCK_TTL_MS` is read only while the lease is active (`REDIS_URL` and `RECONCILE_INTERVAL_MS` both set);
+`worker_started` reports `reconcile_lease` (`on` / `off`) and `reconcile_lock_ttl_ms` (null when off).
+
 ---
 
 ## 4. The populate race
@@ -554,6 +563,10 @@ The lease stays in Redis to save scans; fencing would make it a correctness mech
   lease is what makes scaling safe (amends D-115: the one-instance rule becomes a default).
 - **Gauges:** an instance that skips keeps the drift gauges from its last run. M6's alerts must ignore instances whose
   last completed run is older than 2 × the lease (open issue).
+- **In code (T12):** `reconcile_lease.py`; the events `reconciliation_skipped` and `reconciliation_lock_unavailable`;
+  the `skipped` label on `ledger_reconciliation_runs_total` (D-116 amended); `RECONCILE_LOCK_TTL_MS` (default
+  `RECONCILE_INTERVAL_MS`; while the lease is active it must be ≥ 2 × `WORKER_DB_COMMAND_TIMEOUT_MS` +
+  `RECONCILE_STATEMENT_TIMEOUT_MS`, else `config_invalid` naming all three, exit 2).
 
 ---
 

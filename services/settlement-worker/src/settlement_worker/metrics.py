@@ -63,6 +63,10 @@ class ReconcileMetrics:
     def failed(self) -> None:
         self.runs.labels(result="error").inc()
 
+    def skipped(self) -> None:
+        """A tick skipped because another instance holds the lease (D-144, D-116 amended)."""
+        self.runs.labels(result="skipped").inc()
+
 
 RECONCILE = ReconcileMetrics()
 

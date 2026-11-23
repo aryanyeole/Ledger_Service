@@ -242,6 +242,8 @@ async def _run(config: Config, fault_id, skip_id) -> int:
             processor_outage=config.processor_outage,
             reconcile_interval_ms=None,  # the naive worker never reconciles (D-114)
             balance_invalidation=INVALIDATION_NO_REDIS,  # it refuses REDIS_URL and never invalidates (D-152)
+            reconcile_lease="off",  # no Redis, no reconciler (D-144)
+            reconcile_lock_ttl_ms=None,
             correlation_id=None,
         )
         while not stop.is_set() and code == consumer.EXIT_STOPPED:

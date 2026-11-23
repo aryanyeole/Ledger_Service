@@ -18,6 +18,10 @@ reconciliation_failed and never affects the consumer; a run that finds its conne
 and the next run reconnects. A role refusal on its connection is configuration: config_invalid, and the
 worker exits 2 (D-109). On stop the task is cancelled and awaited for at most STOP_TIMEOUT_SECONDS;
 its connection is terminated, never closed.
+
+With a lease (D-144: REDIS_URL and RECONCILE_INTERVAL_MS both set), each tick first tries it, before any DB
+call for that run: acquired runs; held skips (reconciliation_skipped, runs_total{result="skipped"}, no DB
+call); unavailable runs anyway (reconciliation_lock_unavailable, WARNING). See reconcile_lease.py.
 """
 
 import asyncio
@@ -31,7 +35,7 @@ from decimal import Decimal
 import asyncpg
 import structlog
 
-from settlement_worker import db, events, failures, metrics, timestamps
+from settlement_worker import db, events, failures, metrics, reconcile_lease, timestamps
 from settlement_worker.money import InvalidAmount
 
 APPLICATION_NAME = "settlement-worker-reconcile"
@@ -177,9 +181,15 @@ class Reconciler:
     """The reconciliation task (D-114). refusal is set, with the error, if its connection is refused
     the role; the consume loop then exits 2."""
 
-    def __init__(self, config, reconcile_metrics: metrics.ReconcileMetrics | None = None) -> None:
+    def __init__(
+        self,
+        config,
+        reconcile_metrics: metrics.ReconcileMetrics | None = None,
+        lease: reconcile_lease.Lease | None = None,
+    ) -> None:
         self._config = config
         self._metrics = reconcile_metrics or metrics.RECONCILE
+        self._lease = lease
         self._conn: asyncpg.Connection | None = None
         self._windows = DriftWindows()
         self._run_id = 0
@@ -215,6 +225,22 @@ class Reconciler:
         self._run_id += 1
         run_id = self._run_id
         log = structlog.get_logger()
+        # The lease (D-144), before any DB call for this run and so before the snapshot transaction opens
+        # (invariant 5): held -> skip with no DB call; unavailable -> run anyway (fail open).
+        if self._lease is not None:
+            attempt = await self._lease.try_acquire()
+            if attempt.result == reconcile_lease.HELD:
+                events.emit(
+                    log, events.RECONCILIATION_SKIPPED, run_id=run_id, lease_ttl_ms=self._lease.ttl_ms,
+                    correlation_id=None,
+                )
+                self._metrics.skipped()
+                return
+            if attempt.result == reconcile_lease.UNAVAILABLE:
+                events.emit(
+                    log, events.RECONCILIATION_LOCK_UNAVAILABLE, level="warning", run_id=run_id,
+                    error_class=attempt.error_class, correlation_id=None,
+                )
         started = time.monotonic_ns()
         try:
             if self._conn is None:
