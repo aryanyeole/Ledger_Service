@@ -63,8 +63,7 @@ $KafkaInternal = "localhost:29092"
 # Every dependency of the host-run services by 127.0.0.1, never localhost: Compose publishes on 127.0.0.1 only (D-029),
 # and Windows resolves localhost to ::1 first. redis-py's 200 ms connect timeout expires on ::1, so every worker
 # invalidation failed (found in T14's smoke); for Postgres and Kafka, Windows takes ~2 s to refuse a closed ::1 port
-# before falling back, which would at best add connect latency to the measurement. One limit: the broker advertises
-# EXTERNAL://localhost:9092 (docker-compose.yml), so after bootstrapping here a host Kafka client reconnects to localhost.
+# before falling back, which would at best add connect latency to the measurement.
 $RedisUrl = "redis://127.0.0.1:6379"
 $PostgresHost = "127.0.0.1"
 $KafkaBootstrap = "127.0.0.1:9092"
