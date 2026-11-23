@@ -114,7 +114,9 @@ ledger-service/
 | Grafana | 3000 |
 | dashboard (Vite dev) | 5173 |
 
-All published host ports bind to 127.0.0.1 only (D-029).
+All published host ports bind to 127.0.0.1 only (D-029). Host-side clients address them as 127.0.0.1, not localhost:
+Windows resolves localhost to ::1 first, and redis-py's 200 ms connect timeout expires on ::1 before it falls back (found
+in M5 T14); Postgres and Kafka clients lose ~2 s to the refused ::1 port. Containers keep service names.
 
 Compose project name: ledger-service (fixed via top-level `name:`)
 
@@ -228,15 +230,34 @@ cd services\ledger-api; .\mvnw.cmd test -Dtest=ConcurrentIdempotentTransferTest
 
 cd services\settlement-worker; .\.venv\Scripts\Activate.ps1; pytest -k crash
 
-# k6 (PowerShell has no `<` redirect; pipe instead; reach the host API via host.docker.internal)
-Get-Content infra\k6\transfers.js -Raw | docker run --rm -i -e BASE_URL=http://host.docker.internal:8080 grafana/k6 run -
+# k6, pinned to grafana/k6:2.3.0 (D-146; PowerShell has no `<` redirect; pipe instead; reach the host API via
+# host.docker.internal). A script that imports modules is mounted instead of piped (see the cache benchmark below).
+Get-Content infra\k6\transfers.js -Raw | docker run --rm -i -e BASE_URL=http://host.docker.internal:8080 grafana/k6:2.3.0 run -
+
+# Cache benchmark (M5, D-146, docs/design/cache-invalidation.md §8). Compose runs postgres, kafka and redis only; the
+# script starts the jar, waits for its health and the relay's topics, commits the worker group at the topic's end,
+# starts the worker, applies the mode guard, waits for lag 0, runs k6, then stops both services (process trees) and
+# restores Redis if the run took it down. Raw outputs go to <-OutputDir>/<mode>-<run>/ (default
+# docs/load-tests/raw/m5): k6 summary and stdout, service logs, counters before/after, Redis INFO, env.json with
+# hardware, validity.json. Only the small evidence files are committed (k6-summary.json, counters.json, env.json,
+# validity.json, redis-info-*.txt); .gitignore keeps the logs, stderr and k6's stdout out permanently.
+# DB credentials come from the environment if LEDGER_API_APP_PASSWORD, LEDGER_API_OWNER_PASSWORD and
+# SETTLEMENT_WORKER_PASSWORD are all set, else from .env; never printed. Exits 1 if any run is invalid or fails.
+# Invalid runs are rerun, never silently dropped: the report lists every invalid run with its reason (D-146).
+# The harness's own self-test (a stub API; exact -> exit 0, off-by-0.01 reads -> stale counted, exit 99):
+# infra\k6\selftest\README.md
+.\scripts\bench-cache.ps1 -Modes A,B,C-stopped,C-paused -Runs 3 -DurationSeconds 300 -Vus 20 -Seed 42
+# A smoke run goes outside the repo:
+.\scripts\bench-cache.ps1 -Modes A -Runs 1 -DurationSeconds 30 -Vus 2 -OutputDir "$env:TEMP\ledger-bench-smoke"
+# The stale judge's unit test, in the same image:
+docker run --rm -v "${PWD}\infra\k6:/scripts:ro" grafana/k6:2.3.0 run /scripts/lib/judge.test.js
 
 # psql as the superuser, inside the container (it trusts local connections; no password in shell history)
 docker compose exec postgres psql -U ledger -d ledger
 
 # psql as the app role from the host (repo root), password read from .env
 $pw = (Select-String -Path .env -Pattern '^LEDGER_API_APP_PASSWORD=(.+)$').Matches[0].Groups[1].Value
-& "C:\Program Files\PostgreSQL\18\bin\psql.exe" "postgresql://ledger_api_app:$pw@localhost:5433/ledger"
+& "C:\Program Files\PostgreSQL\18\bin\psql.exe" "postgresql://ledger_api_app:$pw@127.0.0.1:5433/ledger"
 ```
 
 Proofs and CI evidence (M2):

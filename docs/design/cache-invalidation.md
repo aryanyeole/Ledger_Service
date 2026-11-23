@@ -493,7 +493,7 @@ value TTL (60 s), because the stale value is written with `PX` = the value TTL.
 | 4d | Eviction of the lease | Another instance may start a run before the period ends | None: a harmless double run (D-115) | One run | Argued; T13 case 4 shows double runs report no drift |
 | 5 | A failed invalidation (the command fails or times out, or no connection is established so it can't be sent, D-137) | The posting's response is unchanged; the API logs and counts; the worker emits `cache_invalidation_failed` | Stale reads only | Value TTL | Argued, plus the counter; T11 (stopped) exercises the Redis-down case; T2 `RedisDownStartupTest` shows invalidations return at once with no connection (20 concurrent callers: slowest 188–200 ms, one connect attempt per window) |
 | 6 | ledger-api started with Redis down | Startup succeeds (the connection is made lazily, D-137); the first calls bypass | None | — | T2 `RedisDownStartupTest`: the context starts with Redis down, calls are unavailable, and once Redis starts calls succeed without a restart; `RedisClient.connect()` throws `RedisConnectionException` while the server is down, which is why the connection is lazy. T10 repeats it under load |
-| 7 | Worker without `REDIS_URL` while the API caches | Settles and releases never invalidate: merchant, ESCROW, PLATFORM_FEES and (on a release) customer balances are stale after every settle | Stale reads only | Value TTL per read, but it recurs after every settle | Consequence shown by T9's red evidence ("worker doesn't invalidate → red"); detected by `worker_started.balance_invalidation` and the D-146 harness guard; Compose makes `REDIS_URL` required (open issue) |
+| 7 | Worker without `REDIS_URL`, or with a `REDIS_URL` it can never reach, while the API caches | Settles and releases never invalidate: merchant, ESCROW, PLATFORM_FEES and (on a release) customer balances are stale after every settle | Stale reads only | Value TTL per read, but it recurs after every settle | Consequence shown by T9's red evidence ("worker doesn't invalidate → red"). Without `REDIS_URL`: detected by `worker_started.balance_invalidation` (`no_redis`) and the D-146 harness guard; Compose makes `REDIS_URL` required (open issue). With an unreachable `REDIS_URL` (e.g. `localhost` on a Windows host, resolved to `::1` while Redis is published on 127.0.0.1 only): `worker_started` says `on`, so the startup line does **not** detect it; detected by a `cache_invalidation_failed` WARNING per payment and `settlement_balance_invalidations_total{failed}`, and the bench's validity check (worker sent > 0, failed = 0 in mode A) catches it. Proven by: T14 smoke (observed) |
 | 8 | Postgres reset or restore without a Redis flush | Idempotency replays for rows that no longer exist; balances of another database state | **Wrong outcomes:** a request whose key replays from Redis is not executed. The same harm as rows 2a and 11, with no timing margin to protect against it, which is why the flush is a runbook step | Idempotency: fast-path TTL (10 min). Balances: value TTL | Runbook §9.1; residual |
 | 9 | A test Redis shared across databases | One database's replays and balances served to another (account ids and test keys repeat) | Wrong test results | — | Prevented by D-138; T2: every test Redis asserts `DBSIZE = 0` before its first test |
 | 10 | Clock skew between API, DB and Redis | Nothing | None: no absolute time is compared across hosts. Remaining life is measured by the DB; every PX is counted by Redis from execution. Only a jump in Redis's own clock changes when a PX ends | For idempotency, a Redis clock jump is a delay like any other: bounded by the margin | Argued |
@@ -587,7 +587,7 @@ The lease stays in Redis to save scans; fencing would make it a correctness mech
 Same seed and the same k6 mix in every mode; 3 runs per mode.
 
 Mode C paused will show stale hits, up to the value TTL, from lost worker invalidations (§1.5, §5 row 2c). That is
-expected, not a defect: D-146 asserts stale misses = 0 only.
+expected, not a defect: D-146 asserts stale misses and stale bypasses = 0 (both read the DB), never stale hits.
 
 ### 8.2 Stack and mode guard
 
@@ -595,6 +595,13 @@ ledger-api (jar) and the worker run on the host against Compose's Postgres, Kafk
 `grafana/k6:2.3.0` (verified with `k6 version`) and reaches the API through `host.docker.internal`. The harness refuses
 to start unless both services' startup lines report the mode's invalidation setting (`worker_started.balance_invalidation`
 for the worker).
+
+In code (T14): `scripts/bench-cache.ps1` and `infra/k6/` (the workload, and the judge in `lib/judge.js`). Before each
+run the runner flushes Redis, starts the API and waits for its health (Flyway has migrated), waits for the relay's
+topics, commits the `bench-settlement-worker` group at the topic's end with no worker running (D-123), starts the
+worker, and then waits for lag 0, so leftover events can't settle inside the measured window. The API's counters come from `/actuator/metrics`, exposed only by a bench-time
+command-line flag; the worker's come from its `/metrics`. Merchant reads are judged only once every authorize to that
+merchant has been seen terminal.
 
 ### 8.3 Stale judge
 
@@ -604,7 +611,8 @@ for the worker).
 - Merchant reads are judged only after the VU has seen its payment `SETTLED` (through `GET /v1/payments/{id}`, a DB
   read). Customer reads after a decline are judged only after it has seen `FAILED`.
 - Expected balances are BigInt minor units parsed from the JSON strings, e.g. `"100.00"` → `10000n`. No `parseFloat`,
-  `Number` or float arithmetic anywhere in the judge (D-011). k6 2.3.0 supports BigInt **(verify in T14)**.
+  `Number` or float arithmetic anywhere in the judge (D-011). k6 2.3.0 supports BigInt (verified in T14; the judge is
+  `infra/k6/lib/judge.js`, unit-tested by `infra/k6/lib/judge.test.js` in the same image).
 - Foreign reads, on random accounts, drive populate races and aren't judged. A stale value they plant is caught by the
   owner's next judged read.
 - Each stale read is classified by its `X-Cache` value. A stale hit is a cached value that's out of date. A stale miss
@@ -623,8 +631,10 @@ evicted token reopens the populate race, so a run with evictions isn't measuring
 
 ### 8.6 Assertions
 
-- Stale misses = 0 in every mode.
-- Mode B stale reads > 0. This is the positive control: it shows the judge can see staleness.
+- Stale misses and stale bypasses = 0 in every mode: both read the DB, so either is a defect (D-016). They are k6
+  thresholds in `infra/k6/cache-benchmark.js`.
+- Mode B stale hits > 0. This is the positive control: it shows the judge can see staleness. `scripts/bench-cache.ps1`
+  asserts it, so every mode runs the same script.
 
 ### 8.7 The report
 
@@ -686,9 +696,9 @@ docker compose exec redis redis-cli --scan --pattern "ledger:v1:bal:*" | Select-
 
 ## Appendix: claims to verify
 
-| # | Claim | Where | Task |
-|---|---|---|---|
-| 6 | k6 2.3.0 supports BigInt | §8.3 | T14 |
+None open. Claim 6 (k6 2.3.0 supports BigInt, §8.3) was verified in T14: `docker run --rm grafana/k6:2.3.0 version` →
+`k6 v2.3.0 (commit/e088784614, go1.27.1, linux/amd64)`, and a piped script evaluating `10n + 20n` and `BigInt("123")`
+logged `sum=30 parsed=123 typeof=bigint`.
 
 Claim 1 (Spring runs `afterCommit` before it releases the connection, and the actual-transaction-active flag is still
 set there) was verified in T4 from the spring-tx 7.0.9 source (§1.6, D-149). Claims 2–5 were verified in T2 (PR body): `RedisClient.connect()` throws while Redis is down (§5 row 6); Lettuce's
