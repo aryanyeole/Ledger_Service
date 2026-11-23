@@ -120,7 +120,7 @@ in M5 T14); Postgres and Kafka clients lose ~2 s to the refused ::1 port. Contai
 
 Compose project name: ledger-service (fixed via top-level `name:`)
 
-Kafka in Compose needs **two listeners**: one advertised as `kafka:<internal port>` for containers, one as `localhost:9092` for tools/tests on Windows. Getting this wrong is the #1 Compose Kafka bug — if a client connects then hangs, check advertised listeners first.
+Kafka in Compose needs **two listeners**: one advertised as `kafka:<internal port>` for containers, one as `127.0.0.1:9092` for tools/tests on Windows (not `localhost:9092`: Windows resolves localhost to ::1 first and a refused ::1 connection takes ~2 s, so every host client reconnect after bootstrap took that detour; D-154). Getting this wrong is the #1 Compose Kafka bug — if a client connects then hangs, check advertised listeners first.
 
 ---
 
