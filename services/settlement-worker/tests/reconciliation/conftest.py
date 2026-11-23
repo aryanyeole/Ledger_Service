@@ -7,6 +7,8 @@ under test consumes nothing; it only reconciles. The topics are created as their
 D-110), because the worker subscribes to ledger.payments.v1 and produces dead letters, and
 auto-create is off.
 
+lock_rs (T13, D-144): rs without the API, plus its own Redis, for the reconciliation lease proof.
+
 relay_rs (D-118): the relay on its 200 ms schedule, so the worker under test settles while it
 reconciles. The relay is the topics' owner and creates both itself: ledger.payments.v1 before its
 first batch (D-080), the DLQ after every tick until it is verified, an empty one included (D-110).
@@ -46,6 +48,31 @@ def rs(tmp_path_factory) -> ReconciliationStack:
         )
         with stack.ledger_api(database, jar, log_dir) as api:
             yield ReconciliationStack(database, broker, api, stack.AppDb(database), stack.WorkerDb(database), log_dir)
+
+
+@dataclass(frozen=True)
+class LockStack:
+    database: stack.Database
+    kafka: stack.Kafka
+    redis: stack.Redis
+    log_dir: Path
+
+
+@pytest.fixture(scope="module")
+def lock_rs(tmp_path_factory) -> LockStack:
+    """The reconciliation lock proof's stack (T13, D-144): rs's shape without the API (no case needs it), plus its
+    own Redis. stack.redis() binds an explicit host port, so a stop/start keeps REDIS_URL valid."""
+    jar = stack.find_jar()
+    log_dir = tmp_path_factory.mktemp("reconciliation-lock")
+    with stack.postgres() as database, stack.kafka() as broker, stack.redis() as redis:
+        stack.migrate(database, jar)
+        asyncio.run(
+            stack.create_topics(
+                broker.bootstrap_servers,
+                {stack.TOPIC: (3, {}), stack.DLQ_TOPIC: (1, {"retention.ms": "-1"})},
+            )
+        )
+        yield LockStack(database, broker, redis, log_dir)
 
 
 @pytest.fixture(scope="module")
