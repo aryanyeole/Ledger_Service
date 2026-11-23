@@ -18,3 +18,10 @@ dist/
 # OS
 Thumbs.db
 .DS_Store
+
+# Cache benchmark raw outputs (T14, D-146): only the small evidence files are committed (k6-summary.json,
+# counters.json, env.json, validity.json, redis-info-*.txt); service logs, stderr and k6's stdout stay out.
+docs/load-tests/raw/m5/**/*.log
+docs/load-tests/raw/m5/**/*.jsonl
+docs/load-tests/raw/m5/**/*.err
+docs/load-tests/raw/m5/**/k6.txt
